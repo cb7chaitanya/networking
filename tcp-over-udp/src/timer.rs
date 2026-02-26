@@ -53,6 +53,12 @@ pub struct RetransmitTimer {
     pub rttvar: Option<Duration>,
 }
 
+impl Default for RetransmitTimer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RetransmitTimer {
     /// Construct a new timer with default configuration.
     pub fn new() -> Self {
@@ -66,25 +72,43 @@ impl RetransmitTimer {
         }
     }
 
-    /// Record a new RTT sample and update SRTT / RTTVAR / RTO.
+    /// Record a new RTT sample and update SRTT / RTTVAR / RTO (RFC 6298 §2).
     ///
-    /// TODO: implement RFC 6298 §2 update equations.
-    pub fn record_rtt_sample(&mut self, _sample: Duration) {
-        todo!("update SRTT, RTTVAR, RTO from sample")
+    /// On the first sample:  SRTT = R,  RTTVAR = R/2,  RTO = SRTT + 4·RTTVAR.
+    /// Subsequent samples:   RTTVAR = 3/4·RTTVAR + 1/4·|SRTT − R|
+    ///                       SRTT   = 7/8·SRTT   + 1/8·R
+    pub fn record_rtt_sample(&mut self, sample: Duration) {
+        match (self.srtt, self.rttvar) {
+            (None, _) => {
+                // First measurement.
+                self.srtt = Some(sample);
+                self.rttvar = Some(sample / 2);
+            }
+            (Some(srtt), Some(rttvar)) => {
+                let diff = sample.abs_diff(srtt);
+                self.rttvar = Some(rttvar * 3 / 4 + diff / 4);
+                self.srtt = Some(srtt * 7 / 8 + sample / 8);
+            }
+            _ => unreachable!(),
+        }
+        self.reset();
     }
 
-    /// Double the RTO (called on retransmit timeout) up to `max_rto`.
+    /// Double the RTO on retransmit timeout (exponential back-off, RFC 6298 §5.5).
     ///
-    /// TODO: implement exponential back-off capped at `config.max_rto`.
+    /// Capped at `config.max_rto` to prevent indefinite growth.
     pub fn back_off(&mut self) {
-        todo!("double current_rto up to max")
+        self.current_rto = (self.current_rto * 2).min(self.config.max_rto);
     }
 
-    /// Reset RTO to the computed value after a successful ACK.
+    /// Restore `current_rto` from the current SRTT / RTTVAR estimates.
     ///
-    /// TODO: restore `current_rto` from SRTT/RTTVAR.
+    /// Falls back to `initial_rto` before the first RTT sample is available.
     pub fn reset(&mut self) {
-        todo!("reset RTO to SRTT + 4*RTTVAR")
+        self.current_rto = match (self.srtt, self.rttvar) {
+            (Some(srtt), Some(rttvar)) => (srtt + rttvar * 4).min(self.config.max_rto),
+            _ => self.config.initial_rto,
+        };
     }
 }
 

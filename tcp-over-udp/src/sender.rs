@@ -1,76 +1,134 @@
-//! Outbound segment management and retransmit queue.
+//! Outbound segment state for stop-and-wait reliability.
 //!
-//! The [`Sender`] is responsible for everything that happens *after* the
-//! application hands data to the connection layer and *before* bytes hit the
-//! wire:
-//! - Buffering unsent application data.
-//! - Segmenting data into [`crate::packet::Packet`]s that fit the MSS.
-//! - Assigning sequence numbers and populating packet headers.
-//! - Maintaining the retransmit queue (sent-but-unacknowledged segments).
-//! - Advancing `SND.UNA` and `SND.NXT` as ACKs arrive.
-//! - Respecting the send window (`SND.WND`) advertised by the receiver.
+//! [`Sender`] tracks sequence numbers and the single in-flight segment.
+//! It does **not** touch the socket; [`crate::connection::Connection`] calls
+//! these methods and owns the actual send/receive loop.
 //!
-//! The [`Sender`] does **not** talk to the socket directly; it hands finished
-//! [`crate::packet::Packet`]s back to [`crate::connection::Connection`] for
-//! dispatch.
+//! # Stop-and-Wait contract
+//! - At most **one** segment is in flight at any moment (`unacked`).
+//! - A new segment may only be sent once `unacked` is `None`.
+//! - On ACK: advance `next_seq`; clear `unacked`.
+//! - On timeout: increment `tx_count`; resend the same packet unchanged.
 
-use crate::packet::Packet;
+use std::time::Instant;
 
-/// An entry in the retransmit queue.
-///
-/// TODO: add `sent_at: std::time::Instant` for RTT measurement.
+use crate::packet::{flags, Header, Packet};
+
+// ---------------------------------------------------------------------------
+// RetransmitEntry
+// ---------------------------------------------------------------------------
+
+/// A segment that has been sent but not yet acknowledged.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetransmitEntry {
-    /// The segment awaiting acknowledgement.
+    /// The segment on the wire.
     pub packet: Packet,
-    /// Number of times this segment has been transmitted (for backoff).
+    /// How many times this segment has been transmitted (1 = first send).
     pub tx_count: u32,
+    /// Wall-clock time of the most recent transmission (for RTT sampling).
+    pub sent_at: Instant,
 }
 
-/// Manages the send side of a single connection.
-///
-/// TODO: add fields for send buffer (`Vec<u8>`), SND.UNA, SND.NXT, SND.WND,
-///       maximum segment size (MSS), and congestion window (cwnd).
+// ---------------------------------------------------------------------------
+// Sender
+// ---------------------------------------------------------------------------
+
+/// Stop-and-wait send-side state for one connection.
+#[derive(Debug)]
 pub struct Sender {
-    /// Segments sent but not yet acknowledged, in sequence-number order.
-    pub retransmit_queue: Vec<RetransmitEntry>,
+    /// Sequence number of the **next** segment to send.
+    ///
+    /// Advances by `payload.len()` each time an ACK is received.
+    /// Remains unchanged while a segment is in flight.
+    pub next_seq: u32,
+
+    /// The in-flight segment, or `None` when the sender is idle.
+    pub unacked: Option<RetransmitEntry>,
 }
 
 impl Sender {
-    /// Create a new [`Sender`] with an empty buffer.
+    /// Create a new [`Sender`].
     ///
-    /// TODO: accept initial sequence number (ISN) as parameter.
-    pub fn new() -> Self {
-        todo!("construct Sender")
+    /// `isn` is the Initial Sequence Number chosen during the handshake.
+    /// The SYN itself consumes one sequence number, so the first data segment
+    /// will carry `isn + 1`.
+    pub fn new(isn: u32) -> Self {
+        Self {
+            next_seq: isn.wrapping_add(1),
+            unacked: None,
+        }
     }
 
-    /// Accept application data into the send buffer.
+    /// Build a data packet ready to send.
     ///
-    /// TODO: append `data` to internal ring buffer; do not send yet.
-    pub fn buffer_data(&mut self, _data: &[u8]) {
-        todo!("buffer outbound data")
+    /// The caller must subsequently call [`record_sent`] to place the packet
+    /// into the retransmit slot before calling the socket.
+    pub fn build_data_packet(&self, payload: Vec<u8>, ack: u32, window: u16) -> Packet {
+        Packet {
+            header: Header {
+                seq: self.next_seq,
+                ack,
+                flags: flags::ACK, // data segments carry ACK of the peer's data
+                window,
+                checksum: 0, // filled in by Packet::encode
+            },
+            payload,
+        }
     }
 
-    /// Produce the next segment(s) to transmit, if the window allows.
+    /// Move `packet` into the in-flight slot (first transmission).
     ///
-    /// Returns a list of packets ready to be handed to the socket.
-    ///
-    /// TODO: segment send buffer respecting MSS and SND.WND.
-    pub fn poll_segments(&mut self) -> Vec<Packet> {
-        todo!("produce sendable segments")
+    /// Panics in debug mode if a segment is already in flight.
+    pub fn record_sent(&mut self, packet: Packet) {
+        debug_assert!(
+            self.unacked.is_none(),
+            "record_sent called while a segment is already in flight"
+        );
+        self.unacked = Some(RetransmitEntry {
+            packet,
+            tx_count: 1,
+            sent_at: Instant::now(),
+        });
     }
 
-    /// Process an incoming ACK, advancing the unacknowledged window.
+    /// Process an inbound ACK number.
     ///
-    /// TODO: remove acknowledged entries from `retransmit_queue`, update
-    ///       `SND.UNA`, update `SND.WND` from the ACK's window field.
-    pub fn on_ack(&mut self, _ack_num: u32, _window: u16) {
-        todo!("advance send window on ACK")
+    /// Returns `true` if this ACK covers the in-flight segment (new data
+    /// acknowledged).  Returns `false` for a duplicate or unexpected ACK.
+    ///
+    /// On success: `next_seq` advances and the retransmit slot is cleared.
+    pub fn on_ack(&mut self, ack_num: u32) -> bool {
+        if let Some(ref entry) = self.unacked {
+            // The ACK we expect is seq + payload_len.
+            let expected =
+                entry.packet.header.seq.wrapping_add(entry.packet.payload.len() as u32);
+            if ack_num == expected {
+                self.next_seq = ack_num;
+                self.unacked = None;
+                return true;
+            }
+        }
+        false
     }
 
-    /// Retransmit the oldest unacknowledged segment (triggered by timer).
+    /// Increment the retransmit count for the in-flight segment.
     ///
-    /// TODO: implement exponential back-off via `RetransmitEntry::tx_count`.
-    pub fn retransmit_oldest(&mut self) -> Option<Packet> {
-        todo!("retransmit head of queue")
+    /// Called by the connection loop before each retransmission.
+    pub fn on_retransmit(&mut self) {
+        if let Some(ref mut e) = self.unacked {
+            e.tx_count += 1;
+            e.sent_at = Instant::now();
+        }
+    }
+
+    /// Returns the number of times the in-flight segment has been sent,
+    /// or `0` if the sender is idle.
+    pub fn retransmit_count(&self) -> u32 {
+        self.unacked.as_ref().map_or(0, |e| e.tx_count)
+    }
+
+    /// `true` when a segment is waiting for an ACK.
+    pub fn has_unacked(&self) -> bool {
+        self.unacked.is_some()
     }
 }
