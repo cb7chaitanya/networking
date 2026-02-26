@@ -4,6 +4,7 @@ use crate::network::{extract_ns_and_glue, pick_ns_server, query, ROOT_SERVERS};
 use std::collections::HashSet;
 use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use rand::Rng;
 
 /// ------------------------------------------------------------
 /// Configuration
@@ -258,7 +259,7 @@ impl DnsResolver {
             return Err(DnsError::Timeout);
         }
 
-        let query_id = (start.elapsed().as_millis() & 0xFFFF) as u16;
+        let query_id: u16 = rand::rng().random();
         let request = self.create_query_packet(query_id, domain, record_type)?;
         let mut servers: Vec<String> = ROOT_SERVERS.iter().map(|s| (*s).to_string()).collect();
         let mut visited_ns = HashSet::<String>::new();
