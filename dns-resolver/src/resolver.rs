@@ -117,6 +117,23 @@ impl DnsResolver {
         }
     }
 
+    /// Internal version that also validates the transaction ID.
+    /// Rejects mismatched response during iterative resolution.
+    fn parse_response_packet_with_id(
+        &self,
+        data: &[u8],
+        expected_id: u16,
+    ) -> Result<DnsPacket, DnsError> {
+        let packet = self.parse_response_packet(data)?;
+        if packet.header.id != expected_id{
+            return Err(DnsError::InvalidPacket(format!(
+                "Transaction ID mismatch : got {}, expected {}",
+                packet.header.id,expected_id
+            )));
+        }
+        Ok(packet)
+    }
+
     /// Resolve a domain for a given record type
     pub fn resolve(
         &mut self,
@@ -289,7 +306,7 @@ impl DnsResolver {
                     }
                 };
 
-                let packet = match self.parse_response_packet(&response_bytes) {
+                let packet = match self.parse_response_packet_with_id(&response_bytes,query_id) {
                     Ok(p) => p,
                     Err(DnsError::NxDomain) => {
                         self.metrics.lock().unwrap().nxdomain_hits += 1;
@@ -299,6 +316,9 @@ impl DnsResolver {
                     Err(DnsError::ServFail) => {
                         self.metrics.lock().unwrap().servfail_hits += 1;
                         last_error = Some(DnsError::ServFail);
+                        continue;
+                    }
+                    Err(DnsError::InvalidPacket(_)) => {
                         continue;
                     }
                     Err(e) => {

@@ -549,9 +549,7 @@ fn decode_domain_name(data: &[u8], offset: usize) -> Result<(String, usize), Dns
         let bytes = data
             .get(start..end)
             .ok_or_else(|| DnsError::InvalidPacket("label overflow".into()))?;
-        let label =
-            std::str::from_utf8(bytes).map_err(|_| DnsError::InvalidPacket("utf8".into()))?;
-        labels.push(label.to_string());
+        labels.push(String::from_utf8_lossy(bytes).into_owned());
         cursor = end;
     }
 }
