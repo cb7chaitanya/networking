@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 /// ------------------------------------------------------------
 /// Configuration
 /// ------------------------------------------------------------
-const GLOBAL_TIMEOUT: Duration = Duration::from_secs(8);
+pub const GLOBAL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// ------------------------------------------------------------
 /// Metrics
@@ -122,6 +122,17 @@ impl DnsResolver {
         domain: &str,
         record_type: RecordType,
     ) -> Result<Vec<ResourceRecord>, DnsError> {
+        self.resolve_with_timeout(domain, record_type, Instant::now())
+    }
+
+    /// Internal resolve that uses a provided start time for timeout tracking.
+    /// This ensures recursive calls don't reset the timeout window.
+    fn resolve_with_timeout(
+        &mut self,
+        domain: &str,
+        record_type: RecordType,
+        start: Instant,
+    ) -> Result<Vec<ResourceRecord>, DnsError> {
         self.metrics().unwrap().resolve_calls += 1;
 
         // Check cache first (includes negative cache check)
@@ -136,8 +147,6 @@ impl DnsResolver {
         // The cache handles negative cache internally and returns None for both cases
         // We'll proceed to query backend, which will handle NXDOMAIN if needed
         self.metrics.lock().unwrap().cache_misses += 1;
-
-        let start = Instant::now();
 
         // Use backend if provided, otherwise use network (iterative resolution)
         let records = if let Some(backend) = &self.backend {
@@ -344,7 +353,9 @@ impl DnsResolver {
                 // No glue: resolve first NS name to get an IP
                 for (ns_name, _) in &ns_and_glue {
                     if visited_ns.insert(ns_name.clone()) {
-                        if let Ok(a_records) = self.resolve(ns_name, RecordType::A) {
+                        if let Ok(a_records) =
+                            self.resolve_with_timeout(ns_name, RecordType::A, start)
+                        {
                             if let Some(rr) = a_records
                                 .into_iter()
                                 .find(|r| r.record_type == RecordType::A)
