@@ -15,20 +15,19 @@ const GLOBAL_TIMEOUT: Duration = Duration::from_secs(8);
 /// ------------------------------------------------------------
 #[derive(Default, Debug)]
 pub struct ResolverMetrics {
-    pub resolve_calls: u64,    // total resolve calls
-    pub cache_hits: u64,       // served from cache
-    pub cache_misses: u64,     // had to query backend
-    pub cname_follows: u64,    // number of CNAME chains followed
-    pub nxdomain_hits: u64,    // NXDOMAIN responses
-    pub servfail_hits: u64,    // SERVFAIL responses
+    pub resolve_calls: u64, // total resolve calls
+    pub cache_hits: u64,    // served from cache
+    pub cache_misses: u64,  // had to query backend
+    pub cname_follows: u64, // number of CNAME chains followed
+    pub nxdomain_hits: u64, // NXDOMAIN responses
+    pub servfail_hits: u64, // SERVFAIL responses
 }
 
 /// ------------------------------------------------------------
 /// Backend type alias
 /// ------------------------------------------------------------
-pub type BackendFn = dyn Fn(&str, RecordType) -> Result<Vec<ResourceRecord>, DnsError>
-    + Send
-    + Sync;
+pub type BackendFn =
+    dyn Fn(&str, RecordType) -> Result<Vec<ResourceRecord>, DnsError> + Send + Sync;
 
 /// ------------------------------------------------------------
 /// DNS Resolver
@@ -80,13 +79,18 @@ impl DnsResolver {
 
     /// Create a DNS query packet for a domain and record type.
     /// Includes minimal EDNS0 (OPT record) so root servers accept the query.
-    pub fn create_query_packet(&self, id: u16, domain: &str, record_type: RecordType) -> Result<Vec<u8>, DnsError> {
+    pub fn create_query_packet(
+        &self,
+        id: u16,
+        domain: &str,
+        record_type: RecordType,
+    ) -> Result<Vec<u8>, DnsError> {
         let mut packet = DnsPacket::new_query(id, domain.to_string(), record_type);
         // Minimal EDNS0: OPT pseudo-RR (type 41), UDP payload 4096, so root servers respond
         packet.additionals.push(ResourceRecord {
             name: ".".to_string(),
             record_type: RecordType::Unknown(41), // OPT
-            class: RecordClass::Unknown(4096),     // requestor's UDP payload size
+            class: RecordClass::Unknown(4096),    // requestor's UDP payload size
             ttl: 0,
             data: RecordData::Unknown(vec![]),
         });
@@ -97,7 +101,7 @@ impl DnsResolver {
     /// This can be used for future network implementation
     pub fn parse_response_packet(&self, data: &[u8]) -> Result<DnsPacket, DnsError> {
         let packet = DnsPacket::decode(data)?;
-        
+
         // Validate it's a response
         if !packet.header.is_response() {
             return Err(DnsError::InvalidPacket("Not a DNS response".into()));
@@ -125,7 +129,7 @@ impl DnsResolver {
             self.metrics.lock().unwrap().cache_hits += 1;
             return Ok(cached);
         }
-        
+
         // If cache.get returned None, it could be:
         // 1. Cache miss (not in cache)
         // 2. Negative cache hit (domain doesn't exist, cached)
@@ -138,7 +142,13 @@ impl DnsResolver {
         // Use backend if provided, otherwise use network (iterative resolution)
         let records = if let Some(backend) = &self.backend {
             let mut visited = HashSet::new();
-            self.resolve_with_backend(domain.to_string(), record_type, backend, &mut visited, start)?
+            self.resolve_with_backend(
+                domain.to_string(),
+                record_type,
+                backend,
+                &mut visited,
+                start,
+            )?
         } else {
             self.resolve_via_network(domain, record_type, start)?
         };
@@ -148,7 +158,7 @@ impl DnsResolver {
         let mut grouped: HashMap<(String, RecordType), Vec<ResourceRecord>> = HashMap::new();
         for r in &records {
             let key = (r.name.clone(), r.record_type);
-            grouped.entry(key).or_insert_with(Vec::new).push(r.clone());
+            grouped.entry(key).or_default().push(r.clone());
         }
 
         // Cache each group
@@ -294,7 +304,10 @@ impl DnsResolver {
 
                 // We have a response with rcode 0
                 if !packet.answers.is_empty() {
-                    let cname_rr = packet.answers.iter().find(|r| r.record_type == RecordType::CNAME);
+                    let cname_rr = packet
+                        .answers
+                        .iter()
+                        .find(|r| r.record_type == RecordType::CNAME);
                     let has_requested = packet.answers.iter().any(|r| r.record_type == record_type);
 
                     if has_requested {
@@ -308,7 +321,8 @@ impl DnsResolver {
                     if let Some(cname_rr) = cname_rr {
                         if let RecordData::CNAME(target) = &cname_rr.data {
                             self.metrics.lock().unwrap().cname_follows += 1;
-                            let mut chained = self.resolve_via_network(target, record_type, start)?;
+                            let mut chained =
+                                self.resolve_via_network(target, record_type, start)?;
                             chained.insert(0, cname_rr.clone());
                             return Ok(chained);
                         }
@@ -330,16 +344,16 @@ impl DnsResolver {
                 // No glue: resolve first NS name to get an IP
                 for (ns_name, _) in &ns_and_glue {
                     if visited_ns.insert(ns_name.clone()) {
-                        match self.resolve(ns_name, RecordType::A) {
-                            Ok(a_records) => {
-                                if let Some(rr) = a_records.into_iter().find(|r| r.record_type == RecordType::A) {
-                                    if let RecordData::A(addr) = rr.data {
-                                        servers = vec![addr.to_string()];
-                                        continue 'outer;
-                                    }
+                        if let Ok(a_records) = self.resolve(ns_name, RecordType::A) {
+                            if let Some(rr) = a_records
+                                .into_iter()
+                                .find(|r| r.record_type == RecordType::A)
+                            {
+                                if let RecordData::A(addr) = rr.data {
+                                    servers = vec![addr.to_string()];
+                                    continue 'outer;
                                 }
                             }
-                            Err(_) => {}
                         }
                     }
                 }

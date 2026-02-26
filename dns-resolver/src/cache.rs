@@ -1,4 +1,4 @@
-use crate::dns::{ResourceRecord, RecordType, RecordData};
+use crate::dns::{RecordData, RecordType, ResourceRecord};
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, RwLock},
@@ -61,9 +61,10 @@ impl DnsCache {
 
         // Clone what we need first to avoid borrow conflicts
         let result = match inner.map.get(&key) {
-            Some(CacheEntry::Positive { records, expires_at }) if *expires_at > Instant::now() => {
-                Some(records.clone())
-            }
+            Some(CacheEntry::Positive {
+                records,
+                expires_at,
+            }) if *expires_at > Instant::now() => Some(records.clone()),
             Some(CacheEntry::Negative { expires_at }) if *expires_at > Instant::now() => {
                 Some(Vec::new()) // Negative cache hit
             }
@@ -149,13 +150,16 @@ impl DnsCache {
         for i in 0..parts.len() {
             let sub = parts[i..].join(".");
             if let Some(records) = self.get(&sub, RecordType::NS) {
-                let ns: Vec<String> = records.iter().filter_map(|r| {
-                    if let RecordData::NS(n) = &r.data {
-                        Some(n.clone())
-                    } else {
-                        None
-                    }
-                }).collect();
+                let ns: Vec<String> = records
+                    .iter()
+                    .filter_map(|r| {
+                        if let RecordData::NS(n) = &r.data {
+                            Some(n.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
 
                 if !ns.is_empty() {
                     return Some(ns);
@@ -212,7 +216,7 @@ impl Default for DnsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::{RecordClass};
+    use crate::dns::RecordClass;
     use std::net::Ipv4Addr;
     use std::thread::sleep;
 
@@ -422,11 +426,11 @@ mod tests {
         assert_eq!(a_records.len(), 1);
         assert_eq!(ns_records.len(), 1);
         match &a_records[0].data {
-            RecordData::A(_) => {},
+            RecordData::A(_) => {}
             _ => panic!("Expected A record"),
         }
         match &ns_records[0].data {
-            RecordData::NS(_) => {},
+            RecordData::NS(_) => {}
             _ => panic!("Expected NS record"),
         }
     }
@@ -495,7 +499,7 @@ mod tests {
     fn negative_cache_expires() {
         let cache = DnsCache::new();
         cache.put_negative("expire.com", RecordType::A, 1);
-        
+
         // Should be cached (returns None but counts as hit)
         cache.get("expire.com", RecordType::A);
         let (hits, misses, _) = cache.stats();
@@ -564,7 +568,7 @@ mod tests {
     #[test]
     fn stats_misses_tracking() {
         let cache = DnsCache::new();
-        
+
         cache.get("missing1.com", RecordType::A);
         cache.get("missing2.com", RecordType::A);
         cache.get("missing3.com", RecordType::A);
@@ -577,7 +581,7 @@ mod tests {
     #[test]
     fn stats_evictions_tracking() {
         let cache = DnsCache::with_capacity(3);
-        
+
         cache.put(a("a.com", "1.1.1.1", 300));
         cache.put(a("b.com", "2.2.2.2", 300));
         cache.put(a("c.com", "3.3.3.3", 300));
@@ -590,13 +594,13 @@ mod tests {
     #[test]
     fn lru_touch_updates_order() {
         let cache = DnsCache::with_capacity(2);
-        
+
         cache.put(a("a.com", "1.1.1.1", 300));
         cache.put(a("b.com", "2.2.2.2", 300));
-        
+
         // Touch a.com (should move it to end of LRU)
         cache.get("a.com", RecordType::A);
-        
+
         // Add c.com - should evict b.com (oldest untouched), not a.com
         cache.put(a("c.com", "3.3.3.3", 300));
 
@@ -609,7 +613,7 @@ mod tests {
     fn overwrite_existing_record() {
         let cache = DnsCache::new();
         cache.put(a("overwrite.com", "1.1.1.1", 300));
-        
+
         let first = cache.get("overwrite.com", RecordType::A).unwrap();
         match &first[0].data {
             RecordData::A(ip) => assert_eq!(ip.to_string(), "1.1.1.1"),
@@ -617,7 +621,7 @@ mod tests {
         }
 
         cache.put(a("overwrite.com", "2.2.2.2", 300));
-        
+
         let second = cache.get("overwrite.com", RecordType::A).unwrap();
         match &second[0].data {
             RecordData::A(ip) => assert_eq!(ip.to_string(), "2.2.2.2"),
@@ -629,7 +633,7 @@ mod tests {
     fn overwrite_with_multiple() {
         let cache = DnsCache::new();
         cache.put(a("multi.com", "1.1.1.1", 300));
-        
+
         let records = vec![
             a("multi.com", "2.2.2.2", 300),
             a("multi.com", "3.3.3.3", 300),
@@ -680,7 +684,7 @@ mod tests {
         let cache = DnsCache::new();
         // Only A records, no NS
         cache.put(a("example.com", "1.1.1.1", 300));
-        
+
         assert!(cache.get_ns("example.com").is_none());
     }
 
@@ -709,7 +713,7 @@ mod tests {
         let cache = DnsCache::new();
         cache.put(a("multi.com", "1.1.1.1", 300));
         cache.put(ns("multi.com", "ns.multi.com", 300));
-        
+
         fn mx(name: &str, priority: u16, exchange: &str, ttl: u32) -> ResourceRecord {
             ResourceRecord {
                 name: name.into(),
@@ -749,12 +753,12 @@ mod tests {
     fn expired_entry_removed_on_get() {
         let cache = DnsCache::new();
         cache.put(a("expire.com", "1.1.1.1", 1));
-        
+
         sleep(Duration::from_secs(2));
-        
+
         // Getting expired entry should remove it and return None
         assert!(cache.get("expire.com", RecordType::A).is_none());
-        
+
         // Should be removed from cache
         let (hits, misses, _) = cache.stats();
         assert_eq!(misses, 1);

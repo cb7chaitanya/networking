@@ -13,6 +13,9 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
 /// Retries on transient errors (EAGAIN, timeout).
 const QUERY_RETRIES: u32 = 3;
 
+/// Max UDP payload size, matches EDNS0 OPT size
+const UDP_RESPONSE_BUFFER_SIZE: usize = 4096;
+
 /// Root server IPv4 addresses (IANA root hints).
 /// Used to bootstrap iterative resolution.
 pub const ROOT_SERVERS: &[&str] = &[
@@ -56,8 +59,12 @@ pub fn query_udp(server: &str, request: &[u8]) -> Result<Vec<u8>, DnsError> {
     let mut last_err = None;
     for _ in 0..QUERY_RETRIES {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(DnsError::from)?;
-        socket.set_read_timeout(Some(QUERY_TIMEOUT)).map_err(DnsError::from)?;
-        socket.set_write_timeout(Some(QUERY_TIMEOUT)).map_err(DnsError::from)?;
+        socket
+            .set_read_timeout(Some(QUERY_TIMEOUT))
+            .map_err(DnsError::from)?;
+        socket
+            .set_write_timeout(Some(QUERY_TIMEOUT))
+            .map_err(DnsError::from)?;
 
         if let Err(e) = socket.send_to(request, addr) {
             let transient = is_transient_io_error(&e);
@@ -69,7 +76,7 @@ pub fn query_udp(server: &str, request: &[u8]) -> Result<Vec<u8>, DnsError> {
             return Err(last_err.unwrap());
         }
 
-        let mut buf = [0u8; 512];
+        let mut buf = vec![0u8; UDP_RESPONSE_BUFFER_SIZE];
         match socket.recv_from(&mut buf) {
             Ok((len, _)) => return Ok(buf[..len].to_vec()),
             Err(e) => {
@@ -123,10 +130,11 @@ pub fn query_tcp(server: &str, request: &[u8]) -> Result<Vec<u8>, DnsError> {
         })();
         match &result {
             Ok(_) => return result,
-            Err(DnsError::Network(s)) if s.contains("Resource temporarily unavailable")
-                || s.contains("timed out")
-                || s.contains("Connection refused")
-                || s.contains("Connection reset") =>
+            Err(DnsError::Network(s))
+                if s.contains("Resource temporarily unavailable")
+                    || s.contains("timed out")
+                    || s.contains("Connection refused")
+                    || s.contains("Connection reset") =>
             {
                 last_err = result.err();
                 std::thread::sleep(Duration::from_millis(100));
@@ -144,9 +152,8 @@ pub fn query_tcp(server: &str, request: &[u8]) -> Result<Vec<u8>, DnsError> {
 /// Query one server: try UDP first; if response is truncated (TC=1), retry with TCP.
 pub fn query(server: &str, request: &[u8]) -> Result<Vec<u8>, DnsError> {
     let response = query_udp(server, request)?;
-    let packet = DnsPacket::decode(&response).map_err(|e| {
-        DnsError::InvalidPacket(format!("Failed to decode UDP response: {}", e))
-    })?;
+    let packet = DnsPacket::decode(&response)
+        .map_err(|e| DnsError::InvalidPacket(format!("Failed to decode UDP response: {}", e)))?;
     if packet.header.truncated() {
         return query_tcp(server, request);
     }
@@ -192,7 +199,9 @@ pub fn pick_ns_server(ns_and_glue: &[(String, Option<String>)]) -> Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns::{DnsHeader, DnsPacket, DnsQuestion, RecordClass, RecordData, RecordType, ResourceRecord};
+    use crate::dns::{
+        DnsHeader, DnsPacket, DnsQuestion, RecordClass, RecordData, RecordType, ResourceRecord,
+    };
     use std::net::Ipv4Addr;
 
     fn ns(name: &str, ns_host: &str, ttl: u32) -> ResourceRecord {
@@ -226,7 +235,11 @@ mod tests {
             let parsed: std::net::Ipv4Addr = addr
                 .parse()
                 .unwrap_or_else(|_| panic!("root server {} ({}) is not valid IPv4", i, addr));
-            assert!(!parsed.is_unspecified(), "root server {} must not be 0.0.0.0", i);
+            assert!(
+                !parsed.is_unspecified(),
+                "root server {} must not be 0.0.0.0",
+                i
+            );
         }
     }
 
@@ -333,7 +346,10 @@ mod tests {
     fn pick_ns_server_with_glue() {
         let ns_and_glue = vec![
             ("ns1.example.com.".to_string(), None),
-            ("ns2.example.com.".to_string(), Some("192.0.2.2".to_string())),
+            (
+                "ns2.example.com.".to_string(),
+                Some("192.0.2.2".to_string()),
+            ),
         ];
         assert_eq!(pick_ns_server(&ns_and_glue), Some("192.0.2.2".to_string()));
     }
@@ -356,8 +372,14 @@ mod tests {
     #[test]
     fn pick_ns_server_first_glue_wins() {
         let ns_and_glue = vec![
-            ("ns1.example.com.".to_string(), Some("192.0.2.1".to_string())),
-            ("ns2.example.com.".to_string(), Some("192.0.2.2".to_string())),
+            (
+                "ns1.example.com.".to_string(),
+                Some("192.0.2.1".to_string()),
+            ),
+            (
+                "ns2.example.com.".to_string(),
+                Some("192.0.2.2".to_string()),
+            ),
         ];
         assert_eq!(pick_ns_server(&ns_and_glue), Some("192.0.2.1".to_string()));
     }

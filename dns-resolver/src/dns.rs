@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::collections::HashMap;
 use thiserror::Error;
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum RecordType {
     A = 1,
     NS = 2,
@@ -70,8 +71,8 @@ impl std::str::FromStr for RecordType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordClass {
     IN = 1,
-    CH = 3,  // Chaos (historic)
-    HS = 4,  // Hesiod (historic)
+    CH = 3, // Chaos (historic)
+    HS = 4, // Hesiod (historic)
     /// Unknown class (e.g. from server response); allows decoding any qclass/class.
     Unknown(u16),
 }
@@ -97,13 +98,17 @@ impl RecordClass {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum RecordData {
     A(Ipv4Addr),
     AAAA(Ipv6Addr),
     NS(String),
     CNAME(String),
     PTR(String),
-    MX { priority: u16, exchange: String },
+    MX {
+        priority: u16,
+        exchange: String,
+    },
     TXT(String),
     SOA {
         mname: String,
@@ -139,7 +144,11 @@ impl fmt::Display for RecordClass {
 
 impl fmt::Display for ResourceRecord {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} {} {} {:?} ", self.name, self.ttl, self.class, self.record_type)?;
+        write!(
+            f,
+            "{} {} {} {:?} ",
+            self.name, self.ttl, self.class, self.record_type
+        )?;
         match &self.data {
             RecordData::A(a) => write!(f, "{a}"),
             RecordData::AAAA(a) => write!(f, "{a}"),
@@ -148,8 +157,12 @@ impl fmt::Display for ResourceRecord {
             RecordData::PTR(p) => write!(f, "{p}"),
             RecordData::MX { priority, exchange } => write!(f, "{} {}", priority, exchange),
             RecordData::TXT(t) => write!(f, "\"{t}\""),
-            RecordData::SOA { mname, rname, serial, .. } =>
-                write!(f, "{} {} {}", mname, rname, serial),
+            RecordData::SOA {
+                mname,
+                rname,
+                serial,
+                ..
+            } => write!(f, "{} {} {}", mname, rname, serial),
             RecordData::Unknown(_) => write!(f, "<unknown>"),
         }
     }
@@ -189,6 +202,7 @@ impl DnsHeader {
         self.flags & 0x0200 != 0 // TC (Truncated) bit is bit 9
     }
 
+    #[allow(dead_code)]
     pub fn is_authoritative(&self) -> bool {
         self.flags & 0x0400 != 0
     }
@@ -269,7 +283,9 @@ impl DnsPacket {
             out.extend_from_slice(&q.qclass.to_u16().to_be_bytes());
         }
 
-        for rr in self.answers.iter()
+        for rr in self
+            .answers
+            .iter()
             .chain(self.authorities.iter())
             .chain(self.additionals.iter())
         {
@@ -286,14 +302,19 @@ impl DnsPacket {
         for _ in 0..header.qdcount {
             let (name, o) = decode_domain_name(data, offset)?;
             offset = o;
-            let qtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
-            let qclass = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
+            let q_fixed = data
+                .get(offset..offset + 4)
+                .ok_or_else(|| DnsError::InvalidPacket("question overflow".into()))?;
+            let qtype = u16::from_be_bytes([q_fixed[0], q_fixed[1]]);
+            let qclass = u16::from_be_bytes([q_fixed[2], q_fixed[3]]);
             offset += 4;
 
             questions.push(DnsQuestion {
                 name,
-                qtype: RecordType::from_u16(qtype).ok_or(DnsError::InvalidPacket("bad qtype".into()))?,
-                qclass: RecordClass::from_u16(qclass).ok_or(DnsError::InvalidPacket("bad qclass".into()))?,
+                qtype: RecordType::from_u16(qtype)
+                    .ok_or(DnsError::InvalidPacket("bad qtype".into()))?,
+                qclass: RecordClass::from_u16(qclass)
+                    .ok_or(DnsError::InvalidPacket("bad qclass".into()))?,
             });
         }
 
@@ -323,8 +344,8 @@ impl DnsPacket {
 }
 
 /* ============================
-   Domain + RDATA decoding
-   ============================ */
+Domain + RDATA decoding
+============================ */
 
 fn encode_domain_name(
     out: &mut Vec<u8>,
@@ -354,8 +375,7 @@ fn encode_domain_name(
         if let Some(&offset) = compression_map.get(&suffix) {
             // Encode the prefix labels, then use compression pointer
             let prefix_start = out.len();
-            for j in 0..i {
-                let label = parts[j];
+            for label in parts.iter().take(i) {
                 if label.len() > 63 {
                     return Err(DnsError::InvalidPacket("label too long".into()));
                 }
@@ -366,12 +386,16 @@ fn encode_domain_name(
             if offset < 16384 {
                 let ptr = 0xC000u16 | (offset as u16);
                 out.extend_from_slice(&ptr.to_be_bytes());
-                
+
                 // Record the full name and its prefixes for future compression
                 for k in 0..=i {
                     let partial = parts[k..].join(".");
                     if !partial.is_empty() {
-                        compression_map.entry(partial).or_insert(if k == i { offset } else { prefix_start });
+                        compression_map.entry(partial).or_insert(if k == i {
+                            offset
+                        } else {
+                            prefix_start
+                        });
                     }
                 }
                 return Ok(());
@@ -383,25 +407,25 @@ fn encode_domain_name(
     let start_offset = out.len();
     let parts: Vec<&str> = name.split('.').collect();
     let mut current_offset = start_offset;
-    
+
     for (i, label) in parts.iter().enumerate() {
         if label.len() > 63 {
             return Err(DnsError::InvalidPacket("label too long".into()));
         }
-        
+
         // Record this suffix before encoding (for compression)
         let suffix = parts[i..].join(".");
         if !suffix.is_empty() {
             compression_map.entry(suffix).or_insert(current_offset);
         }
-        
+
         // Encode the label
         out.push(label.len() as u8);
         out.extend_from_slice(label.as_bytes());
         current_offset += 1 + label.len(); // length byte + label bytes
     }
     out.push(0);
-    
+
     Ok(())
 }
 
@@ -477,58 +501,92 @@ fn encode_record_data(
     Ok(())
 }
 
-fn decode_domain_name(data: &[u8], mut offset: usize) -> Result<(String, usize), DnsError> {
+fn decode_domain_name(data: &[u8], offset: usize) -> Result<(String, usize), DnsError> {
     let mut labels = Vec::new();
-    let mut jumped = false;
-    let start = offset;
+    let mut cursor = offset;
+    let mut next_offset = None;
+    let mut jumps = 0usize;
 
     loop {
-        let len = *data.get(offset).ok_or(DnsError::InvalidPacket("name overflow".into()))?;
-        offset += 1;
+        let len = *data
+            .get(cursor)
+            .ok_or_else(|| DnsError::InvalidPacket("name overflow".into()))?;
 
         if len == 0 {
-            break;
+            let consumed = next_offset.unwrap_or(cursor + 1);
+            return Ok((labels.join("."), consumed));
         }
 
         if len & 0xC0 == 0xC0 {
-            let ptr = (((len & 0x3F) as usize) << 8)
-                | *data.get(offset).ok_or(DnsError::InvalidPacket("ptr overflow".into()))? as usize;
-            offset += 1;
-            let (name, _) = decode_domain_name(data, ptr)?;
-            labels.push(name);
-            jumped = true;
-            break;
+            let b2 = *data
+                .get(cursor + 1)
+                .ok_or_else(|| DnsError::InvalidPacket("ptr overflow".into()))?
+                as usize;
+            let ptr = (((len & 0x3F) as usize) << 8) | b2;
+            if ptr >= data.len() {
+                return Err(DnsError::InvalidPacket("ptr out of bounds".into()));
+            }
+            if next_offset.is_none() {
+                next_offset = Some(cursor + 2);
+            }
+            cursor = ptr;
+            jumps += 1;
+            if jumps > data.len() {
+                return Err(DnsError::InvalidPacket("compression loop".into()));
+            }
+            continue;
         }
 
-        let end = offset + len as usize;
-        let label = std::str::from_utf8(&data[offset..end])
-            .map_err(|_| DnsError::InvalidPacket("utf8".into()))?;
-        labels.push(label.to_string());
-        offset = end;
-    }
+        if len & 0xC0 != 0 {
+            return Err(DnsError::InvalidPacket("bad label length".into()));
+        }
 
-    Ok((labels.join("."), if jumped { start + 2 } else { offset }))
+        let label_len = len as usize;
+        let start = cursor + 1;
+        let end = start
+            .checked_add(label_len)
+            .ok_or_else(|| DnsError::InvalidPacket("label overflow".into()))?;
+        let bytes = data
+            .get(start..end)
+            .ok_or_else(|| DnsError::InvalidPacket("label overflow".into()))?;
+        let label =
+            std::str::from_utf8(bytes).map_err(|_| DnsError::InvalidPacket("utf8".into()))?;
+        labels.push(label.to_string());
+        cursor = end;
+    }
 }
 
 fn decode_resource_record(data: &[u8], offset: usize) -> Result<(ResourceRecord, usize), DnsError> {
     let (name, mut offset) = decode_domain_name(data, offset)?;
-    let rtype = u16::from_be_bytes([data[offset], data[offset + 1]]);
-    let class = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
-    let ttl = u32::from_be_bytes(data[offset + 4..offset + 8].try_into().unwrap());
-    let rdlen = u16::from_be_bytes([data[offset + 8], data[offset + 9]]) as usize;
+    let rr_fixed = data
+        .get(offset..offset + 10)
+        .ok_or_else(|| DnsError::InvalidPacket("rr header overflow".into()))?;
+    let rtype = u16::from_be_bytes([rr_fixed[0], rr_fixed[1]]);
+    let class = u16::from_be_bytes([rr_fixed[2], rr_fixed[3]]);
+    let ttl = u32::from_be_bytes([rr_fixed[4], rr_fixed[5], rr_fixed[6], rr_fixed[7]]);
+    let rdlen = u16::from_be_bytes([rr_fixed[8], rr_fixed[9]]) as usize;
     offset += 10;
 
-    let rdata = &data[offset..offset + rdlen];
+    let end = offset
+        .checked_add(rdlen)
+        .ok_or_else(|| DnsError::InvalidPacket("rdata overflow".into()))?;
+    let rdata = data
+        .get(offset..end)
+        .ok_or_else(|| DnsError::InvalidPacket("rdata overflow".into()))?;
     let parsed = decode_record_data(rtype, data, offset, rdata)?;
-    offset += rdlen;
+    offset = end;
 
-    Ok((ResourceRecord {
-        name,
-        record_type: RecordType::from_u16(rtype).ok_or(DnsError::InvalidPacket("rtype".into()))?,
-        class: RecordClass::from_u16(class).ok_or(DnsError::InvalidPacket("class".into()))?,
-        ttl,
-        data: parsed,
-    }, offset))
+    Ok((
+        ResourceRecord {
+            name,
+            record_type: RecordType::from_u16(rtype)
+                .ok_or(DnsError::InvalidPacket("rtype".into()))?,
+            class: RecordClass::from_u16(class).ok_or(DnsError::InvalidPacket("class".into()))?,
+            ttl,
+            data: parsed,
+        },
+        offset,
+    ))
 }
 
 fn decode_record_data(
@@ -538,28 +596,76 @@ fn decode_record_data(
     rdata: &[u8],
 ) -> Result<RecordData, DnsError> {
     Ok(match rtype {
-        1 => RecordData::A(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3])),
-        28 => RecordData::AAAA(Ipv6Addr::from(<[u8;16]>::try_from(rdata).unwrap())),
-        2 => RecordData::NS(decode_domain_name(packet, offset)?.0),
-        5 => RecordData::CNAME(decode_domain_name(packet, offset)?.0),
-        12 => RecordData::PTR(decode_domain_name(packet, offset)?.0),
+        1 => {
+            if rdata.len() != 4 {
+                return Err(DnsError::InvalidPacket("bad A rdata len".into()));
+            }
+            RecordData::A(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]))
+        }
+        28 => {
+            let bytes: [u8; 16] = rdata
+                .try_into()
+                .map_err(|_| DnsError::InvalidPacket("bad AAAA rdata len".into()))?;
+            RecordData::AAAA(Ipv6Addr::from(bytes))
+        }
+        2 => {
+            let (ns, end) = decode_domain_name(packet, offset)?;
+            if end > offset + rdata.len() {
+                return Err(DnsError::InvalidPacket("bad NS rdata len".into()));
+            }
+            RecordData::NS(ns)
+        }
+        5 => {
+            let (cname, end) = decode_domain_name(packet, offset)?;
+            if end > offset + rdata.len() {
+                return Err(DnsError::InvalidPacket("bad CNAME rdata len".into()));
+            }
+            RecordData::CNAME(cname)
+        }
+        12 => {
+            let (ptr, end) = decode_domain_name(packet, offset)?;
+            if end > offset + rdata.len() {
+                return Err(DnsError::InvalidPacket("bad PTR rdata len".into()));
+            }
+            RecordData::PTR(ptr)
+        }
         15 => {
+            if rdata.len() < 3 {
+                return Err(DnsError::InvalidPacket("bad MX rdata len".into()));
+            }
             let prio = u16::from_be_bytes([rdata[0], rdata[1]]);
-            let (ex, _) = decode_domain_name(packet, offset + 2)?;
-            RecordData::MX { priority: prio, exchange: ex }
+            let (ex, end) = decode_domain_name(packet, offset + 2)?;
+            if end > offset + rdata.len() {
+                return Err(DnsError::InvalidPacket("bad MX rdata len".into()));
+            }
+            RecordData::MX {
+                priority: prio,
+                exchange: ex,
+            }
         }
         6 => {
+            let rdata_end = offset
+                .checked_add(rdata.len())
+                .ok_or_else(|| DnsError::InvalidPacket("bad SOA rdata len".into()))?;
             let (m, o1) = decode_domain_name(packet, offset)?;
             let (r, o2) = decode_domain_name(packet, o1)?;
-            let nums = &packet[o2..o2 + 20];
+            let nums_end = o2
+                .checked_add(20)
+                .ok_or_else(|| DnsError::InvalidPacket("bad SOA rdata len".into()))?;
+            if nums_end > rdata_end {
+                return Err(DnsError::InvalidPacket("bad SOA rdata len".into()));
+            }
+            let nums = packet
+                .get(o2..nums_end)
+                .ok_or_else(|| DnsError::InvalidPacket("bad SOA rdata len".into()))?;
             RecordData::SOA {
                 mname: m,
                 rname: r,
-                serial: u32::from_be_bytes(nums[0..4].try_into().unwrap()),
-                refresh: u32::from_be_bytes(nums[4..8].try_into().unwrap()),
-                retry: u32::from_be_bytes(nums[8..12].try_into().unwrap()),
-                expire: u32::from_be_bytes(nums[12..16].try_into().unwrap()),
-                minimum: u32::from_be_bytes(nums[16..20].try_into().unwrap()),
+                serial: u32::from_be_bytes([nums[0], nums[1], nums[2], nums[3]]),
+                refresh: u32::from_be_bytes([nums[4], nums[5], nums[6], nums[7]]),
+                retry: u32::from_be_bytes([nums[8], nums[9], nums[10], nums[11]]),
+                expire: u32::from_be_bytes([nums[12], nums[13], nums[14], nums[15]]),
+                minimum: u32::from_be_bytes([nums[16], nums[17], nums[18], nums[19]]),
             }
         }
         16 => {

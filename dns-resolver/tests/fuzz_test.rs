@@ -1,15 +1,15 @@
+use dns_resolver::dns::{RecordClass, RecordData};
+use dns_resolver::{DnsError, DnsResolver, RecordType, ResourceRecord};
 use rand::Rng;
-use std::{thread, time::Duration};
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
 };
-use dns_resolver::{DnsError, DnsResolver, ResourceRecord, RecordType};
-use dns_resolver::dns::{RecordClass, RecordData};
+use std::{thread, time::Duration};
 
-/// ------------------------------------------------------------
-/// Helper functions for creating test records
-/// ------------------------------------------------------------
+// ------------------------------------------------------------
+// Helper functions for creating test records
+// ------------------------------------------------------------
 
 fn a(name: &str, ip: &str, ttl: u32) -> ResourceRecord {
     ResourceRecord {
@@ -51,13 +51,15 @@ fn txt(name: &str, text: &str, ttl: u32) -> ResourceRecord {
     }
 }
 
-/// ------------------------------------------------------------
-/// Mock DNS backend (NO NETWORK)
-/// ------------------------------------------------------------
+// ------------------------------------------------------------
+// Mock DNS backend (NO NETWORK)
+// ------------------------------------------------------------
+
+type ResponseMap = HashMap<(String, RecordType), Result<Vec<ResourceRecord>, DnsError>>;
 
 #[derive(Clone, Default)]
 struct MockDnsBackend {
-    responses: Arc<RwLock<HashMap<(String, RecordType), Result<Vec<ResourceRecord>, DnsError>>>>,
+    responses: Arc<RwLock<ResponseMap>>,
 }
 
 impl MockDnsBackend {
@@ -77,31 +79,29 @@ impl MockDnsBackend {
 
     fn resolve(&self, name: &str, rtype: RecordType) -> Result<Vec<ResourceRecord>, DnsError> {
         let responses = self.responses.read().unwrap();
-        
+
         // First try exact match
         if let Some(result) = responses.get(&(name.to_string(), rtype)) {
             return result.clone();
         }
-        
+
         // If querying for A/AAAA and not found, check for CNAME (RFC 1034)
         if matches!(rtype, RecordType::A | RecordType::AAAA) {
             if let Some(result) = responses.get(&(name.to_string(), RecordType::CNAME)) {
                 return result.clone();
             }
         }
-        
+
         Err(DnsError::NxDomain)
     }
 }
 
-/// ------------------------------------------------------------
-/// Helper: resolver with mock backend
-/// ------------------------------------------------------------
+// ------------------------------------------------------------
+// Helper: resolver with mock backend
+// ------------------------------------------------------------
 
 fn test_resolver(backend: MockDnsBackend) -> DnsResolver {
-    DnsResolver::with_backend(Box::new(move |name, rtype| {
-        backend.resolve(name, rtype)
-    }))
+    DnsResolver::with_backend(Box::new(move |name, rtype| backend.resolve(name, rtype)))
 }
 
 #[test]
@@ -119,7 +119,11 @@ fn fuzz_cname_chains() {
 
     // Insert CNAMEs linking the chain
     for i in (0..names.len() - 1).rev() {
-        backend.insert_ok(&names[i], RecordType::CNAME, vec![cname(&names[i], &names[i + 1], 60)]);
+        backend.insert_ok(
+            &names[i],
+            RecordType::CNAME,
+            vec![cname(&names[i], &names[i + 1], 60)],
+        );
     }
 
     let mut resolver = test_resolver(backend);
@@ -127,10 +131,11 @@ fn fuzz_cname_chains() {
 
     // The resolver returns CNAME records followed by the final A record
     // Find the A record (should be the last one)
-    let a_record = resolved.iter()
+    let a_record = resolved
+        .iter()
         .find(|r| matches!(r.record_type, RecordType::A))
         .expect("Expected A record at end of CNAME chain");
-    
+
     match &a_record.data {
         RecordData::A(ip) => assert_eq!(ip.to_string(), "1.2.3.4"),
         _ => panic!("Expected A record at end of CNAME chain"),
@@ -191,19 +196,36 @@ fn fuzz_mixed_record_types_random() {
 
     let names = ["mixed1.com", "mixed2.com", "mixed3.com"];
     backend.insert_ok(names[0], RecordType::A, vec![a(names[0], "1.1.1.1", 60)]);
-    backend.insert_ok(names[1], RecordType::AAAA, vec![aaaa(names[1], "2001:db8::1", 60)]);
-    backend.insert_ok(names[2], RecordType::TXT, vec![txt(names[2], "random text", 60)]);
+    backend.insert_ok(
+        names[1],
+        RecordType::AAAA,
+        vec![aaaa(names[1], "2001:db8::1", 60)],
+    );
+    backend.insert_ok(
+        names[2],
+        RecordType::TXT,
+        vec![txt(names[2], "random text", 60)],
+    );
 
     let mut resolver = test_resolver(backend);
 
     let a_res = resolver.resolve(names[0], RecordType::A).unwrap();
-    match &a_res[0].data { RecordData::A(ip) => assert_eq!(ip.to_string(), "1.1.1.1"), _ => panic!() }
+    match &a_res[0].data {
+        RecordData::A(ip) => assert_eq!(ip.to_string(), "1.1.1.1"),
+        _ => panic!(),
+    }
 
     let aaaa_res = resolver.resolve(names[1], RecordType::AAAA).unwrap();
-    match &aaaa_res[0].data { RecordData::AAAA(ip) => assert_eq!(ip.to_string(), "2001:db8::1"), _ => panic!() }
+    match &aaaa_res[0].data {
+        RecordData::AAAA(ip) => assert_eq!(ip.to_string(), "2001:db8::1"),
+        _ => panic!(),
+    }
 
     let txt_res = resolver.resolve(names[2], RecordType::TXT).unwrap();
-    match &txt_res[0].data { RecordData::TXT(s) => assert_eq!(s, "random text"), _ => panic!() }
+    match &txt_res[0].data {
+        RecordData::TXT(s) => assert_eq!(s, "random text"),
+        _ => panic!(),
+    }
 }
 
 #[test]
