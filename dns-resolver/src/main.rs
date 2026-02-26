@@ -1,28 +1,24 @@
-mod cache;
-mod dns;
-mod network;
-mod resolver;
-
 use anyhow::Result;
+use dns_resolver::{DnsResolver, RecordType};
 use std::env;
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() < 2 {
         eprintln!("Usage: {} <domain> [record_type]", args[0]);
         eprintln!("Example: {} example.com A", args[0]);
         std::process::exit(1);
     }
-    
+
     let domain = &args[1];
     let record_type = if args.len() >= 3 {
-        args[2].parse().unwrap_or(dns::RecordType::A)
+        args[2].parse().unwrap_or(RecordType::A)
     } else {
-        dns::RecordType::A
+        RecordType::A
     };
-    
-    let mut resolver = resolver::DnsResolver::new();
+
+    let mut resolver = DnsResolver::new();
     match resolver.resolve(domain, record_type) {
         Ok(records) => {
             for record in records {
@@ -34,7 +30,6 @@ fn main() -> Result<()> {
             std::process::exit(1);
         }
     }
-    
+
     Ok(())
 }
-
