@@ -1,0 +1,18 @@
+[package]
+name = "tcp-over-udp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "tcp-over-udp"
+path = "src/main.rs"
+
+[lib]
+name = "tcp_over_udp"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
