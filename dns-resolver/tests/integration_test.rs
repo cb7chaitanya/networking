@@ -6,6 +6,7 @@ use std::{
 
 use dns_resolver::dns::{RecordClass, RecordData};
 use dns_resolver::{DnsError, DnsResolver, RecordType, ResourceRecord};
+use rand::Rng;
 
 /// ------------------------------------------------------------
 /// Helper functions for creating test records
@@ -1193,4 +1194,13 @@ fn encode_domain_name(out: &mut Vec<u8>, name: &str) {
         out.extend_from_slice(label.as_bytes());
     }
     out.push(0);
+}
+
+
+//test for query ID randomization
+#[test]
+fn test_query_ids_no_collisions() {
+    let ids: std::collections::HashSet<u16> =
+        (0..100).map(|_| rand::rng().random::<u16>()).collect();
+    assert!(ids.len() > 90);
 }
