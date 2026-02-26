@@ -31,6 +31,9 @@
 //!
 //! Total header size: [`HEADER_LEN`] = 15 bytes.
 //! seq(4) + ack(4) + flags(1) + window(2) + payload_len(2) + checksum(2)
+//!
+//! `payload_len` exists on the wire for framing but is not stored in the
+//! in-memory [`Header`]; use `packet.payload.len()` as the canonical length.
 
 /// Bit-flag constants for the `flags` header field.
 pub mod flags {
@@ -42,6 +45,8 @@ pub mod flags {
     pub const FIN: u8 = 0b0000_0100;
     /// Reset the connection.
     pub const RST: u8 = 0b0000_1000;
+    /// Mask of all defined flag bits; any bit outside this mask is invalid.
+    pub const VALID_FLAGS: u8 = SYN | ACK | FIN | RST;
 }
 
 /// Byte length of the fixed-size header on the wire.
@@ -55,10 +60,14 @@ const OFF_WINDOW: usize = 9;
 const OFF_PAYLOAD_LEN: usize = 11;
 const OFF_CHECKSUM: usize = 13;
 
-/// Fixed-size protocol header.
+/// Fixed-size protocol header (in-memory representation).
 ///
 /// Fields are in host byte order; [`Packet::encode`] converts to big-endian
 /// on the wire and [`Packet::decode`] converts back.
+///
+/// `payload_len` is intentionally absent: it exists on the wire for framing
+/// and is validated during [`Packet::decode`], but the canonical length is
+/// always `packet.payload.len()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Header {
     /// Sequence number of the first payload byte in this segment.
@@ -69,11 +78,6 @@ pub struct Header {
     pub flags: u8,
     /// Advertised receive-window size in bytes.
     pub window: u16,
-    /// Length of the payload in bytes.
-    ///
-    /// On encode this is computed from the actual payload length.
-    /// On decode this is validated against the remaining buffer bytes.
-    pub payload_len: u16,
     /// Internet checksum (RFC 1071) over the entire serialised packet.
     ///
     /// On encode this is computed and written last.
@@ -91,10 +95,16 @@ pub struct Packet {
 impl Packet {
     /// Serialise this packet into a newly allocated byte vector.
     ///
-    /// `header.payload_len` and `header.checksum` are computed from the actual
-    /// payload; any values already stored in those fields are ignored.
-    pub fn encode(&self) -> Vec<u8> {
+    /// `payload_len` and `checksum` are computed from the actual payload;
+    /// any value already stored in `header.checksum` is ignored.
+    ///
+    /// Returns [`Err`] if the payload exceeds 65 535 bytes.
+    pub fn encode(&self) -> Result<Vec<u8>, PacketError> {
         let payload_len = self.payload.len();
+        if payload_len > u16::MAX as usize {
+            return Err(PacketError::PayloadTooLarge);
+        }
+
         let mut buf = vec![0u8; HEADER_LEN + payload_len];
 
         buf[OFF_SEQ..OFF_SEQ + 4].copy_from_slice(&self.header.seq.to_be_bytes());
@@ -111,14 +121,15 @@ impl Packet {
         let csum = internet_checksum(&buf);
         buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].copy_from_slice(&csum.to_be_bytes());
 
-        buf
+        Ok(buf)
     }
 
     /// Parse a [`Packet`] from a raw byte slice.
     ///
     /// Returns [`Err`] if:
     /// - `buf` is shorter than [`HEADER_LEN`],
-    /// - the `payload_len` field disagrees with `buf.len()`, or
+    /// - the wire `payload_len` field disagrees with `buf.len()`,
+    /// - the `flags` field contains bits outside [`flags::VALID_FLAGS`], or
     /// - the checksum does not verify.
     pub fn decode(buf: &[u8]) -> Result<Self, PacketError> {
         if buf.len() < HEADER_LEN {
@@ -128,27 +139,33 @@ impl Packet {
         let seq = u32::from_be_bytes(
             buf[OFF_SEQ..OFF_SEQ + 4]
                 .try_into()
-                .map_err(|_| PacketError::BufferTooShort)?
+                .map_err(|_| PacketError::BufferTooShort)?,
         );
         let ack = u32::from_be_bytes(
             buf[OFF_ACK..OFF_ACK + 4]
                 .try_into()
-                .map_err(|_| PacketError::BufferTooShort)?
+                .map_err(|_| PacketError::BufferTooShort)?,
         );
-        let flags = buf[OFF_FLAGS];
+        let raw_flags = buf[OFF_FLAGS];
+        if raw_flags & !flags::VALID_FLAGS != 0 {
+            return Err(PacketError::InvalidFlags);
+        }
         let window = u16::from_be_bytes(
             buf[OFF_WINDOW..OFF_WINDOW + 2]
                 .try_into()
-                .map_err(|_| PacketError::BufferTooShort)?
+                .map_err(|_| PacketError::BufferTooShort)?,
         );
-        let payload_len =
-            u16::from_be_bytes(
-                buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 2]
-                    .try_into()
-                    .map_err(|_| PacketError::BufferTooShort)?
-            );
-        let checksum =
-            u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().map_err(|_| PacketError::BufferTooShort)?);
+        // payload_len is a wire-framing field: validate it then discard.
+        let payload_len = u16::from_be_bytes(
+            buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 2]
+                .try_into()
+                .map_err(|_| PacketError::BufferTooShort)?,
+        );
+        let checksum = u16::from_be_bytes(
+            buf[OFF_CHECKSUM..OFF_CHECKSUM + 2]
+                .try_into()
+                .map_err(|_| PacketError::BufferTooShort)?,
+        );
 
         if buf.len() != HEADER_LEN + payload_len as usize {
             return Err(PacketError::LengthMismatch);
@@ -165,9 +182,8 @@ impl Packet {
             header: Header {
                 seq,
                 ack,
-                flags,
+                flags: raw_flags,
                 window,
-                payload_len,
                 checksum,
             },
             payload: buf[HEADER_LEN..].to_vec(),
@@ -175,7 +191,7 @@ impl Packet {
     }
 }
 
-/// Errors that can arise when parsing a raw datagram.
+/// Errors that can arise when encoding or parsing a datagram.
 #[derive(Debug, PartialEq, Eq)]
 pub enum PacketError {
     /// Buffer shorter than the fixed header size.
@@ -184,6 +200,10 @@ pub enum PacketError {
     LengthMismatch,
     /// Checksum did not match recomputed value.
     ChecksumFailed,
+    /// `flags` field contains bits outside the defined set.
+    InvalidFlags,
+    /// Payload exceeds the 65 535-byte wire limit.
+    PayloadTooLarge,
 }
 
 impl std::fmt::Display for PacketError {
@@ -194,6 +214,8 @@ impl std::fmt::Display for PacketError {
                 write!(f, "payload_len field does not match remaining bytes")
             }
             PacketError::ChecksumFailed => write!(f, "checksum verification failed"),
+            PacketError::InvalidFlags => write!(f, "flags field contains undefined bits"),
+            PacketError::PayloadTooLarge => write!(f, "payload exceeds 65535-byte wire limit"),
         }
     }
 }
@@ -237,8 +259,7 @@ mod tests {
                 ack,
                 flags,
                 window,
-                payload_len: 0, // overwritten by encode
-                checksum: 0,    // overwritten by encode
+                checksum: 0, // overwritten by encode
             },
             payload: payload.to_vec(),
         }
@@ -247,19 +268,18 @@ mod tests {
     #[test]
     fn encode_decode_roundtrip() {
         let pkt = make_packet(42, 0, flags::SYN, 4096, b"hello");
-        let decoded = Packet::decode(&pkt.encode()).unwrap();
+        let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
         assert_eq!(decoded.header.seq, pkt.header.seq);
         assert_eq!(decoded.header.ack, pkt.header.ack);
         assert_eq!(decoded.header.flags, pkt.header.flags);
         assert_eq!(decoded.header.window, pkt.header.window);
-        assert_eq!(decoded.header.payload_len, pkt.payload.len() as u16);
         assert_eq!(decoded.payload, pkt.payload);
     }
 
     #[test]
     fn encode_sets_correct_payload_len() {
         let pkt = make_packet(1, 2, flags::ACK, 8192, b"world");
-        let bytes = pkt.encode();
+        let bytes = pkt.encode().unwrap();
         let len_field = u16::from_be_bytes([bytes[OFF_PAYLOAD_LEN], bytes[OFF_PAYLOAD_LEN + 1]]);
         assert_eq!(len_field, pkt.payload.len() as u16);
     }
@@ -279,30 +299,29 @@ mod tests {
 
     #[test]
     fn decode_truncated_payload_returns_error() {
-        let mut bytes = make_packet(0, 0, 0, 0, b"data").encode();
+        let mut bytes = make_packet(0, 0, 0, 0, b"data").encode().unwrap();
         bytes.pop(); // payload_len still claims 4 bytes, but buf is one short
         assert_eq!(Packet::decode(&bytes), Err(PacketError::LengthMismatch));
     }
 
     #[test]
     fn decode_corrupt_byte_returns_checksum_error() {
-        let mut bytes = make_packet(99, 0, flags::SYN, 1024, b"test").encode();
+        let mut bytes = make_packet(99, 0, flags::SYN, 1024, b"test").encode().unwrap();
         bytes[0] ^= 0xff;
         assert_eq!(Packet::decode(&bytes), Err(PacketError::ChecksumFailed));
     }
 
     #[test]
     fn syn_flag_is_set_correctly() {
-        let bytes = make_packet(0, 0, flags::SYN, 0, b"").encode();
+        let bytes = make_packet(0, 0, flags::SYN, 0, b"").encode().unwrap();
         assert_eq!(bytes[OFF_FLAGS] & flags::SYN, flags::SYN);
     }
 
     #[test]
     fn empty_payload_roundtrip() {
         let pkt = make_packet(0, 1000, flags::ACK, 65535, b"");
-        let decoded = Packet::decode(&pkt.encode()).unwrap();
+        let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
         assert_eq!(decoded.payload, Vec::<u8>::new());
-        assert_eq!(decoded.header.payload_len, 0);
     }
 
     #[test]
@@ -314,21 +333,39 @@ mod tests {
     #[test]
     fn encoded_length_equals_header_plus_payload() {
         let payload = b"exactly twelve!";
-        let bytes = make_packet(0, 0, 0, 0, payload).encode();
+        let bytes = make_packet(0, 0, 0, 0, payload).encode().unwrap();
         assert_eq!(bytes.len(), HEADER_LEN + payload.len());
     }
 
     #[test]
     fn multiple_flag_bits() {
         let f = flags::SYN | flags::ACK;
-        let bytes = make_packet(1, 2, f, 512, b"").encode();
+        let bytes = make_packet(1, 2, f, 512, b"").encode().unwrap();
         assert_eq!(bytes[OFF_FLAGS], f);
     }
 
     #[test]
     fn seq_ack_big_endian_on_wire() {
-        let bytes = make_packet(0x0102_0304, 0x0506_0708, 0, 0, b"").encode();
+        let bytes = make_packet(0x0102_0304, 0x0506_0708, 0, 0, b"").encode().unwrap();
         assert_eq!(&bytes[OFF_SEQ..OFF_SEQ + 4], &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(&bytes[OFF_ACK..OFF_ACK + 4], &[0x05, 0x06, 0x07, 0x08]);
+    }
+
+    #[test]
+    fn decode_invalid_flags_returns_error() {
+        // Build a valid packet, then flip an undefined flag bit.
+        let mut bytes = make_packet(0, 0, flags::SYN, 0, b"").encode().unwrap();
+        bytes[OFF_FLAGS] |= 0b1111_0000; // bits 4–7 are undefined
+        assert_eq!(Packet::decode(&bytes), Err(PacketError::InvalidFlags));
+    }
+
+    #[test]
+    fn encode_payload_too_large_returns_error() {
+        let oversized = vec![0u8; u16::MAX as usize + 1];
+        let pkt = Packet {
+            header: Header { seq: 0, ack: 0, flags: 0, window: 0, checksum: 0 },
+            payload: oversized,
+        };
+        assert_eq!(pkt.encode(), Err(PacketError::PayloadTooLarge));
     }
 }
