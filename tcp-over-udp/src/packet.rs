@@ -125,14 +125,30 @@ impl Packet {
             return Err(PacketError::BufferTooShort);
         }
 
-        let seq = u32::from_be_bytes(buf[OFF_SEQ..OFF_SEQ + 4].try_into().unwrap());
-        let ack = u32::from_be_bytes(buf[OFF_ACK..OFF_ACK + 4].try_into().unwrap());
+        let seq = u32::from_be_bytes(
+            buf[OFF_SEQ..OFF_SEQ + 4]
+                .try_into()
+                .map_err(|_| PacketError::BufferTooShort)?
+        );
+        let ack = u32::from_be_bytes(
+            buf[OFF_ACK..OFF_ACK + 4]
+                .try_into()
+                .map_err(|_| PacketError::BufferTooShort)?
+        );
         let flags = buf[OFF_FLAGS];
-        let window = u16::from_be_bytes(buf[OFF_WINDOW..OFF_WINDOW + 2].try_into().unwrap());
+        let window = u16::from_be_bytes(
+            buf[OFF_WINDOW..OFF_WINDOW + 2]
+                .try_into()
+                .map_err(|_| PacketError::BufferTooShort)?
+        );
         let payload_len =
-            u16::from_be_bytes(buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 2].try_into().unwrap());
+            u16::from_be_bytes(
+                buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 2]
+                    .try_into()
+                    .map_err(|_| PacketError::BufferTooShort)?
+            );
         let checksum =
-            u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
+            u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().map_err(|_| PacketError::BufferTooShort)?);
 
         if buf.len() != HEADER_LEN + payload_len as usize {
             return Err(PacketError::LengthMismatch);
