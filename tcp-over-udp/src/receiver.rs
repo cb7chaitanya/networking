@@ -1,69 +1,86 @@
-//! Inbound segment reassembly and receive-window management.
+//! Inbound segment delivery for stop-and-wait reliability.
 //!
-//! The [`Receiver`] is responsible for everything that happens *after* a raw
-//! datagram is decoded into a [`crate::packet::Packet`] and *before* the
-//! application reads contiguous bytes:
-//! - Validating that a segment's sequence number falls within the receive window.
-//! - Buffering out-of-order segments until gaps are filled (resequencing).
-//! - Delivering in-order data to the application receive buffer.
-//! - Computing the ACK number and advertised window for outbound ACK packets.
-//! - Detecting and discarding duplicate segments.
+//! [`Receiver`] tracks `RCV.NXT` (the next expected sequence number) and
+//! buffers in-order payload bytes for the application.  Out-of-order or
+//! duplicate segments are silently rejected; the caller re-ACKs with the
+//! current `ack_number()` in both cases, prompting the sender to retransmit.
 //!
-//! The [`Receiver`] does **not** send ACKs itself; it provides the values
-//! that [`crate::connection::Connection`] uses when constructing ACK packets.
+//! The module does **not** send ACKs — it only supplies the values that
+//! [`crate::connection::Connection`] puts into outbound ACK packets.
 
-/// Manages the receive side of a single connection.
-///
-/// TODO: add fields for receive buffer (`VecDeque<u8>`), RCV.NXT, RCV.WND,
-///       and an out-of-order segment store (e.g. `BTreeMap<u32, Vec<u8>>`).
+use std::collections::VecDeque;
+
+/// Stop-and-wait receive-side state for one connection.
+#[derive(Debug)]
 pub struct Receiver {
-    /// Bytes ready to be consumed by the application, in order.
-    pub app_buffer: Vec<u8>,
+    /// Next expected sequence number (`RCV.NXT`).
+    ///
+    /// Advances by `payload.len()` each time an in-order segment is accepted.
+    pub rcv_nxt: u32,
+
+    /// Bytes received in order, ready for the application to consume.
+    pub app_buffer: VecDeque<u8>,
+
+    /// Advertised receive window (fixed for stop-and-wait; no flow control).
+    window: u16,
 }
 
 impl Receiver {
     /// Create a new [`Receiver`].
     ///
-    /// TODO: accept initial receive sequence number (IRS) as parameter.
-    pub fn new() -> Self {
-        todo!("construct Receiver")
+    /// `rcv_nxt` is the first sequence number expected from the peer.  For a
+    /// freshly completed handshake this is `peer_isn + 1` (the SYN consumed
+    /// one sequence number).
+    pub fn new(rcv_nxt: u32) -> Self {
+        Self {
+            rcv_nxt,
+            app_buffer: VecDeque::new(),
+            window: 8192,
+        }
     }
 
     /// Process an inbound segment.
     ///
-    /// Validates sequence number against the receive window, stores the
-    /// payload, and advances `RCV.NXT` as far as possible.
-    ///
-    /// TODO: handle wrap-around arithmetic for 32-bit sequence numbers.
-    pub fn on_segment(&mut self, _seq: u32, _payload: &[u8]) {
-        todo!("accept inbound segment")
+    /// Returns `true` if the segment was accepted (seq == RCV.NXT) and its
+    /// payload appended to the application buffer.  Returns `false` for a
+    /// duplicate (seq < RCV.NXT) or out-of-order (seq > RCV.NXT) segment;
+    /// the caller should still send an ACK with the current `ack_number()`.
+    pub fn on_segment(&mut self, seq: u32, payload: &[u8]) -> bool {
+        if seq == self.rcv_nxt {
+            self.app_buffer.extend(payload.iter().copied());
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(payload.len() as u32);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Return the next ACK number the connection should send.
-    ///
-    /// This is `RCV.NXT` — the sequence number of the first byte not yet
-    /// received in order.
-    ///
-    /// TODO: return stored `RCV.NXT`.
+    /// Advance `RCV.NXT` past a received FIN (which consumes one sequence
+    /// number) without delivering any payload bytes.
+    pub fn on_fin(&mut self, fin_seq: u32) {
+        if fin_seq == self.rcv_nxt {
+            self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+        }
+    }
+
+    /// The ACK number to place in the next outbound packet (`RCV.NXT`).
     pub fn ack_number(&self) -> u32 {
-        todo!("return RCV.NXT")
+        self.rcv_nxt
     }
 
-    /// Return the current advertised receive window size.
-    ///
-    /// Computed as `RCV.WND - bytes_buffered_but_not_read`.
-    ///
-    /// TODO: implement based on app_buffer capacity.
+    /// The advertised receive window to place in the next outbound packet.
     pub fn window_size(&self) -> u16 {
-        todo!("return available window")
+        self.window
     }
 
-    /// Read up to `buf.len()` bytes of ordered application data.
+    /// Copy up to `buf.len()` bytes of in-order application data into `buf`.
     ///
-    /// Returns the number of bytes copied.
-    ///
-    /// TODO: drain from app_buffer into `buf`.
-    pub fn read(&mut self, _buf: &mut [u8]) -> usize {
-        todo!("drain app_buffer")
+    /// Returns the number of bytes actually copied.
+    pub fn read(&mut self, buf: &mut [u8]) -> usize {
+        let n = buf.len().min(self.app_buffer.len());
+        for (dst, src) in buf[..n].iter_mut().zip(self.app_buffer.drain(..n)) {
+            *dst = src;
+        }
+        n
     }
 }
