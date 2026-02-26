@@ -5,7 +5,7 @@ use std::{
 };
 
 use dns_resolver::dns::{RecordClass, RecordData};
-use dns_resolver::{DnsError, DnsResolver, RecordType, ResourceRecord};
+use dns_resolver::{DnsError, DnsResolver, RecordType, ResourceRecord, GLOBAL_TIMEOUT};
 
 /// ------------------------------------------------------------
 /// Helper functions for creating test records
@@ -122,12 +122,33 @@ use record_helpers::*;
 /// ------------------------------------------------------------
 type ResponseMap = HashMap<(String, RecordType), Result<Vec<ResourceRecord>, DnsError>>;
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct MockDnsBackend {
     responses: Arc<RwLock<ResponseMap>>,
+    delay_per_query: Duration,
+}
+
+impl Default for MockDnsBackend {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MockDnsBackend {
+    fn new() -> Self {
+        Self {
+            responses: Arc::new(RwLock::new(ResponseMap::default())),
+            delay_per_query: Duration::ZERO,
+        }
+    }
+
+    fn with_delay(delay_per_query: Duration) -> Self {
+        Self {
+            responses: Arc::new(RwLock::new(ResponseMap::default())),
+            delay_per_query,
+        }
+    }
+
     fn insert_ok(&self, name: &str, rtype: RecordType, records: Vec<ResourceRecord>) {
         self.responses
             .write()
@@ -143,6 +164,9 @@ impl MockDnsBackend {
     }
 
     fn resolve(&self, name: &str, rtype: RecordType) -> Result<Vec<ResourceRecord>, DnsError> {
+        if self.delay_per_query > Duration::ZERO {
+            std::thread::sleep(self.delay_per_query);
+        }
         self.responses
             .read()
             .unwrap()
@@ -1184,6 +1208,51 @@ fn truncated_rdata_returns_error_not_panic() {
         Err(DnsError::InvalidPacket(_)) => {}
         Err(other) => panic!("expected InvalidPacket, got {:?}", other),
     }
+}
+
+#[test]
+fn recursive_resolution_enforces_global_timeout() {
+    let backend = MockDnsBackend::with_delay(Duration::from_millis(2000));
+
+    backend.insert_ok(
+        "a.com",
+        RecordType::CNAME,
+        vec![cname("a.com", "b.com", 60)],
+    );
+    backend.insert_ok(
+        "b.com",
+        RecordType::CNAME,
+        vec![cname("b.com", "c.com", 60)],
+    );
+    backend.insert_ok(
+        "c.com",
+        RecordType::CNAME,
+        vec![cname("c.com", "d.com", 60)],
+    );
+    backend.insert_ok(
+        "d.com",
+        RecordType::CNAME,
+        vec![cname("d.com", "e.com", 60)],
+    );
+    backend.insert_ok("e.com", RecordType::A, vec![a("e.com", "1.2.3.4", 60)]);
+
+    let mut resolver = test_resolver(backend);
+
+    let start = Instant::now();
+    let result = resolver.resolve("a.com", RecordType::A);
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(result, Err(DnsError::Timeout)),
+        "Expected Timeout error, got {:?}",
+        result
+    );
+    assert!(
+        elapsed >= GLOBAL_TIMEOUT,
+        "Resolution should have timed out after {}ms, but took {:?}",
+        GLOBAL_TIMEOUT.as_millis(),
+        elapsed
+    );
 }
 
 // Helper function for encoding domain names in tests
