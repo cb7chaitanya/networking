@@ -1,24 +1,25 @@
 //! Entry point for `tcp-over-udp`.
 //!
-//! # Usage
+//! # Stop-and-wait demo
 //!
-//! Run the server in one terminal:
-//! ```
+//! ```text
 //! RUST_LOG=debug cargo run -- server --bind 127.0.0.1:9000
-//! ```
-//!
-//! Then run the client in another:
-//! ```
 //! RUST_LOG=debug cargo run -- client --server 127.0.0.1:9000
 //! ```
 //!
-//! The client sends "Ping!" and the server echoes "Pong!".
+//! # Go-Back-N demo (pipelined, window = 4)
+//!
+//! ```text
+//! RUST_LOG=debug cargo run -- gbn-server --bind 127.0.0.1:9001
+//! RUST_LOG=debug cargo run -- gbn-client --server 127.0.0.1:9001 --window 4
+//! ```
 
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
 use tcp_over_udp::{
     connection::{ConnError, Connection},
+    gbn_connection::GbnConnection,
     socket::Socket,
 };
 
@@ -36,17 +37,34 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Mode {
-    /// Listen for one incoming connection, receive a message, echo a reply.
+    /// Stop-and-wait server: receive one message, echo a reply.
     Server {
-        /// Local address to bind (e.g. 127.0.0.1:9000).
         #[arg(short, long, default_value = "0.0.0.0:9000")]
         bind: String,
     },
-    /// Connect to the server, send "Ping!", receive "Pong!".
+    /// Stop-and-wait client: send "Ping!", receive "Pong!".
     Client {
-        /// Remote server address (e.g. 127.0.0.1:9000).
         #[arg(short, long)]
         server: String,
+    },
+    /// Go-Back-N server: receive multiple pipelined messages, echo each one.
+    GbnServer {
+        #[arg(short, long, default_value = "0.0.0.0:9001")]
+        bind: String,
+        /// GBN receive window size N.
+        #[arg(short, long, default_value_t = 4)]
+        window: usize,
+    },
+    /// Go-Back-N client: pipeline N messages without waiting for individual ACKs.
+    GbnClient {
+        #[arg(short, long)]
+        server: String,
+        /// GBN send window size N.
+        #[arg(short, long, default_value_t = 4)]
+        window: usize,
+        /// Number of messages to send in a pipeline burst.
+        #[arg(short, long, default_value_t = 8)]
+        count: usize,
     },
 }
 
@@ -63,6 +81,8 @@ async fn main() {
     let result = match cli.mode {
         Mode::Server { bind } => run_server(bind).await,
         Mode::Client { server } => run_client(server).await,
+        Mode::GbnServer { bind, window } => run_gbn_server(bind, window).await,
+        Mode::GbnClient { server, window, count } => run_gbn_client(server, window, count).await,
     };
 
     if let Err(e) = result {
@@ -125,5 +145,76 @@ async fn run_client(server: String) -> Result<(), ConnError> {
 
     conn.close().await?;
     log::info!("client done");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GBN server
+// ---------------------------------------------------------------------------
+
+async fn run_gbn_server(bind: String, window: usize) -> Result<(), ConnError> {
+    let addr: SocketAddr = bind.parse().expect("invalid bind address");
+    let socket = Socket::bind(addr).await.map_err(ConnError::Socket)?;
+    log::info!("gbn-server listening on {} (window={})", socket.local_addr, window);
+
+    let mut conn = GbnConnection::accept(socket, window).await?;
+    log::info!("gbn connection established");
+
+    // Receive messages until the client closes, echoing each one back.
+    loop {
+        match conn.recv().await {
+            Ok(data) => {
+                let msg = String::from_utf8_lossy(&data);
+                log::info!("gbn-server received: {:?}", msg);
+                conn.send(&data).await?; // echo
+            }
+            Err(ConnError::Eof) => {
+                log::info!("gbn-server: client closed connection");
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    conn.close().await?;
+    log::info!("gbn-server done");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// GBN client
+// ---------------------------------------------------------------------------
+
+async fn run_gbn_client(server: String, window: usize, count: usize) -> Result<(), ConnError> {
+    let peer: SocketAddr = server.parse().expect("invalid server address");
+    let local: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let socket = Socket::bind(local).await.map_err(ConnError::Socket)?;
+
+    log::info!("gbn-client connecting to {peer} (window={window}, count={count})");
+    let mut conn = GbnConnection::connect(socket, peer, window).await?;
+    log::info!("gbn connection established");
+
+    // Pipeline `count` messages: send all, flush, then collect echoes.
+    for i in 0..count {
+        let msg = format!("msg-{i:03}");
+        conn.send(msg.as_bytes()).await?;
+        log::info!("gbn-client → {:?}", msg);
+    }
+
+    // Wait for all sends to be acknowledged.
+    conn.flush().await?;
+    log::info!("gbn-client: all {} messages sent and acknowledged", count);
+
+    // Collect the server's echoes.
+    for _ in 0..count {
+        match conn.recv().await {
+            Ok(data) => log::info!("gbn-client ← {:?}", String::from_utf8_lossy(&data)),
+            Err(ConnError::Eof) => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    conn.close().await?;
+    log::info!("gbn-client done");
     Ok(())
 }

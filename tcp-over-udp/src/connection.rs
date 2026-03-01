@@ -438,6 +438,37 @@ impl Connection {
     }
 
     // -----------------------------------------------------------------------
+    // Decomposition
+    // -----------------------------------------------------------------------
+
+    /// Consume this connection and return its internal components.
+    ///
+    /// Intended for upgrading a stop-and-wait [`Connection`] (after the
+    /// 3-way handshake) to a higher-level protocol layer such as
+    /// [`crate::gbn_connection::GbnConnection`].
+    ///
+    /// Returns `(state, socket, peer, next_seq, rcv_nxt, rto)`.
+    pub fn into_parts(
+        self,
+    ) -> (
+        ConnectionState,
+        Socket,
+        SocketAddr,
+        u32,  // sender.next_seq
+        u32,  // receiver.rcv_nxt
+        Duration,
+    ) {
+        (
+            self.state,
+            self.socket,
+            self.peer,
+            self.sender.next_seq,
+            self.receiver.rcv_nxt,
+            self.rto,
+        )
+    }
+
+    // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
