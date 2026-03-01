@@ -10,6 +10,7 @@ use rand::Rng;
 /// Configuration
 /// ------------------------------------------------------------
 pub const GLOBAL_TIMEOUT: Duration = Duration::from_secs(8);
+pub const MAX_CNAME_DEPTH: u8 = 16;
 
 /// ------------------------------------------------------------
 /// Metrics
@@ -140,16 +141,17 @@ impl DnsResolver {
         domain: &str,
         record_type: RecordType,
     ) -> Result<Vec<ResourceRecord>, DnsError> {
-        self.resolve_with_timeout(domain, record_type, Instant::now())
+        self.resolve_with_timeout(domain, record_type, Instant::now(), 0)
     }
 
-    /// Internal resolve that uses a provided start time for timeout tracking.
+    /// Internal resolve that uses provided start time and depth for tracking.
     /// This ensures recursive calls don't reset the timeout window.
     fn resolve_with_timeout(
         &mut self,
         domain: &str,
         record_type: RecordType,
         start: Instant,
+        depth: u8,
     ) -> Result<Vec<ResourceRecord>, DnsError> {
         self.metrics().unwrap().resolve_calls += 1;
 
@@ -175,9 +177,10 @@ impl DnsResolver {
                 backend,
                 &mut visited,
                 start,
+                depth,
             )?
         } else {
-            self.resolve_via_network(domain, record_type, start)?
+            self.resolve_via_network(domain, record_type, start, depth)?
         };
 
         // Cache results - group by (name, type) to use put_multiple efficiently
@@ -204,10 +207,16 @@ impl DnsResolver {
         backend: &Arc<BackendFn>,
         visited: &mut HashSet<String>,
         start: Instant,
+        depth: u8,
     ) -> Result<Vec<ResourceRecord>, DnsError> {
         if start.elapsed() > GLOBAL_TIMEOUT {
             self.metrics.lock().unwrap().servfail_hits += 1;
             return Err(DnsError::Timeout);
+        }
+
+        if depth >= MAX_CNAME_DEPTH {
+            self.metrics.lock().unwrap().servfail_hits += 1;
+            return Err(DnsError::ServFail);
         }
 
         if !visited.insert(domain.clone()) {
@@ -264,6 +273,7 @@ impl DnsResolver {
                     backend,
                     visited,
                     start,
+                    depth + 1,
                 )?;
                 chained.insert(0, cname_rr.clone()); // include the CNAME itself
                 return Ok(chained);
@@ -279,10 +289,16 @@ impl DnsResolver {
         domain: &str,
         record_type: RecordType,
         start: Instant,
+        depth: u8,
     ) -> Result<Vec<ResourceRecord>, DnsError> {
         if start.elapsed() > GLOBAL_TIMEOUT {
             self.metrics.lock().unwrap().servfail_hits += 1;
             return Err(DnsError::Timeout);
+        }
+
+        if depth >= MAX_CNAME_DEPTH {
+            self.metrics.lock().unwrap().servfail_hits += 1;
+            return Err(DnsError::ServFail);
         }
 
         let query_id: u16 = rand::rng().random();
@@ -352,7 +368,7 @@ impl DnsResolver {
                         if let RecordData::CNAME(target) = &cname_rr.data {
                             self.metrics.lock().unwrap().cname_follows += 1;
                             let mut chained =
-                                self.resolve_via_network(target, record_type, start)?;
+                                self.resolve_via_network(target, record_type, start, depth + 1)?;
                             chained.insert(0, cname_rr.clone());
                             return Ok(chained);
                         }
@@ -375,7 +391,7 @@ impl DnsResolver {
                 for (ns_name, _) in &ns_and_glue {
                     if visited_ns.insert(ns_name.clone()) {
                         if let Ok(a_records) =
-                            self.resolve_with_timeout(ns_name, RecordType::A, start)
+                            self.resolve_with_timeout(ns_name, RecordType::A, start, depth + 1)
                         {
                             if let Some(rr) = a_records
                                 .into_iter()

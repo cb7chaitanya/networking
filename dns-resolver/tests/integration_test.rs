@@ -5,7 +5,7 @@ use std::{
 };
 
 use dns_resolver::dns::{RecordClass, RecordData};
-use dns_resolver::{DnsError, DnsResolver, RecordType, ResourceRecord};
+use dns_resolver::{DnsError, DnsResolver, RecordType, ResourceRecord, GLOBAL_TIMEOUT, MAX_CNAME_DEPTH,};
 use rand::Rng;
 
 /// ------------------------------------------------------------
@@ -1256,6 +1256,38 @@ fn recursive_resolution_enforces_global_timeout() {
     );
 }
 
+#[test]
+fn cname_chain_exceeds_max_depth() {
+    let backend = MockDnsBackend::default();
+
+    // Create a chain longer than MAX_CNAME_DEPTH
+    // Chain: 0.com -> 1.com -> 2.com -> ... -> 17.com -> A record
+    for i in 0..=MAX_CNAME_DEPTH {
+        let domain = format!("cname{}.test", i);
+        let next = format!("cname{}.test", i + 1);
+        backend.insert_ok(&domain, RecordType::CNAME, vec![cname(&domain, &next, 60)]);
+    }
+    backend.insert_ok(
+        &format!("cname{}.test", MAX_CNAME_DEPTH + 1),
+        RecordType::A,
+        vec![a(
+            &format!("cname{}.test", MAX_CNAME_DEPTH + 1),
+            "1.2.3.4",
+            60,
+        )],
+    );
+
+    let mut resolver = test_resolver(backend);
+    // Start from first domain in chain - this should exceed max depth
+    let result = resolver.resolve("cname0.test", RecordType::A);
+
+    assert!(
+        matches!(result, Err(DnsError::ServFail)),
+        "Expected ServFail for exceeding max CNAME depth, got {:?}",
+        result
+    );
+}
+
 // Helper function for encoding domain names in tests
 fn encode_domain_name(out: &mut Vec<u8>, name: &str) {
     for label in name.split('.') {
@@ -1264,7 +1296,6 @@ fn encode_domain_name(out: &mut Vec<u8>, name: &str) {
     }
     out.push(0);
 }
-
 
 //test for query ID randomization
 #[test]
