@@ -112,3 +112,25 @@ fn resolve_google_com_ns_via_network() {
         .collect();
     assert!(!ns_records.is_empty());
 }
+
+#[test]
+fn ignores_mismatched_response_id_from_network() {
+    let resolver = DnsResolver::new();
+    let sent_id: u16 = 9999;
+    let wrong_id: u16 = 1234;
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&wrong_id.to_be_bytes());
+    bytes.extend_from_slice(&0x8000u16.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+    bytes.extend_from_slice(&0u16.to_be_bytes());
+
+    let parsed = resolver
+        .parse_response_packet(&bytes)
+        .expect("structurally valid packet should parse");
+
+    assert_eq!(parsed.header.id, wrong_id);
+    assert_ne!(parsed.header.id, sent_id);
+}
