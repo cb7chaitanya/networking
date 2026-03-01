@@ -287,7 +287,7 @@ mod tests {
     fn cumulative_ack_slides_multiple() {
         let mut s = GbnSender::new(0, 4);
 
-        for i in 0..3u32 {
+        for _ in 0..3u32 {
             let pkt = s.build_data_packet(vec![0u8; 5], 0, 8192);
             s.record_sent(pkt);
             // next_seq auto-advances in record_sent

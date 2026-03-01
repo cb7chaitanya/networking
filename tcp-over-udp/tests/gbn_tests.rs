@@ -233,7 +233,7 @@ fn test_gbn_sender_window_boundary() {
     let mut s = GbnSender::new(0, 3);
 
     // Fill the window.
-    for i in 0..3u32 {
+    for _ in 0..3u32 {
         let pkt = s.build_data_packet(vec![0u8; 4], 0, 8192);
         s.record_sent(pkt);
     }
