@@ -461,3 +461,209 @@ fn test_rtt_estimator_adapts_to_delay() {
         "RTO must increase after a RTT spike; before={rto:?} after={rto_after_spike:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 11: cwnd starts at 1 and doubles per RTT during slow start
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cwnd_slow_start_doubles() {
+    use tcp_over_udp::gbn_sender::{CongestionState, GbnSender, INITIAL_SSTHRESH};
+
+    let mut s = GbnSender::new(0, 32);
+    // Keep ssthresh high so slow start continues well past our test range.
+    assert_eq!(s.ssthresh(), INITIAL_SSTHRESH);
+    assert_eq!(s.cwnd(), 1);
+    assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+
+    // RTT 1: cwnd=1 → send 1 segment, ACK it → cwnd = 2.
+    let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+    s.record_sent(p);
+    let r = s.on_ack(4);
+    s.on_ack_cc(r.acked_count);
+    assert_eq!(s.cwnd(), 2, "SS: cwnd should be 2 after first RTT");
+    assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+
+    // RTT 2: cwnd=2 → send 2 segments, ACK both → cwnd = 4.
+    for _ in 0..2 {
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+    }
+    let r = s.on_ack(s.next_seq);
+    s.on_ack_cc(r.acked_count);
+    assert_eq!(s.cwnd(), 4, "SS: cwnd should be 4 after second RTT");
+    assert_eq!(*s.cc_state(), CongestionState::SlowStart);
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: cwnd grows by exactly 1 per RTT in congestion avoidance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cwnd_congestion_avoidance_linear() {
+    use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
+
+    let mut s = GbnSender::new(0, 32);
+    // Manually place sender in CA phase at cwnd=4 via public fields.
+    s.ssthresh = 4;
+    s.cwnd = 4;
+    s.cc_state = CongestionState::CongestionAvoidance;
+
+    // First "RTT": 4 ACKs arrive (one per in-flight segment) → cwnd = 5.
+    s.on_ack_cc(4);
+    assert_eq!(s.cwnd(), 5, "CA: cwnd must increase by 1 after one RTT's worth of ACKs");
+
+    // Second "RTT": 5 ACKs → cwnd = 6.
+    s.on_ack_cc(5);
+    assert_eq!(s.cwnd(), 6, "CA: linear growth +1 per RTT");
+
+    assert_eq!(*s.cc_state(), CongestionState::CongestionAvoidance);
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: timeout halves ssthresh and resets cwnd to 1 (simulates loss)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cwnd_timeout_halves_and_resets() {
+    use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
+
+    // Start in CA with a large cwnd so we can fill 6 segments.
+    let mut s = GbnSender::new(0, 32);
+    s.cwnd = 8;
+    s.ssthresh = 16;
+    s.cc_state = CongestionState::CongestionAvoidance;
+
+    // Use record_sent() to put 6 segments in flight (cwnd=8, so this fits).
+    for _ in 0..6 {
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+    }
+    assert_eq!(s.in_flight(), 6);
+
+    // Simulate a timeout (packet loss detected via RTO expiry).
+    s.on_timeout_cc();
+
+    assert_eq!(s.ssthresh(), 3, "ssthresh = max(2, 6/2) = 3");
+    assert_eq!(s.cwnd(), 1, "cwnd resets to 1 on timeout");
+    assert_eq!(*s.cc_state(), CongestionState::SlowStart, "must re-enter SlowStart");
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: 3 duplicate ACKs trigger fast retransmit entry (simulates loss)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cwnd_triple_dup_ack_enters_fast_recovery() {
+    use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
+
+    // Window size 8; inflate cwnd to allow 4 in-flight segments.
+    let mut s = GbnSender::new(0, 8);
+    s.cwnd = 4;
+
+    for _ in 0..4 {
+        let p = s.build_data_packet(vec![0u8; 4], 0, 8192);
+        s.record_sent(p);
+    }
+    assert_eq!(s.in_flight(), 4);
+
+    // 3 duplicate ACKs for send_base: no new data ACKed, just duplicates.
+    for i in 1..=3u32 {
+        let r = s.on_ack(s.send_base); // ack_num == send_base → dup-ACK
+        assert!(r.dup_ack, "ACK #{i} must be flagged as duplicate");
+        assert_eq!(s.dup_ack_count(), i, "dup_ack_count should be {i}");
+    }
+
+    s.on_triple_dup_ack_cc();
+
+    // ssthresh = max(2, 4/2) = 2; cwnd = ssthresh + 3 = 5 (Reno inflation).
+    assert_eq!(s.ssthresh(), 2, "ssthresh = max(2, 4/2) = 2");
+    assert_eq!(s.cwnd(), 5, "cwnd = ssthresh + 3 = 5 (Reno fast recovery inflation)");
+    assert_eq!(*s.cc_state(), CongestionState::FastRecovery);
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: new ACK in fast recovery exits to congestion avoidance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cwnd_fast_recovery_exit_on_new_ack() {
+    use tcp_over_udp::gbn_sender::{CongestionState, GbnSender};
+
+    let mut s = GbnSender::new(0, 16);
+    s.ssthresh = 4;
+    s.cwnd = 7; // ssthresh + 3 (Reno fast recovery inflation)
+    s.cc_state = CongestionState::FastRecovery;
+
+    // A genuine new ACK arrives → exit fast recovery, cwnd ← ssthresh.
+    s.on_ack_cc(1);
+
+    assert_eq!(s.cwnd(), 4, "exit FR: cwnd ← ssthresh = 4");
+    assert_eq!(*s.cc_state(), CongestionState::CongestionAvoidance);
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: integration — cwnd grows from slow start during loopback transfer
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_congestion_control_cwnd_grows_on_loopback() {
+    const WINDOW: usize = 16;
+    const MSG_COUNT: usize = 20;
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW)
+            .await
+            .expect("accept");
+        let mut total = 0usize;
+        loop {
+            match conn.recv().await {
+                Ok(data) => total += data.len(),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server: {e}"),
+            }
+            if total >= MSG_COUNT * 4 {
+                break;
+            }
+        }
+        conn.close().await.ok();
+        total
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        for _ in 0..MSG_COUNT {
+            conn.send(b"data").await.expect("send");
+        }
+        conn.flush().await.expect("flush");
+
+        // After a successful transfer cwnd must have grown beyond the initial 1.
+        let cwnd = conn.sender.cwnd();
+        assert!(
+            cwnd > 1,
+            "cwnd should have grown during slow start; got cwnd={cwnd}"
+        );
+
+        // RTT estimator must have samples.
+        assert!(
+            conn.rtt.srtt().is_some(),
+            "SRTT must be set after exchanges"
+        );
+
+        conn.close().await.ok();
+        cwnd
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    let total = sr.unwrap();
+    let cwnd = cr.unwrap();
+    assert_eq!(total, MSG_COUNT * 4);
+    assert!(cwnd > 1, "final cwnd={cwnd} must reflect SS growth");
+}

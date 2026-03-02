@@ -186,9 +186,13 @@ impl GbnConnection {
                     }
                     self.retransmit_window().await?;
                     self.sender.on_retransmit();
+                    self.sender.on_timeout_cc();
                     self.rtt.back_off();
                     rto = self.rtt.rto();
-                    log::debug!("[gbn] timeout — back-off rto={:?}", rto);
+                    log::debug!(
+                        "[gbn] timeout — back-off rto={:?} cwnd={} ssthresh={}",
+                        rto, self.sender.cwnd(), self.sender.ssthresh()
+                    );
                 }
             }
         }
@@ -244,7 +248,7 @@ impl GbnConnection {
                 return Err(ConnError::Eof);
             }
 
-            // Piggybacked ACK: slide window and update RTT estimator.
+            // Piggybacked ACK: slide window, update RTT and congestion control.
             if h.flags & flags::ACK != 0 {
                 let n = self.on_ack_received(h.ack);
                 if n > 0 {
@@ -252,6 +256,11 @@ impl GbnConnection {
                         "[gbn] ← ACK ack={} slid={} srtt={:?} rto={:?}",
                         h.ack, n, self.rtt.srtt(), self.rtt.rto()
                     );
+                }
+                // Reno fast retransmit on 3 consecutive duplicate ACKs.
+                if self.sender.dup_ack_count() == 3 {
+                    self.sender.on_triple_dup_ack_cc();
+                    self.fast_retransmit().await.ok();
                 }
             }
 
@@ -309,9 +318,13 @@ impl GbnConnection {
                     }
                     self.retransmit_window().await?;
                     self.sender.on_retransmit();
+                    self.sender.on_timeout_cc();
                     self.rtt.back_off();
                     rto = self.rtt.rto();
-                    log::debug!("[gbn] flush timeout — back-off rto={:?}", rto);
+                    log::debug!(
+                        "[gbn] flush timeout — back-off rto={:?} cwnd={} ssthresh={}",
+                        rto, self.sender.cwnd(), self.sender.ssthresh()
+                    );
                 }
             }
         }
@@ -404,14 +417,15 @@ impl GbnConnection {
     // Helpers
     // -----------------------------------------------------------------------
 
-    /// Process a cumulative ACK: slide the window and feed the RTT sample
-    /// (if any) into the estimator.  Returns the number of newly-acked
-    /// segments so callers know whether the window has opened.
+    /// Process a cumulative ACK: slide the window, update RTT and congestion
+    /// control.  Returns the number of newly-acked segments so callers know
+    /// whether the window has opened.
     ///
     /// This centralises all ACK handling so that every code path — `send`,
-    /// `flush`, `recv`, and the event loop — updates the RTT estimator.
+    /// `flush`, `recv`, and the event loop — updates the RTT estimator and
+    /// the Reno congestion window.
     fn on_ack_received(&mut self, ack_num: u32) -> usize {
-        let AckResult { acked_count, rtt_sample } = self.sender.on_ack(ack_num);
+        let AckResult { acked_count, rtt_sample, dup_ack: _ } = self.sender.on_ack(ack_num);
         if let Some(sample) = rtt_sample {
             self.rtt.record_sample(sample);
             log::debug!(
@@ -422,7 +436,33 @@ impl GbnConnection {
                 self.rtt.rto()
             );
         }
+        if acked_count > 0 {
+            self.sender.on_ack_cc(acked_count);
+            log::debug!(
+                "[gbn] cwnd={} ssthresh={} state={:?}",
+                self.sender.cwnd(),
+                self.sender.ssthresh(),
+                self.sender.cc_state()
+            );
+        }
         acked_count
+    }
+
+    /// Retransmit only the oldest unacked segment (Reno fast retransmit).
+    ///
+    /// Called after 3 consecutive duplicate ACKs have been detected.
+    async fn fast_retransmit(&mut self) -> Result<(), ConnError> {
+        if let Some(entry) = self.sender.window_entries().next() {
+            let pkt = entry.packet.clone();
+            log::debug!("[gbn] fast-retransmit seq={}", pkt.header.seq);
+            self.socket.send_to(&pkt, self.peer).await?;
+        }
+        // Mark the retransmitted segment so Karn's algorithm suppresses its
+        // RTT sample on the next ACK.
+        if let Some(e) = self.sender.window.front_mut() {
+            e.tx_count += 1;
+        }
+        Ok(())
     }
 
     /// Handle one incoming packet: dispatch ACK, data payload, FIN, RST.
@@ -457,6 +497,12 @@ impl GbnConnection {
         if h.flags & flags::ACK != 0 {
             let newly_acked = self.on_ack_received(h.ack);
             window_advanced = newly_acked > 0;
+
+            // Reno fast retransmit: 3 consecutive duplicate ACKs signal loss.
+            if self.sender.dup_ack_count() == 3 {
+                self.sender.on_triple_dup_ack_cc();
+                self.fast_retransmit().await.ok();
+            }
         }
 
         if !pkt.payload.is_empty() {
@@ -624,9 +670,9 @@ async fn event_loop(
                     break;
                 }
 
-                // Cumulative ACK — slide window and update RTT estimator.
+                // Cumulative ACK — slide window, update RTT estimator, Reno CC.
                 if h.flags & flags::ACK != 0 {
-                    let AckResult { acked_count, rtt_sample } = sender.on_ack(h.ack);
+                    let AckResult { acked_count, rtt_sample, dup_ack } = sender.on_ack(h.ack);
                     if let Some(sample) = rtt_sample {
                         rtt.record_sample(sample);
                         log::debug!(
@@ -636,11 +682,12 @@ async fn event_loop(
                     }
 
                     if acked_count > 0 {
+                        sender.on_ack_cc(acked_count);
                         retries = 0;
-                        rto = rtt.rto(); // use newly estimated RTO
+                        rto = rtt.rto();
                         log::debug!(
-                            "[gbn:loop] ← ACK ack={} slid={} rto={:?}",
-                            h.ack, acked_count, rto
+                            "[gbn:loop] ← ACK ack={} slid={} rto={:?} cwnd={} ssthresh={}",
+                            h.ack, acked_count, rto, sender.cwnd(), sender.ssthresh()
                         );
 
                         if sender.has_unacked() {
@@ -649,6 +696,21 @@ async fn event_loop(
                             timer_armed = false;
                             timer.as_mut().reset(tok_now() + far_future);
                         }
+                    } else if dup_ack && sender.dup_ack_count() == 3 {
+                        // Reno fast retransmit: retransmit oldest unacked segment.
+                        sender.on_triple_dup_ack_cc();
+                        if let Some(entry) = sender.window_entries().next() {
+                            let pkt = entry.packet.clone();
+                            log::debug!("[gbn:loop] fast-retransmit seq={}", pkt.header.seq);
+                            let _ = socket.send_to(&pkt, peer).await;
+                        }
+                        if let Some(e) = sender.window.front_mut() {
+                            e.tx_count += 1;
+                        }
+                        log::debug!(
+                            "[gbn:loop] 3-dup-ACK → FR cwnd={} ssthresh={}",
+                            sender.cwnd(), sender.ssthresh()
+                        );
                     }
                 }
 
@@ -686,11 +748,17 @@ async fn event_loop(
                 }
                 sender.on_retransmit();
 
+                // Reno: halve ssthresh, reset cwnd to 1, re-enter slow start.
+                sender.on_timeout_cc();
+
                 // Exponential back-off via the RTT estimator.
                 rtt.back_off();
                 rto = rtt.rto();
                 timer.as_mut().reset(tok_now() + rto);
-                log::debug!("[gbn:loop] back-off rto={:?}", rto);
+                log::debug!(
+                    "[gbn:loop] timeout → SS rto={:?} cwnd={} ssthresh={}",
+                    rto, sender.cwnd(), sender.ssthresh()
+                );
             }
         }
     }
