@@ -465,18 +465,37 @@ impl GbnSender {
 
     /// Iterate over all in-flight segments from oldest to newest.
     ///
-    /// Used by the connection layer to retransmit the full window on timeout
-    /// (the "go back N" step).
+    /// Used by the connection layer to inspect the window (e.g. for
+    /// zero-window probing or diagnostics).
     pub fn window_entries(&self) -> impl Iterator<Item = &GbnEntry> {
         self.window.iter()
+    }
+
+    /// Selective Repeat retransmit: resend only the **oldest** unacked segment.
+    ///
+    /// Increments `tx_count` and refreshes `sent_at` for that entry only
+    /// (so Karn's algorithm suppresses its RTT sample on the next ACK).
+    /// Returns a clone of the retransmitted packet, or `None` when the window
+    /// is empty.
+    ///
+    /// Call [`on_timeout_cc`] separately to adjust the congestion window.
+    ///
+    /// [`on_timeout_cc`]: Self::on_timeout_cc
+    pub fn retransmit_oldest(&mut self) -> Option<Packet> {
+        if let Some(entry) = self.window.front_mut() {
+            entry.tx_count += 1;
+            entry.sent_at = Instant::now();
+            Some(entry.packet.clone())
+        } else {
+            None
+        }
     }
 
     /// Increment the transmission count and refresh `sent_at` for every
     /// in-flight segment.
     ///
-    /// Call this immediately **after** retransmitting the entire window so
-    /// subsequent RTT samples from these retransmitted segments will be
-    /// suppressed by Karn's algorithm.
+    /// Used by the fast-retransmit path when the caller wants to mark *all*
+    /// segments as retransmitted (e.g. after a Go-Back-N style probe).
     pub fn on_retransmit(&mut self) {
         let now = Instant::now();
         for entry in self.window.iter_mut() {

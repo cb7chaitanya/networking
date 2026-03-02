@@ -254,7 +254,7 @@ fn test_gbn_sender_window_boundary() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: GBN receiver unit-level — discard out-of-order
+// Test 6: SR receiver unit-level — OOO segments buffered and delivered
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -263,17 +263,19 @@ fn test_gbn_receiver_discard_ooo() {
 
     let mut r = GbnReceiver::new(0);
 
-    // seq=5 arrives before seq=0 — must be discarded.
+    // seq=5 arrives before seq=0 — buffered in OOO map (SR), not discarded.
+    // Returns false because nothing is delivered to the application yet.
     assert!(!r.on_segment(5, b"future"));
     assert_eq!(r.ack_number(), 0, "rcv_nxt must not advance on OOO segment");
 
-    // seq=0 arrives in order — must be accepted.
+    // seq=0 arrives in order — accepted; deliver_ooo fires and also delivers
+    // the buffered seq=5, advancing rcv_nxt past both segments.
     assert!(r.on_segment(0, b"hello"));
-    assert_eq!(r.ack_number(), 5);
+    assert_eq!(r.ack_number(), 11, "rcv_nxt must advance past both segments");
 
-    // seq=5 again — now in order — accepted.
-    assert!(r.on_segment(5, b"future"));
-    assert_eq!(r.ack_number(), 11);
+    // seq=5 is now a duplicate (rcv_nxt=11 > 5) — discarded.
+    assert!(!r.on_segment(5, b"future"));
+    assert_eq!(r.ack_number(), 11, "duplicate must not advance rcv_nxt");
 }
 
 // ---------------------------------------------------------------------------
@@ -986,4 +988,131 @@ async fn test_flow_control_small_recv_buffer() {
         server_peer_rwnd > 8192,
         "server must have seen client's large default buffer (> 8192), got {server_peer_rwnd}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test 25: SR receiver buffers an OOO segment then delivers it when gap fills
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sr_receiver_buffers_and_delivers_ooo() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+
+    let mut r = GbnReceiver::new(0);
+
+    // seq=3 (OOO) arrives before seq=0 — buffered, nothing delivered.
+    assert!(!r.on_segment(3, b"world"));
+    assert_eq!(r.ack_number(), 0, "rcv_nxt must not advance for OOO");
+    assert!(r.app_buffer.is_empty(), "OOO data must not appear in app_buffer yet");
+
+    // seq=0 (in-order, 3 bytes) arrives — accepted, then OOO chain delivered.
+    assert!(r.on_segment(0, b"hel"));
+    assert_eq!(r.ack_number(), 8, "rcv_nxt must jump past OOO segment after chain delivery");
+    assert_eq!(r.app_buffer.len(), 8, "both segments must be in app_buffer");
+
+    let mut buf = [0u8; 8];
+    let n = r.read(&mut buf);
+    assert_eq!(n, 8);
+    assert_eq!(&buf, b"helworld");
+}
+
+// ---------------------------------------------------------------------------
+// Test 26: SR receiver delivers a multi-segment OOO chain (reverse arrival)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sr_ooo_chain_delivery() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+
+    let mut r = GbnReceiver::new(0);
+
+    // Segments arrive in reverse order: last first, then second, then first.
+    assert!(!r.on_segment(6, b"ccc")); // buffered
+    assert!(!r.on_segment(3, b"bbb")); // buffered
+    assert_eq!(r.ack_number(), 0, "rcv_nxt must stay at 0 while gap exists");
+
+    // In-order arrival triggers full chain delivery.
+    assert!(r.on_segment(0, b"aaa"));
+    assert_eq!(r.ack_number(), 9, "all three segments delivered after gap fill");
+
+    let mut buf = [0u8; 9];
+    r.read(&mut buf);
+    assert_eq!(&buf, b"aaabbbccc", "delivered bytes must be in sequence order");
+}
+
+// ---------------------------------------------------------------------------
+// Test 27: SR sender — retransmit_oldest touches only the front entry
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sr_selective_retransmit_oldest_only() {
+    use tcp_over_udp::gbn_sender::GbnSender;
+
+    let mut s = GbnSender::new(0, 4);
+    s.cwnd = 3; // allow 3 in-flight
+
+    // 3 segments of 8 bytes each (seq 0, 8, 16).
+    for _ in 0..3 {
+        let p = s.build_data_packet(vec![0u8; 8], 0, 8192);
+        s.record_sent(p);
+    }
+    assert_eq!(s.in_flight(), 3);
+
+    // SR timeout: only the oldest (seq=0) is retransmitted.
+    let pkt = s.retransmit_oldest().expect("should have oldest segment");
+    assert_eq!(pkt.header.seq, 0, "oldest segment must have seq=0");
+
+    // Only the front entry has its tx_count and sent_at updated.
+    let entries: Vec<_> = s.window_entries().collect();
+    assert_eq!(entries[0].tx_count, 2, "oldest tx_count must be 2 after retransmit");
+    assert_eq!(entries[1].tx_count, 1, "second segment must be untouched");
+    assert_eq!(entries[2].tx_count, 1, "third segment must be untouched");
+}
+
+// ---------------------------------------------------------------------------
+// Test 28: SR full cycle — OOO buffer + selective retransmit simulation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sr_full_cycle() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+    use tcp_over_udp::gbn_sender::GbnSender;
+
+    // Sender: window=4, cwnd=4.
+    let mut sender = GbnSender::new(0, 4);
+    sender.cwnd = 4;
+
+    // Receiver: large buffer, expecting seq=0.
+    let mut receiver = GbnReceiver::new(0);
+
+    // "Send" 4 segments of 8 bytes (seq 0, 8, 16, 24).
+    for _ in 0..4 {
+        let pkt = sender.build_data_packet(vec![0u8; 8], 0, 8192);
+        sender.record_sent(pkt);
+    }
+    assert_eq!(sender.in_flight(), 4);
+
+    // Simulate network: segments 1–3 arrive at receiver; segment 0 was "lost".
+    // With SR, these are buffered (not discarded) since seq=0 is still expected.
+    assert!(!receiver.on_segment(8,  &[1u8; 8]));
+    assert!(!receiver.on_segment(16, &[2u8; 8]));
+    assert!(!receiver.on_segment(24, &[3u8; 8]));
+    assert_eq!(receiver.ack_number(), 0, "gap at seq=0 must keep rcv_nxt at 0");
+    assert!(receiver.app_buffer.is_empty(), "no data until gap is filled");
+
+    // Selective retransmit: sender retransmits only seq=0 (not the full window).
+    let retransmitted = sender.retransmit_oldest().expect("oldest must be available");
+    assert_eq!(retransmitted.header.seq, 0, "SR must retransmit seq=0 only");
+
+    // Segment 0 arrives (retransmission reaches receiver).
+    assert!(receiver.on_segment(0, &[0u8; 8]));
+
+    // SR chain delivery: all 4 segments now in app_buffer.
+    assert_eq!(receiver.ack_number(), 32, "all 4 segments delivered via OOO chain");
+    assert_eq!(receiver.app_buffer.len(), 32);
+
+    // Cumulative ACK=32 clears the sender's entire window.
+    let r = sender.on_ack(32);
+    assert_eq!(r.acked_count, 4, "all 4 segments must be acked by cumulative ACK=32");
+    assert!(!sender.has_unacked(), "sender window must be empty after full ACK");
 }

@@ -238,13 +238,13 @@ impl GbnConnection {
                         rto = (rto * 2).min(Duration::from_secs(64));
                         log::debug!("[gbn] zero-window probe — rto={:?}", rto);
                     } else {
-                        self.retransmit_window().await?;
-                        self.sender.on_retransmit();
+                        // Selective Repeat: retransmit only the oldest segment.
+                        self.retransmit_oldest_pkt().await?;
                         self.sender.on_timeout_cc();
                         self.rtt.back_off();
                         rto = self.rtt.rto();
                         log::debug!(
-                            "[gbn] timeout — back-off rto={:?} cwnd={} ssthresh={}",
+                            "[gbn] SR timeout — back-off rto={:?} cwnd={} ssthresh={}",
                             rto, self.sender.cwnd(), self.sender.ssthresh()
                         );
                     }
@@ -376,13 +376,13 @@ impl GbnConnection {
                         rto = (rto * 2).min(Duration::from_secs(64));
                         log::debug!("[gbn] flush zero-window probe — rto={:?}", rto);
                     } else {
-                        self.retransmit_window().await?;
-                        self.sender.on_retransmit();
+                        // Selective Repeat: retransmit only the oldest segment.
+                        self.retransmit_oldest_pkt().await?;
                         self.sender.on_timeout_cc();
                         self.rtt.back_off();
                         rto = self.rtt.rto();
                         log::debug!(
-                            "[gbn] flush timeout — back-off rto={:?} cwnd={} ssthresh={}",
+                            "[gbn] SR flush timeout — back-off rto={:?} cwnd={} ssthresh={}",
                             rto, self.sender.cwnd(), self.sender.ssthresh()
                         );
                     }
@@ -628,14 +628,11 @@ impl GbnConnection {
         buf
     }
 
-    async fn retransmit_window(&self) -> Result<(), ConnError> {
-        let pkts: Vec<Packet> = self
-            .sender
-            .window_entries()
-            .map(|e| e.packet.clone())
-            .collect();
-        log::debug!("[gbn] retransmitting {} segment(s)", pkts.len());
-        for pkt in pkts {
+    /// Selective Repeat timeout helper: retransmit only the oldest in-flight
+    /// segment and mark it so Karn's algorithm suppresses its RTT sample.
+    async fn retransmit_oldest_pkt(&mut self) -> Result<(), ConnError> {
+        if let Some(pkt) = self.sender.retransmit_oldest() {
+            log::debug!("[gbn] SR retransmit oldest seq={}", pkt.header.seq);
             self.socket.send_to(&pkt, self.peer).await?;
         }
         Ok(())
@@ -841,15 +838,11 @@ async fn event_loop(
                     rto = (rto * 2).min(Duration::from_secs(64));
                     log::debug!("[gbn:loop] zero-window probe — rto={:?}", rto);
                 } else {
-                    // Go-Back-N: retransmit every unacked segment.
-                    let pkts: Vec<Packet> = sender.window_entries()
-                        .map(|e| e.packet.clone())
-                        .collect();
-                    log::debug!("[gbn:loop] timeout — retransmitting {} pkt(s)", pkts.len());
-                    for p in pkts {
-                        let _ = socket.send_to(&p, peer).await;
+                    // Selective Repeat: retransmit only the oldest unacked segment.
+                    if let Some(pkt) = sender.retransmit_oldest() {
+                        log::debug!("[gbn:loop] SR timeout — retransmit oldest seq={}", pkt.header.seq);
+                        let _ = socket.send_to(&pkt, peer).await;
                     }
-                    sender.on_retransmit();
 
                     // Reno: halve ssthresh, reset cwnd to 1, re-enter slow start.
                     sender.on_timeout_cc();
@@ -858,7 +851,7 @@ async fn event_loop(
                     rtt.back_off();
                     rto = rtt.rto();
                     log::debug!(
-                        "[gbn:loop] timeout → SS rto={:?} cwnd={} ssthresh={}",
+                        "[gbn:loop] SR timeout → SS rto={:?} cwnd={} ssthresh={}",
                         rto, sender.cwnd(), sender.ssthresh()
                     );
                 }
