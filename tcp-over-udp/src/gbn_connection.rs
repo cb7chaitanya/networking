@@ -119,6 +119,13 @@ pub struct GbnConnection {
     ///
     /// [`with_msl`]: Self::with_msl
     msl: Duration,
+
+    /// Negotiated Maximum Segment Size from the 3-way handshake.
+    ///
+    /// `send()` segments application data into chunks of at most this many
+    /// bytes before queuing each chunk as an independent packet.  Set by
+    /// `min(local_mss, peer_mss)` during the handshake.
+    mss: u16,
 }
 
 impl GbnConnection {
@@ -151,7 +158,7 @@ impl GbnConnection {
         window_size: usize,
         recv_buf_bytes: usize,
     ) -> Self {
-        let (state, socket, peer, next_seq, rcv_nxt, _rto) = conn.into_parts();
+        let (state, socket, peer, next_seq, rcv_nxt, _rto, negotiated_mss) = conn.into_parts();
         Self {
             state,
             socket: Arc::new(socket),
@@ -160,7 +167,17 @@ impl GbnConnection {
             receiver: GbnReceiver::with_capacity(rcv_nxt, recv_buf_bytes),
             rtt: RttEstimator::new(),
             msl: DEFAULT_MSL,
+            mss: negotiated_mss,
         }
+    }
+
+    /// The Maximum Segment Size negotiated during the 3-way handshake.
+    ///
+    /// Data passed to [`send`] is split into chunks of at most this many bytes.
+    ///
+    /// [`send`]: Self::send
+    pub fn mss(&self) -> u16 {
+        self.mss
     }
 
     /// Active open (client): run the 3-way handshake then return a GBN connection.
@@ -226,10 +243,12 @@ impl GbnConnection {
     // Sequential data transfer
     // -----------------------------------------------------------------------
 
-    /// Queue one segment for delivery.
+    /// Send `data` to the peer, segmenting into MSS-sized chunks as needed.
     ///
-    /// Returns immediately when the window has space.  Blocks — processing
-    /// incoming ACKs and retransmitting on timeout — when the window is full.
+    /// Data larger than the negotiated MSS is automatically split into
+    /// multiple segments, each queued separately through the GBN window.
+    /// Empty slices produce a single zero-length segment (matching existing
+    /// test expectations).
     ///
     /// **Pipeline pattern**: call `send` in a tight loop to fill the window,
     /// then call [`flush`] to wait for all in-flight segments to be ACKed.
@@ -240,6 +259,25 @@ impl GbnConnection {
             return Err(ConnError::BadState);
         }
 
+        let mss = self.mss as usize;
+
+        if data.is_empty() {
+            // Preserve existing behaviour for zero-length sends.
+            return self.send_segment(data).await;
+        }
+
+        // Segment the data into MSS-sized chunks.
+        for chunk in data.chunks(mss) {
+            self.send_segment(chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// Queue one pre-sized segment for delivery (internal).
+    ///
+    /// Blocks — processing incoming ACKs and retransmitting on timeout — when
+    /// the window is full.  The caller is responsible for MSS-sized chunking.
+    async fn send_segment(&mut self, data: &[u8]) -> Result<(), ConnError> {
         let mut rto = self.rtt.rto();
         let mut retries = 0u32;
 
@@ -495,6 +533,7 @@ impl GbnConnection {
                 window: self.receiver.window_size(),
                 checksum: 0,
             },
+            options: vec![],
             payload: vec![],
         };
         let mut rto = self.rtt.rto();
@@ -757,6 +796,7 @@ impl GbnConnection {
                 window: self.receiver.window_size(),
                 checksum: 0,
             },
+            options: vec![],
             payload: vec![],
         }
     }
@@ -794,6 +834,7 @@ impl GbnConnection {
                 window: self.receiver.window_size(),
                 checksum: 0,
             },
+            options: vec![],
             payload: vec![],
         };
         let fin_seq = fin.header.seq;
@@ -1371,6 +1412,7 @@ fn build_ack(sender: &GbnSender, receiver: &GbnReceiver) -> Packet {
             window: receiver.window_size(),
             checksum: 0,
         },
+        options: vec![],
         payload: vec![],
     }
 }
@@ -1384,6 +1426,7 @@ fn build_fin(sender: &GbnSender, receiver: &GbnReceiver) -> Packet {
             window: receiver.window_size(),
             checksum: 0,
         },
+        options: vec![],
         payload: vec![],
     }
 }

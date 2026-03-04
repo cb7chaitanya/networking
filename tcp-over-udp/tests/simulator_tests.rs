@@ -34,6 +34,7 @@ fn make_packet(seq: u32, payload: &[u8]) -> Packet {
             window: 8192,
             checksum: 0,
         },
+        options: vec![],
         payload: payload.to_vec(),
     }
 }

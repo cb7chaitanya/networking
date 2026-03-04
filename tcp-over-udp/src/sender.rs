@@ -72,6 +72,7 @@ impl Sender {
                 window,
                 checksum: 0, // filled in by Packet::encode
             },
+            options: vec![],
             payload,
         }
     }

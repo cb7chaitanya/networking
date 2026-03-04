@@ -21,23 +21,29 @@
 //! before transmitting the next segment.  On timeout the segment is
 //! retransmitted with exponential back-off, up to `MAX_RETRIES` attempts.
 //!
-//! # 3-Way Handshake
+//! # 3-Way Handshake with MSS Negotiation
 //!
 //! ```text
-//!  Client                        Server
-//!   │── SYN  (seq=C_ISN)  ──────▶│
-//!   │◀─ SYN-ACK (seq=S_ISN,      │
-//!   │          ack=C_ISN+1) ──── │
-//!   │── ACK  (ack=S_ISN+1) ─────▶│
-//!                            ESTABLISHED
+//!  Client                              Server
+//!   │── SYN  (seq=C_ISN,  MSS=X) ──▶│
+//!   │◀─ SYN-ACK (seq=S_ISN,          │
+//!   │          ack=C_ISN+1, MSS=Y) ──│
+//!   │── ACK  (ack=S_ISN+1)  ────────▶│
+//!                               ESTABLISHED
+//!            negotiated_mss = min(X, Y)
 //! ```
+//!
+//! The MSS option is carried in the TCP-style options area that immediately
+//! follows the fixed 15-byte header on SYN / SYN-ACK packets.  Peers that
+//! predate this extension ignore the SYN payload, so the negotiation is
+//! fully backward-compatible.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio::time::timeout;
 
-use crate::packet::{flags, Header, Packet};
+use crate::packet::{flags, Header, Packet, TcpOption, DEFAULT_MSS};
 use crate::receiver::Receiver;
 use crate::sender::Sender;
 use crate::socket::{Socket, SocketError};
@@ -117,14 +123,24 @@ pub struct Connection {
     peer: SocketAddr,
     /// Current retransmit timeout (doubles on each miss, resets on ACK).
     rto: Duration,
+    /// MSS negotiated during the 3-way handshake: `min(local_mss, peer_mss)`.
+    ///
+    /// Defaults to [`DEFAULT_MSS`] when the peer does not advertise an MSS.
+    pub negotiated_mss: u16,
 }
 
 impl Connection {
     // -----------------------------------------------------------------------
-    // Internal constructor
+    // Internal constructors
     // -----------------------------------------------------------------------
 
-    fn established(socket: Socket, peer: SocketAddr, isn: u32, peer_isn: u32) -> Self {
+    fn established_with_mss(
+        socket: Socket,
+        peer: SocketAddr,
+        isn: u32,
+        peer_isn: u32,
+        negotiated_mss: u16,
+    ) -> Self {
         Self {
             state: ConnectionState::Established,
             // SYN consumed one sequence number; data starts at ISN+1.
@@ -133,6 +149,7 @@ impl Connection {
             socket,
             peer,
             rto: INITIAL_RTO,
+            negotiated_mss,
         }
     }
 
@@ -140,44 +157,65 @@ impl Connection {
     // Handshake — active open (client)
     // -----------------------------------------------------------------------
 
-    /// Initiate an active open to `peer`.
+    /// Initiate an active open to `peer` using [`DEFAULT_MSS`].
     ///
-    /// Sends SYN, waits for SYN-ACK, sends ACK.  Retransmits the SYN up to
-    /// `MAX_RETRIES` times on timeout.
+    /// Sends SYN (with MSS option), waits for SYN-ACK, sends ACK.
+    /// Retransmits the SYN up to `MAX_RETRIES` times on timeout.
     pub async fn connect(socket: Socket, peer: SocketAddr) -> Result<Self, ConnError> {
+        Self::connect_with_mss(socket, peer, DEFAULT_MSS).await
+    }
+
+    /// Like [`connect`] but with an explicit local MSS to advertise.
+    ///
+    /// The negotiated MSS is `min(local_mss, peer_mss)`.  When the peer does
+    /// not advertise an MSS (backward-compatible peer), `peer_mss` is taken
+    /// as [`DEFAULT_MSS`].
+    ///
+    /// [`connect`]: Self::connect
+    pub async fn connect_with_mss(
+        socket: Socket,
+        peer: SocketAddr,
+        local_mss: u16,
+    ) -> Result<Self, ConnError> {
         let isn = rand_isn();
-        let syn = make_syn(isn);
+        let syn = make_syn_with_opts(isn, &[TcpOption::Mss(local_mss)]);
         let mut rto = INITIAL_RTO;
 
         for attempt in 0..=MAX_RETRIES {
             socket.send_to(&syn, peer).await?;
-            log::debug!("[client] → SYN seq={isn} (attempt {attempt})");
+            log::debug!("[client] → SYN seq={isn} mss={local_mss} (attempt {attempt})");
 
             // Wait for SYN-ACK.
             'wait: loop {
                 match timeout(rto, socket.recv_from()).await {
                     Ok(Ok((pkt, from))) => {
                         if from != peer {
-                            continue 'wait; // datagram from unknown source
+                            continue 'wait;
                         }
                         let h = &pkt.header;
                         let is_syn_ack = h.flags & (flags::SYN | flags::ACK)
                             == (flags::SYN | flags::ACK);
                         if is_syn_ack && h.ack == isn.wrapping_add(1) {
                             let peer_isn = h.seq;
+                            // Extract peer MSS; fall back to DEFAULT_MSS for old peers.
+                            let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
+                            let negotiated = local_mss.min(peer_mss);
                             // Send ACK to complete the handshake.
-                            let ack = make_ack(isn.wrapping_add(1), peer_isn.wrapping_add(1));
+                            let ack =
+                                make_ack(isn.wrapping_add(1), peer_isn.wrapping_add(1));
                             socket.send_to(&ack, peer).await?;
                             log::debug!(
-                                "[client] ← SYN-ACK peer_isn={peer_isn}; → ACK"
+                                "[client] ← SYN-ACK peer_isn={peer_isn} peer_mss={peer_mss} \
+                                 negotiated_mss={negotiated}; → ACK"
                             );
-                            return Ok(Self::established(socket, peer, isn, peer_isn));
+                            return Ok(Self::established_with_mss(
+                                socket, peer, isn, peer_isn, negotiated,
+                            ));
                         }
-                        // Wrong packet (e.g. stale datagram) — keep waiting.
+                        // Wrong packet — keep waiting.
                     }
                     Ok(Err(e)) => return Err(ConnError::Socket(e)),
                     Err(_elapsed) => {
-                        // Timeout — retransmit SYN with back-off.
                         rto = (rto * 2).min(MAX_RTO);
                         break 'wait;
                     }
@@ -192,32 +230,56 @@ impl Connection {
     // Handshake — passive open (server)
     // -----------------------------------------------------------------------
 
-    /// Accept an incoming connection on `socket`.
+    /// Accept an incoming connection on `socket` using [`DEFAULT_MSS`].
     ///
-    /// Blocks until a SYN arrives, replies with SYN-ACK, and waits for the
-    /// final ACK.  Retransmits SYN-ACK up to `MAX_RETRIES` times on timeout.
+    /// Blocks until a SYN arrives, replies with SYN-ACK (carrying own MSS),
+    /// and waits for the final ACK.  Retransmits SYN-ACK up to `MAX_RETRIES`
+    /// times on timeout.
     pub async fn accept(socket: Socket) -> Result<Self, ConnError> {
+        Self::accept_with_mss(socket, DEFAULT_MSS).await
+    }
+
+    /// Like [`accept`] but with an explicit local MSS to advertise.
+    ///
+    /// [`accept`]: Self::accept
+    pub async fn accept_with_mss(
+        socket: Socket,
+        local_mss: u16,
+    ) -> Result<Self, ConnError> {
         let isn = rand_isn();
 
         // Step 1: wait for SYN (no timeout — passive open).
-        let (client_addr, client_isn) = loop {
+        let (client_addr, client_isn, peer_mss) = loop {
             let (pkt, addr) = socket.recv_from().await?;
             let h = &pkt.header;
             // A pure SYN has SYN set and ACK clear.
             if h.flags & flags::SYN != 0 && h.flags & flags::ACK == 0 {
-                log::debug!("[server] ← SYN seq={} from {addr}", h.seq);
-                break (addr, h.seq);
+                let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
+                log::debug!(
+                    "[server] ← SYN seq={} peer_mss={peer_mss} from {addr}",
+                    h.seq
+                );
+                break (addr, h.seq, peer_mss);
             }
         };
 
-        // Step 2: send SYN-ACK, then wait for the final ACK.
-        let syn_ack = make_syn_ack(isn, client_isn.wrapping_add(1));
+        let negotiated = local_mss.min(peer_mss);
+
+        // Step 2: send SYN-ACK (advertising our own MSS), then wait for final ACK.
+        let syn_ack = make_syn_ack_with_opts(
+            isn,
+            client_isn.wrapping_add(1),
+            &[TcpOption::Mss(local_mss)],
+        );
         let mut rto = INITIAL_RTO;
 
         for attempt in 0..=MAX_RETRIES {
             socket.send_to(&syn_ack, client_addr).await?;
-            log::debug!("[server] → SYN-ACK seq={isn} ack={} (attempt {attempt})",
-                client_isn.wrapping_add(1));
+            log::debug!(
+                "[server] → SYN-ACK seq={isn} ack={} mss={local_mss} negotiated={negotiated} \
+                 (attempt {attempt})",
+                client_isn.wrapping_add(1)
+            );
 
             'wait: loop {
                 match timeout(rto, socket.recv_from()).await {
@@ -230,9 +292,15 @@ impl Connection {
                             && h.flags & flags::SYN == 0
                             && h.ack == isn.wrapping_add(1);
                         if is_ack {
-                            log::debug!("[server] ← ACK — handshake complete");
-                            return Ok(Self::established(
-                                socket, client_addr, isn, client_isn,
+                            log::debug!(
+                                "[server] ← ACK — handshake complete negotiated_mss={negotiated}"
+                            );
+                            return Ok(Self::established_with_mss(
+                                socket,
+                                client_addr,
+                                isn,
+                                client_isn,
+                                negotiated,
                             ));
                         }
                         // Could be a retransmitted SYN — keep waiting.
@@ -404,6 +472,7 @@ impl Connection {
                 window: self.receiver.window_size(),
                 checksum: 0,
             },
+            options: vec![],
             payload: vec![],
         };
         let mut rto = self.rto;
@@ -447,16 +516,17 @@ impl Connection {
     /// 3-way handshake) to a higher-level protocol layer such as
     /// [`crate::gbn_connection::GbnConnection`].
     ///
-    /// Returns `(state, socket, peer, next_seq, rcv_nxt, rto)`.
+    /// Returns `(state, socket, peer, next_seq, rcv_nxt, rto, negotiated_mss)`.
     pub fn into_parts(
         self,
     ) -> (
         ConnectionState,
         Socket,
         SocketAddr,
-        u32,  // sender.next_seq
-        u32,  // receiver.rcv_nxt
-        Duration,
+        u32,      // sender.next_seq
+        u32,      // receiver.rcv_nxt
+        Duration, // rto
+        u16,      // negotiated_mss
     ) {
         (
             self.state,
@@ -465,6 +535,7 @@ impl Connection {
             self.sender.next_seq,
             self.receiver.rcv_nxt,
             self.rto,
+            self.negotiated_mss,
         )
     }
 
@@ -482,6 +553,7 @@ impl Connection {
                 window: self.receiver.window_size(),
                 checksum: 0,
             },
+            options: vec![],
             payload: vec![],
         }
     }
@@ -505,8 +577,21 @@ fn rand_isn() -> u32 {
     h.finish() as u32
 }
 
-/// Pure SYN packet (active open, no ACK).
-fn make_syn(isn: u32) -> Packet {
+/// Extract the MSS value from a parsed options list.
+///
+/// Returns `None` when no MSS option is present (backward-compatible peer).
+fn extract_mss(options: &[TcpOption]) -> Option<u16> {
+    options.iter().find_map(|o| {
+        if let TcpOption::Mss(m) = o {
+            Some(*m)
+        } else {
+            None
+        }
+    })
+}
+
+/// SYN packet with TCP-style options (active open).
+fn make_syn_with_opts(isn: u32, opts: &[TcpOption]) -> Packet {
     Packet {
         header: Header {
             seq: isn,
@@ -515,12 +600,13 @@ fn make_syn(isn: u32) -> Packet {
             window: DEFAULT_WINDOW,
             checksum: 0,
         },
+        options: opts.to_vec(),
         payload: vec![],
     }
 }
 
-/// SYN-ACK packet (passive open response).
-fn make_syn_ack(seq: u32, ack: u32) -> Packet {
+/// SYN-ACK packet with TCP-style options (passive open response).
+fn make_syn_ack_with_opts(seq: u32, ack: u32, opts: &[TcpOption]) -> Packet {
     Packet {
         header: Header {
             seq,
@@ -529,6 +615,7 @@ fn make_syn_ack(seq: u32, ack: u32) -> Packet {
             window: DEFAULT_WINDOW,
             checksum: 0,
         },
+        options: opts.to_vec(),
         payload: vec![],
     }
 }
@@ -543,6 +630,7 @@ fn make_ack(seq: u32, ack: u32) -> Packet {
             window: DEFAULT_WINDOW,
             checksum: 0,
         },
+        options: vec![],
         payload: vec![],
     }
 }

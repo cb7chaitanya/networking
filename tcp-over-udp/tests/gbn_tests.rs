@@ -5,8 +5,9 @@
 //! progress concurrently without blocking each other.
 
 use tcp_over_udp::{
-    connection::ConnError,
+    connection::{ConnError, Connection},
     gbn_connection::GbnConnection,
+    packet::DEFAULT_MSS,
     socket::Socket,
 };
 
@@ -1351,6 +1352,7 @@ async fn test_time_wait_absorbs_late_segment() {
                 window: 8192,
                 checksum: 0,
             },
+            options: vec![],
             payload: b"stale-segment".to_vec(),
         };
         let bytes = stale.encode().expect("encode failed");
@@ -1451,6 +1453,7 @@ async fn test_time_wait_reacks_duplicate_fin() {
                 window: 8192,
                 checksum: 0,
             },
+            options: vec![],
             payload: vec![],
         };
         let bytes = dup_fin.encode().expect("encode failed");
@@ -1464,4 +1467,188 @@ async fn test_time_wait_reacks_duplicate_fin() {
     })
     .await
     .expect("time_wait_reacks_duplicate_fin timed out");
+}
+
+// ---------------------------------------------------------------------------
+// Test 33: MSS negotiation — each peer advertises its own MSS; the connection
+// should settle on min(client_mss, server_mss).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_mss_negotiation_min_selected() {
+    const CLIENT_MSS: u16 = 800;
+    const SERVER_MSS: u16 = 600; // smaller → wins
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let conn = Connection::accept_with_mss(server_sock, SERVER_MSS)
+            .await
+            .expect("accept");
+        // Server sees negotiated = min(CLIENT_MSS, SERVER_MSS) = 600.
+        assert_eq!(
+            conn.negotiated_mss, 600,
+            "server negotiated_mss should be min(800,600)=600"
+        );
+        let mut gbn = GbnConnection::from_connection(conn, 4);
+        assert_eq!(gbn.mss(), 600, "GbnConnection should inherit negotiated MSS");
+        // Drain one message so the test completes cleanly.
+        loop {
+            match gbn.recv().await {
+                Ok(_) => {}
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        gbn.close().await.expect("server close");
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let conn = Connection::connect_with_mss(sock, server_addr, CLIENT_MSS)
+            .await
+            .expect("connect");
+        // Client also sees negotiated = 600.
+        assert_eq!(
+            conn.negotiated_mss, 600,
+            "client negotiated_mss should be min(800,600)=600"
+        );
+        let mut gbn = GbnConnection::from_connection(conn, 4);
+        assert_eq!(gbn.mss(), 600);
+        gbn.send(b"hello").await.expect("send");
+        gbn.flush().await.expect("flush");
+        gbn.close().await.expect("close");
+    });
+
+    tokio::time::timeout(DEADLINE, async {
+        let (s, c) = tokio::join!(server, client);
+        s.unwrap();
+        c.unwrap();
+    })
+    .await
+    .expect("test_mss_negotiation_min_selected timed out");
+}
+
+// ---------------------------------------------------------------------------
+// Test 34: backward-compatible peer (no MSS option) → fall back to DEFAULT_MSS.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_mss_backward_compat_no_option() {
+    // Both endpoints use the plain connect/accept (DEFAULT_MSS on both sides).
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let conn = Connection::accept(server_sock).await.expect("accept");
+        assert_eq!(
+            conn.negotiated_mss, DEFAULT_MSS,
+            "both peers use DEFAULT_MSS when neither restricts it"
+        );
+        let mut gbn = GbnConnection::from_connection(conn, 1);
+        loop {
+            match gbn.recv().await {
+                Ok(_) => {}
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+        gbn.close().await.expect("close");
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let conn = Connection::connect(sock, server_addr).await.expect("connect");
+        assert_eq!(conn.negotiated_mss, DEFAULT_MSS);
+        let mut gbn = GbnConnection::from_connection(conn, 1);
+        gbn.send(b"ping").await.expect("send");
+        gbn.flush().await.expect("flush");
+        gbn.close().await.expect("close");
+    });
+
+    tokio::time::timeout(DEADLINE, async {
+        let (s, c) = tokio::join!(server, client);
+        s.unwrap();
+        c.unwrap();
+    })
+    .await
+    .expect("test_mss_backward_compat_no_option timed out");
+}
+
+// ---------------------------------------------------------------------------
+// Test 35: segmentation — send a buffer larger than MSS; verify all bytes are
+// received correctly and each transmitted segment is ≤ MSS bytes.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_segmentation_respects_mss() {
+    // Use a small MSS so a moderately-sized message spans multiple segments.
+    const SMALL_MSS: u16 = 100;
+    const MSG_SIZE: usize = 350; // ceil(350/100) = 4 segments of ≤100 bytes each
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    // Build MSG_SIZE bytes without the `0..350 as u8` overflow trap.
+    let data: Vec<u8> = (0..MSG_SIZE).map(|i| (i % 256) as u8).collect();
+    let expected = data.clone();
+
+    let server = tokio::spawn(async move {
+        let conn = Connection::accept_with_mss(server_sock, SMALL_MSS)
+            .await
+            .expect("accept");
+        assert_eq!(conn.negotiated_mss, SMALL_MSS);
+        let mut gbn = GbnConnection::from_connection(conn, 8);
+        assert_eq!(gbn.mss(), SMALL_MSS);
+
+        // Collect all data until the client closes the connection.
+        let mut received: Vec<u8> = Vec::new();
+        loop {
+            match gbn.recv().await {
+                Ok(chunk) => {
+                    // Each segment delivered by recv() must be ≤ MSS bytes.
+                    assert!(
+                        chunk.len() <= SMALL_MSS as usize,
+                        "received chunk len {} exceeds MSS {}",
+                        chunk.len(),
+                        SMALL_MSS
+                    );
+                    received.extend_from_slice(&chunk);
+                }
+                Err(ConnError::Eof) => break, // client FIN received
+                Err(e) => panic!("server recv: {e}"),
+            }
+        }
+
+        assert_eq!(received, expected, "reassembled data must match original");
+        // State is now CloseWait; send our FIN back.
+        gbn.close().await.expect("server close");
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let conn = Connection::connect_with_mss(sock, server_addr, SMALL_MSS)
+            .await
+            .expect("connect");
+        assert_eq!(conn.negotiated_mss, SMALL_MSS);
+        let mut gbn = GbnConnection::from_connection(conn, 8);
+
+        // send() transparently segments `data` into SMALL_MSS-sized chunks.
+        gbn.send(&data).await.expect("send");
+        gbn.flush().await.expect("flush");
+        gbn.close().await.expect("close");
+    });
+
+    tokio::time::timeout(DEADLINE, async {
+        let (s, c) = tokio::join!(server, client);
+        s.unwrap();
+        c.unwrap();
+    })
+    .await
+    .expect("test_segmentation_respects_mss timed out");
 }

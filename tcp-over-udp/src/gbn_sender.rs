@@ -290,6 +290,7 @@ impl GbnSender {
                 window,
                 checksum: 0,
             },
+            options: vec![],
             payload,
         }
     }
@@ -609,6 +610,7 @@ mod tests {
                 window: 8192,
                 checksum: 0,
             },
+            options: vec![],
             payload: vec![0u8; payload_len],
         }
     }
