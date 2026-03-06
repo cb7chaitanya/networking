@@ -134,7 +134,7 @@ impl Connection {
     // Internal constructors
     // -----------------------------------------------------------------------
 
-    fn established_with_mss(
+    pub(crate) fn established_with_mss(
         socket: Socket,
         peer: SocketAddr,
         isn: u32,
