@@ -62,6 +62,13 @@ const MAX_RETRIES: u32 = 6;
 /// Default advertised window (stop-and-wait; not really used for flow control).
 const DEFAULT_WINDOW: u16 = 8192;
 
+/// Default window scale shift count for new connections.
+///
+/// A shift of 7 allows windows up to 8 MiB (65535 << 7 = 8,388,480 bytes),
+/// which is sufficient for most high-BDP paths.  This matches common OS
+/// defaults (Linux uses 7, Windows uses 8).
+pub const DEFAULT_WINDOW_SCALE: u8 = 7;
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -127,6 +134,18 @@ pub struct Connection {
     ///
     /// Defaults to [`DEFAULT_MSS`] when the peer does not advertise an MSS.
     pub negotiated_mss: u16,
+    /// Window scale shift count to apply when sending our window (local shift).
+    ///
+    /// When advertising our receive window in outgoing packets, we must shift
+    /// our true window size right by this amount: `advertised = true_window >> snd_wscale`.
+    /// This is `None` if window scaling was not negotiated.
+    snd_wscale: Option<u8>,
+    /// Window scale shift count to apply to peer's advertised window (peer shift).
+    ///
+    /// When interpreting the peer's advertised window in incoming packets, we
+    /// must shift left by this amount: `true_window = advertised << rcv_wscale`.
+    /// This is `None` if window scaling was not negotiated.
+    rcv_wscale: Option<u8>,
 }
 
 impl Connection {
@@ -140,6 +159,8 @@ impl Connection {
         isn: u32,
         peer_isn: u32,
         negotiated_mss: u16,
+        snd_wscale: Option<u8>,
+        rcv_wscale: Option<u8>,
     ) -> Self {
         Self {
             state: ConnectionState::Established,
@@ -150,6 +171,8 @@ impl Connection {
             peer,
             rto: INITIAL_RTO,
             negotiated_mss,
+            snd_wscale,
+            rcv_wscale,
         }
     }
 
@@ -171,6 +194,10 @@ impl Connection {
     /// not advertise an MSS (backward-compatible peer), `peer_mss` is taken
     /// as [`DEFAULT_MSS`].
     ///
+    /// This function also advertises window scaling with [`DEFAULT_WINDOW_SCALE`].
+    /// Window scaling is enabled only if the peer also includes a WindowScale
+    /// option in the SYN-ACK (per RFC 7323).
+    ///
     /// [`connect`]: Self::connect
     pub async fn connect_with_mss(
         socket: Socket,
@@ -178,12 +205,18 @@ impl Connection {
         local_mss: u16,
     ) -> Result<Self, ConnError> {
         let isn = rand_isn();
-        let syn = make_syn_with_opts(isn, &[TcpOption::Mss(local_mss)]);
+        let local_wscale = DEFAULT_WINDOW_SCALE;
+        let syn = make_syn_with_opts(
+            isn,
+            &[TcpOption::Mss(local_mss), TcpOption::WindowScale(local_wscale)],
+        );
         let mut rto = INITIAL_RTO;
 
         for attempt in 0..=MAX_RETRIES {
             socket.send_to(&syn, peer).await?;
-            log::debug!("[client] → SYN seq={isn} mss={local_mss} (attempt {attempt})");
+            log::debug!(
+                "[client] → SYN seq={isn} mss={local_mss} wscale={local_wscale} (attempt {attempt})"
+            );
 
             // Wait for SYN-ACK.
             'wait: loop {
@@ -200,16 +233,26 @@ impl Connection {
                             // Extract peer MSS; fall back to DEFAULT_MSS for old peers.
                             let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
                             let negotiated = local_mss.min(peer_mss);
+
+                            // snd_wscale = our shift (for outgoing window advertisements)
+                            // rcv_wscale = peer's shift (for interpreting peer's window)
+                            let (snd_wscale, rcv_wscale) =
+                                match extract_window_scale(&pkt.options) {
+                                    Some(peer_shift) => (Some(local_wscale), Some(peer_shift)),
+                                    None => (None, None),
+                                };
+
                             // Send ACK to complete the handshake.
                             let ack =
                                 make_ack(isn.wrapping_add(1), peer_isn.wrapping_add(1));
                             socket.send_to(&ack, peer).await?;
                             log::debug!(
                                 "[client] ← SYN-ACK peer_isn={peer_isn} peer_mss={peer_mss} \
-                                 negotiated_mss={negotiated}; → ACK"
+                                 negotiated_mss={negotiated} snd_wscale={snd_wscale:?} \
+                                 rcv_wscale={rcv_wscale:?}; → ACK"
                             );
                             return Ok(Self::established_with_mss(
-                                socket, peer, isn, peer_isn, negotiated,
+                                socket, peer, isn, peer_isn, negotiated, snd_wscale, rcv_wscale,
                             ));
                         }
                         // Wrong packet — keep waiting.
@@ -241,43 +284,58 @@ impl Connection {
 
     /// Like [`accept`] but with an explicit local MSS to advertise.
     ///
+    /// This function also supports window scaling (RFC 7323).  If the client's
+    /// SYN includes a WindowScale option, the server replies with its own
+    /// WindowScale in the SYN-ACK.  Window scaling is enabled only if both
+    /// sides include the option.
+    ///
     /// [`accept`]: Self::accept
     pub async fn accept_with_mss(
         socket: Socket,
         local_mss: u16,
     ) -> Result<Self, ConnError> {
         let isn = rand_isn();
+        let local_wscale = DEFAULT_WINDOW_SCALE;
 
         // Step 1: wait for SYN (no timeout — passive open).
-        let (client_addr, client_isn, peer_mss) = loop {
+        let (client_addr, client_isn, peer_mss, peer_wscale) = loop {
             let (pkt, addr) = socket.recv_from().await?;
             let h = &pkt.header;
             // A pure SYN has SYN set and ACK clear.
             if h.flags & flags::SYN != 0 && h.flags & flags::ACK == 0 {
                 let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
+                let peer_wscale = extract_window_scale(&pkt.options);
                 log::debug!(
-                    "[server] ← SYN seq={} peer_mss={peer_mss} from {addr}",
+                    "[server] ← SYN seq={} peer_mss={peer_mss} peer_wscale={peer_wscale:?} from {addr}",
                     h.seq
                 );
-                break (addr, h.seq, peer_mss);
+                break (addr, h.seq, peer_mss, peer_wscale);
             }
         };
 
         let negotiated = local_mss.min(peer_mss);
 
-        // Step 2: send SYN-ACK (advertising our own MSS), then wait for final ACK.
-        let syn_ack = make_syn_ack_with_opts(
-            isn,
-            client_isn.wrapping_add(1),
-            &[TcpOption::Mss(local_mss)],
-        );
+        // Window scaling: echo back our scale only if client sent one.
+        // server must not send WindowScale unless client did.
+        let (snd_wscale, rcv_wscale, syn_ack_opts) = match peer_wscale {
+            Some(peer_shift) => (
+                Some(local_wscale),
+                Some(peer_shift),
+                vec![TcpOption::Mss(local_mss), TcpOption::WindowScale(local_wscale)],
+            ),
+            None => (None, None, vec![TcpOption::Mss(local_mss)]),
+        };
+
+        // Step 2: send SYN-ACK (advertising our own MSS and optionally WindowScale),
+        // then wait for final ACK.
+        let syn_ack = make_syn_ack_with_opts(isn, client_isn.wrapping_add(1), &syn_ack_opts);
         let mut rto = INITIAL_RTO;
 
         for attempt in 0..=MAX_RETRIES {
             socket.send_to(&syn_ack, client_addr).await?;
             log::debug!(
                 "[server] → SYN-ACK seq={isn} ack={} mss={local_mss} negotiated={negotiated} \
-                 (attempt {attempt})",
+                 snd_wscale={snd_wscale:?} rcv_wscale={rcv_wscale:?} (attempt {attempt})",
                 client_isn.wrapping_add(1)
             );
 
@@ -293,7 +351,8 @@ impl Connection {
                             && h.ack == isn.wrapping_add(1);
                         if is_ack {
                             log::debug!(
-                                "[server] ← ACK — handshake complete negotiated_mss={negotiated}"
+                                "[server] ← ACK — handshake complete negotiated_mss={negotiated} \
+                                 snd_wscale={snd_wscale:?} rcv_wscale={rcv_wscale:?}"
                             );
                             return Ok(Self::established_with_mss(
                                 socket,
@@ -301,6 +360,8 @@ impl Connection {
                                 isn,
                                 client_isn,
                                 negotiated,
+                                snd_wscale,
+                                rcv_wscale,
                             ));
                         }
                         // Could be a retransmitted SYN — keep waiting.
@@ -507,6 +568,30 @@ impl Connection {
     }
 
     // -----------------------------------------------------------------------
+    // Window Scale Accessors
+    // -----------------------------------------------------------------------
+
+    /// Returns the local window scale shift count (`snd_wscale`).
+    ///
+    /// This is used when advertising our receive window in outgoing packets:
+    /// `advertised = true_window >> snd_wscale`.
+    ///
+    /// Returns `None` if window scaling was not negotiated.
+    pub fn snd_wscale(&self) -> Option<u8> {
+        self.snd_wscale
+    }
+
+    /// Returns the peer's window scale shift count (`rcv_wscale`).
+    ///
+    /// This is used when interpreting the peer's advertised window:
+    /// `true_window = advertised << rcv_wscale`.
+    ///
+    /// Returns `None` if window scaling was not negotiated.
+    pub fn rcv_wscale(&self) -> Option<u8> {
+        self.rcv_wscale
+    }
+
+    // -----------------------------------------------------------------------
     // Decomposition
     // -----------------------------------------------------------------------
 
@@ -516,17 +601,29 @@ impl Connection {
     /// 3-way handshake) to a higher-level protocol layer such as
     /// [`crate::gbn_connection::GbnConnection`].
     ///
-    /// Returns `(state, socket, peer, next_seq, rcv_nxt, rto, negotiated_mss)`.
+    /// Returns `(state, socket, peer, next_seq, rcv_nxt, rto, negotiated_mss, snd_wscale, rcv_wscale)`.
+    ///
+    /// # Window scale factors
+    ///
+    /// - `snd_wscale`: Our local shift count, used when advertising our receive
+    ///   window in outgoing packets (`advertised = true_window >> snd_wscale`).
+    /// - `rcv_wscale`: Peer's shift count, used when interpreting the peer's
+    ///   advertised window (`true_window = advertised << rcv_wscale`).
+    ///
+    /// Both are `None` if window scaling was not negotiated (peer did not
+    /// include WindowScale option in SYN/SYN-ACK).
     pub fn into_parts(
         self,
     ) -> (
         ConnectionState,
         Socket,
         SocketAddr,
-        u32,      // sender.next_seq
-        u32,      // receiver.rcv_nxt
-        Duration, // rto
-        u16,      // negotiated_mss
+        u32,         // sender.next_seq
+        u32,         // receiver.rcv_nxt
+        Duration,    // rto
+        u16,         // negotiated_mss
+        Option<u8>,  // snd_wscale
+        Option<u8>,  // rcv_wscale
     ) {
         (
             self.state,
@@ -536,6 +633,8 @@ impl Connection {
             self.receiver.rcv_nxt,
             self.rto,
             self.negotiated_mss,
+            self.snd_wscale,
+            self.rcv_wscale,
         )
     }
 
@@ -584,6 +683,22 @@ fn extract_mss(options: &[TcpOption]) -> Option<u16> {
     options.iter().find_map(|o| {
         if let TcpOption::Mss(m) = o {
             Some(*m)
+        } else {
+            None
+        }
+    })
+}
+
+/// Extract the window scale shift count from a parsed options list.
+///
+/// Returns `None` when no WindowScale option is present (peer does not
+/// support RFC 7323 window scaling).  The shift count is clamped to 14
+/// per RFC 7323 §2.3.
+fn extract_window_scale(options: &[TcpOption]) -> Option<u8> {
+    options.iter().find_map(|o| {
+        if let TcpOption::WindowScale(shift) = o {
+            // RFC 7323: shift counts > 14 are treated as 14.
+            Some((*shift).min(14))
         } else {
             None
         }

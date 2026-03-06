@@ -135,6 +135,20 @@ pub struct GbnConnection<CC: CongestionControl = RenoCC> {
     /// bytes before queuing each chunk as an independent packet.  Set by
     /// `min(local_mss, peer_mss)` during the handshake.
     mss: u16,
+
+    /// Window scale shift count for sending our window (local shift).
+    ///
+    /// When advertising our receive window, we shift right by this amount:
+    /// `advertised = true_window >> snd_wscale`.  `None` if window scaling
+    /// was not negotiated.
+    snd_wscale: Option<u8>,
+
+    /// Window scale shift count for interpreting peer's window (peer shift).
+    ///
+    /// When interpreting the peer's advertised window, we shift left:
+    /// `true_window = advertised << rcv_wscale`.  `None` if window scaling
+    /// was not negotiated.
+    rcv_wscale: Option<u8>,
 }
 
 // Constructors use GbnSender::new() which is only available for RenoCC.
@@ -165,7 +179,8 @@ impl GbnConnection {
         window_size: usize,
         recv_buf_bytes: usize,
     ) -> Self {
-        let (state, socket, peer, next_seq, rcv_nxt, _rto, negotiated_mss) = conn.into_parts();
+        let (state, socket, peer, next_seq, rcv_nxt, _rto, negotiated_mss, snd_wscale, rcv_wscale) =
+            conn.into_parts();
         Self {
             state,
             socket: Arc::new(socket),
@@ -175,6 +190,8 @@ impl GbnConnection {
             rtt: RttEstimator::new(),
             msl: DEFAULT_MSL,
             mss: negotiated_mss,
+            snd_wscale,
+            rcv_wscale,
         }
     }
 
@@ -234,6 +251,26 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         self.mss
     }
 
+    /// Returns the local window scale shift count (`snd_wscale`).
+    ///
+    /// This is used when advertising our receive window in outgoing packets:
+    /// `advertised = true_window >> snd_wscale`.
+    ///
+    /// Returns `None` if window scaling was not negotiated.
+    pub fn snd_wscale(&self) -> Option<u8> {
+        self.snd_wscale
+    }
+
+    /// Returns the peer's window scale shift count (`rcv_wscale`).
+    ///
+    /// This is used when interpreting the peer's advertised window:
+    /// `true_window = advertised << rcv_wscale`.
+    ///
+    /// Returns `None` if window scaling was not negotiated.
+    pub fn rcv_wscale(&self) -> Option<u8> {
+        self.rcv_wscale
+    }
+
     /// Override the Maximum Segment Lifetime used for `TIME_WAIT`.
     ///
     /// The connection lingers in `TIME_WAIT` for `2 × msl` after the active
@@ -268,6 +305,46 @@ impl<CC: CongestionControl> GbnConnection<CC> {
     pub fn with_nagle(mut self, enabled: bool) -> Self {
         self.sender.set_nagle(enabled);
         self
+    }
+
+    // -----------------------------------------------------------------------
+    // Window scaling helpers
+    // -----------------------------------------------------------------------
+
+    /// Scale the peer's advertised window using the negotiated `rcv_wscale`.
+    ///
+    /// When window scaling is enabled, the 16-bit window field in incoming
+    /// packets represents `true_window >> peer_shift`.  This method applies
+    /// the reverse transformation: `true_window = advertised << rcv_wscale`.
+    ///
+    /// When window scaling is not negotiated (`rcv_wscale` is `None`), the
+    /// raw header value is returned unchanged (as `usize`).
+    #[inline]
+    fn scale_peer_window(&self, advertised: u16) -> usize {
+        match self.rcv_wscale {
+            Some(shift) => (advertised as usize) << shift,
+            None => advertised as usize,
+        }
+    }
+
+    /// Scale our receive window for advertisement in outgoing packets.
+    ///
+    /// When window scaling is enabled, we must shift our true receive window
+    /// right by `snd_wscale` before placing it in the 16-bit header field:
+    /// `advertised = true_window >> snd_wscale`.
+    ///
+    /// When window scaling is not negotiated, the window is clamped to 65535
+    /// (the maximum 16-bit value).
+    #[inline]
+    fn scale_our_window(&self, true_window: usize) -> u16 {
+        match self.snd_wscale {
+            Some(shift) => {
+                let scaled = true_window >> shift;
+                // Clamp to u16::MAX in case of overflow (defensive).
+                scaled.min(u16::MAX as usize) as u16
+            }
+            None => true_window.min(u16::MAX as usize) as u16,
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -382,11 +459,11 @@ impl<CC: CongestionControl> GbnConnection<CC> {
             }
         }
 
-        // Send the new segment.
+        // Send the new segment (with scaled window if negotiated).
         let pkt = self.sender.build_data_packet(
             data.to_vec(),
             self.receiver.ack_number(),
-            self.receiver.window_size(),
+            self.scale_our_window(self.receiver.window_size()),
         );
         self.socket.send_to(&pkt, self.peer).await?;
         self.sender.record_sent(pkt);
@@ -598,7 +675,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 seq: fin_seq,
                 ack: self.receiver.ack_number(),
                 flags: flags::FIN | flags::ACK,
-                window: self.receiver.window_size(),
+                window: self.scale_our_window(self.receiver.window_size()),
                 checksum: 0,
             },
             options: vec![],
@@ -712,6 +789,8 @@ impl<CC: CongestionControl> GbnConnection<CC> {
             recv_tx,
             self.msl,
             self.mss as usize,
+            self.snd_wscale,
+            self.rcv_wscale,
         ));
 
         GbnSession {
@@ -732,6 +811,9 @@ impl<CC: CongestionControl> GbnConnection<CC> {
     /// This centralises all ACK handling so that every code path — `send`,
     /// `flush`, `recv`, and the event loop — updates the flow-control state,
     /// the RTT estimator, and the Reno congestion window.
+    ///
+    /// The `peer_rwnd` parameter is the raw 16-bit window from the header;
+    /// window scaling (if negotiated) is applied internally.
     fn on_ack_received(&mut self, ack_num: u32, peer_rwnd: u16, sack_blocks: &[SackBlock]) -> usize {
         let AckResult { acked_count, rtt_sample, dup_ack: _ } = self.sender.on_ack(ack_num);
         // Apply SACK information so the sender knows which segments are already
@@ -739,8 +821,10 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         self.sender.process_sack(sack_blocks);
         // Always update the peer's advertised receive window, even for dup-ACKs,
         // because the window field in the ACK reflects the peer's current buffer.
+        // Apply window scaling if negotiated.
         // PersistTransition is managed by callers that own the timer futures.
-        let _ = self.sender.update_peer_rwnd(peer_rwnd);
+        let scaled_rwnd = self.scale_peer_window(peer_rwnd);
+        let _ = self.sender.update_peer_rwnd(scaled_rwnd);
         if let Some(sample) = rtt_sample {
             self.rtt.record_sample(sample);
             log::debug!(
@@ -867,7 +951,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 seq: self.sender.next_seq,
                 ack: self.receiver.ack_number(),
                 flags: flags::ACK, // OPT is auto-set by encode() when options is non-empty
-                window: self.receiver.window_size(),
+                window: self.scale_our_window(self.receiver.window_size()),
                 checksum: 0,
             },
             options,
@@ -905,7 +989,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 seq: self.sender.next_seq,
                 ack: self.receiver.ack_number(),
                 flags: flags::FIN | flags::ACK,
-                window: self.receiver.window_size(),
+                window: self.scale_our_window(self.receiver.window_size()),
                 checksum: 0,
             },
             options: vec![],
@@ -1097,7 +1181,26 @@ async fn event_loop<CC: CongestionControl>(
     app_tx: mpsc::Sender<Result<Vec<u8>, ConnError>>,
     msl: Duration,
     mss: usize,
+    snd_wscale: Option<u8>,
+    rcv_wscale: Option<u8>,
 ) {
+    // Window scaling helpers (closures capturing the negotiated shift counts).
+    let scale_peer_window = |advertised: u16| -> usize {
+        match rcv_wscale {
+            Some(shift) => (advertised as usize) << shift,
+            None => advertised as usize,
+        }
+    };
+    let scale_our_window = |true_window: usize| -> u16 {
+        match snd_wscale {
+            Some(shift) => {
+                let scaled = true_window >> shift;
+                scaled.min(u16::MAX as usize) as u16
+            }
+            None => true_window.min(u16::MAX as usize) as u16,
+        }
+    };
+
     let mut rto = rtt.rto();
     let mut retries = 0u32;
 
@@ -1166,7 +1269,7 @@ async fn event_loop<CC: CongestionControl>(
             let pkt = sender.build_data_packet(
                 data,
                 receiver.ack_number(),
-                receiver.window_size(),
+                scale_our_window(receiver.window_size()),
             );
             if socket.send_to(&pkt, peer).await.is_err() {
                 break;
@@ -1193,7 +1296,7 @@ async fn event_loop<CC: CongestionControl>(
                 // Loop again: drain phase will send it, then we reach here with
                 // an empty queue and actually emit the FIN.
             } else {
-                let fin = build_fin(&sender, &receiver);
+                let fin = build_fin(&sender, &receiver, snd_wscale);
                 fin_seq = fin.header.seq; // Save for ACK-of-FIN detection below.
                 let _ = socket.send_to(&fin, peer).await;
                 log::debug!("[gbn:loop] → FIN seq={} (data drained); waiting for peer FIN", fin_seq);
@@ -1239,7 +1342,7 @@ async fn event_loop<CC: CongestionControl>(
                             let pkt = sender.build_data_packet(
                                 first,
                                 receiver.ack_number(),
-                                receiver.window_size(),
+                                scale_our_window(receiver.window_size()),
                             );
                             if socket.send_to(&pkt, peer).await.is_err() {
                                 break;
@@ -1299,7 +1402,7 @@ async fn event_loop<CC: CongestionControl>(
 
                 if h.flags & flags::FIN != 0 {
                     receiver.on_fin(h.seq);
-                    let ack = build_ack(&sender, &receiver);
+                    let ack = build_ack(&sender, &receiver, snd_wscale);
                     let _ = socket.send_to(&ack, peer).await;
                     if half_closed {
                         // Active closer: our FIN was already sent; peer confirmed
@@ -1323,8 +1426,9 @@ async fn event_loop<CC: CongestionControl>(
                         fin_acked = true;
                         log::debug!("[gbn:loop] ← ACK of our FIN → FIN_WAIT_2");
                     }
-                    // Update peer rwnd and handle persist timer transitions.
-                    let persist_transition = sender.update_peer_rwnd(h.window);
+                    // Update peer rwnd (with window scaling) and handle persist timer transitions.
+                    let scaled_rwnd = scale_peer_window(h.window);
+                    let persist_transition = sender.update_peer_rwnd(scaled_rwnd);
                     match persist_transition {
                         PersistTransition::Activated => {
                             // peer_rwnd just dropped to 0: stop retransmit, start persist.
@@ -1407,7 +1511,7 @@ async fn event_loop<CC: CongestionControl>(
                 // Data payload.
                 if !pkt.payload.is_empty() {
                     let accepted = receiver.on_segment(h.seq, &pkt.payload);
-                    let ack = build_ack(&sender, &receiver);
+                    let ack = build_ack(&sender, &receiver, snd_wscale);
                     let _ = socket.send_to(&ack, peer).await;
                     if accepted {
                         let mut buf = vec![0u8; receiver.app_buffer.len()];
@@ -1458,7 +1562,7 @@ async fn event_loop<CC: CongestionControl>(
                 } else {
                     // No in-flight segments (staged data blocked on rwnd==0):
                     // send a pure ACK to elicit a window update from the peer.
-                    let ack = build_ack(&sender, &receiver);
+                    let ack = build_ack(&sender, &receiver, snd_wscale);
                     log::debug!("[gbn:loop] persist keepalive (no in-flight)");
                     let _ = socket.send_to(&ack, peer).await;
                 }
@@ -1517,13 +1621,22 @@ async fn run_time_wait(
 // Packet builders
 // ---------------------------------------------------------------------------
 
-fn build_ack<CC: CongestionControl>(sender: &GbnSender<CC>, receiver: &GbnReceiver) -> Packet {
+fn build_ack<CC: CongestionControl>(
+    sender: &GbnSender<CC>,
+    receiver: &GbnReceiver,
+    snd_wscale: Option<u8>,
+) -> Packet {
+    let true_window = receiver.window_size();
+    let window = match snd_wscale {
+        Some(shift) => (true_window >> shift).min(u16::MAX as usize) as u16,
+        None => true_window.min(u16::MAX as usize) as u16,
+    };
     Packet {
         header: Header {
             seq: sender.next_seq,
             ack: receiver.ack_number(),
             flags: flags::ACK,
-            window: receiver.window_size(),
+            window,
             checksum: 0,
         },
         options: vec![],
@@ -1531,13 +1644,22 @@ fn build_ack<CC: CongestionControl>(sender: &GbnSender<CC>, receiver: &GbnReceiv
     }
 }
 
-fn build_fin<CC: CongestionControl>(sender: &GbnSender<CC>, receiver: &GbnReceiver) -> Packet {
+fn build_fin<CC: CongestionControl>(
+    sender: &GbnSender<CC>,
+    receiver: &GbnReceiver,
+    snd_wscale: Option<u8>,
+) -> Packet {
+    let true_window = receiver.window_size();
+    let window = match snd_wscale {
+        Some(shift) => (true_window >> shift).min(u16::MAX as usize) as u16,
+        None => true_window.min(u16::MAX as usize) as u16,
+    };
     Packet {
         header: Header {
             seq: sender.next_seq,
             ack: receiver.ack_number(),
             flags: flags::FIN | flags::ACK,
-            window: receiver.window_size(),
+            window,
             checksum: 0,
         },
         options: vec![],
