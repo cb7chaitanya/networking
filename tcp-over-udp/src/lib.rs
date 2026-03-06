@@ -30,7 +30,6 @@
 //! - [`state`]           — finite-state-machine types
 //! - [`sender`]          — stop-and-wait outbound segment state
 //! - [`receiver`]        — stop-and-wait inbound segment reassembly
-//! - [`timer`]           — retransmit and keep-alive timers
 //! - [`simulator`]       — optional lossy/reorder network layer for testing
 //! - [`socket`]          — async UDP socket abstraction
 
@@ -47,4 +46,3 @@ pub mod sender;
 pub mod simulator;
 pub mod socket;
 pub mod state;
-pub mod timer;
