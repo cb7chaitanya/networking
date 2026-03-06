@@ -85,7 +85,11 @@ impl RetransmitTimer {
                 self.rttvar = Some(sample / 2);
             }
             (Some(srtt), Some(rttvar)) => {
-                let diff = sample.abs_diff(srtt);
+                let diff = if sample > srtt {
+                    sample - srtt
+                } else {
+                    srtt - sample
+                };
                 self.rttvar = Some(rttvar * 3 / 4 + diff / 4);
                 self.srtt = Some(srtt * 7 / 8 + sample / 8);
             }
