@@ -1317,7 +1317,9 @@ async fn event_loop<CC: CongestionControl>(
 
                 // Cumulative ACK — slide window, update peer rwnd, RTT estimator, Reno CC.
                 if h.flags & flags::ACK != 0 {
+                    let sack_blocks = extract_sack_blocks(&pkt);
                     let AckResult { acked_count, rtt_sample, dup_ack } = sender.on_ack(h.ack);
+                    sender.process_sack(&sack_blocks);
                     // Track whether the peer has ACKed our FIN (FIN_WAIT_1 → FIN_WAIT_2).
                     if half_closed && !fin_acked && h.ack == fin_seq.wrapping_add(1) {
                         fin_acked = true;
@@ -1389,13 +1391,9 @@ async fn event_loop<CC: CongestionControl>(
                     } else if dup_ack && sender.dup_ack_count() == 3 {
                         // Reno fast retransmit: retransmit oldest unacked segment.
                         sender.on_triple_dup_ack_cc();
-                        if let Some(entry) = sender.window_entries().next() {
-                            let pkt = entry.packet.clone();
+                        if let Some(pkt) = sender.retransmit_oldest() {
                             log::debug!("[gbn:loop] fast-retransmit seq={}", pkt.header.seq);
                             let _ = socket.send_to(&pkt, peer).await;
-                        }
-                        if let Some(e) = sender.window.front_mut() {
-                            e.tx_count += 1;
                         }
                         log::debug!(
                             "[gbn:loop] 3-dup-ACK → FR cwnd={}",
@@ -1518,6 +1516,13 @@ async fn run_time_wait(
 // ---------------------------------------------------------------------------
 
 fn build_ack<CC: CongestionControl>(sender: &GbnSender<CC>, receiver: &GbnReceiver) -> Packet {
+    let sack_blocks = receiver.sack_blocks();
+    let options = if sack_blocks.is_empty() {
+        vec![]
+    } else {
+        vec![TcpOption::Sack(sack_blocks)]
+    };
+
     Packet {
         header: Header {
             seq: sender.next_seq,
@@ -1526,7 +1531,7 @@ fn build_ack<CC: CongestionControl>(sender: &GbnSender<CC>, receiver: &GbnReceiv
             window: receiver.window_size(),
             checksum: 0,
         },
-        options: vec![],
+        options,
         payload: vec![],
     }
 }
