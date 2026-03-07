@@ -432,7 +432,30 @@ impl<CC: CongestionControl> GbnConnection<CC> {
 
             let h = &pkt.header;
 
+            // RST received → abort immediately.
             if h.flags & flags::RST != 0 {
+                self.state = ConnectionState::Closed;
+                return Err(ConnError::Reset);
+            }
+
+            // Unexpected SYN in a synchronised state → half-open detection.
+            if is_unexpected_syn(h.flags, self.state) {
+                let rst = build_rst_for(&pkt);
+                let _ = self.socket.send_to(&rst, self.peer).await;
+                log::debug!("[gbn] recv: ← unexpected SYN in {:?}; → RST", self.state);
+                self.state = ConnectionState::Closed;
+                return Err(ConnError::Reset);
+            }
+
+            // Sequence number validation for data segments.
+            if !pkt.payload.is_empty() && !self.receiver.is_seq_plausible(h.seq) {
+                let rst = build_rst_for(&pkt);
+                let _ = self.socket.send_to(&rst, self.peer).await;
+                log::debug!(
+                    "[gbn] recv: ← implausible seq={} (rcv_nxt={}); → RST",
+                    h.seq,
+                    self.receiver.ack_number()
+                );
                 self.state = ConnectionState::Closed;
                 return Err(ConnError::Reset);
             }
@@ -620,6 +643,13 @@ impl<CC: CongestionControl> GbnConnection<CC> {
             match timeout(rto, self.socket.recv_from()).await {
                 Ok(Ok((pkt, addr))) if addr == self.peer => {
                     let h = &pkt.header;
+
+                    if h.flags & flags::RST != 0 {
+                        log::debug!("[gbn] FIN_WAIT_1 ← RST → CLOSED");
+                        self.state = ConnectionState::Closed;
+                        return Ok(());
+                    }
+
                     let acks_our_fin = h.flags & flags::ACK != 0
                         && h.ack == fin_seq.wrapping_add(1);
                     let has_fin = h.flags & flags::FIN != 0;
@@ -686,6 +716,26 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         // ── Phase 3: TIME_WAIT ─────────────────────────────────────────────
         self.state = ConnectionState::TimeWait;
         self.do_time_wait(last_ack).await;
+        self.state = ConnectionState::Closed;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Abort (RST)
+    // -----------------------------------------------------------------------
+
+    /// Abort the connection immediately by sending RST.
+    ///
+    /// Transitions to `Closed` without the graceful FIN handshake.  Any data
+    /// in the send/receive buffers is discarded.  The peer will observe
+    /// [`ConnError::Reset`] on its next socket operation.
+    pub async fn abort(&mut self) -> Result<(), ConnError> {
+        if matches!(self.state, ConnectionState::Closed) {
+            return Ok(());
+        }
+        let rst = build_rst_from(&self.sender);
+        self.socket.send_to(&rst, self.peer).await?;
+        log::debug!("[gbn] → RST (abort) seq={}", rst.header.seq);
         self.state = ConnectionState::Closed;
         Ok(())
     }
@@ -814,7 +864,31 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         let h = &pkt.header;
         let mut window_advanced = false;
 
+        // RST received → abort immediately.
         if h.flags & flags::RST != 0 {
+            self.state = ConnectionState::Closed;
+            return Err(ConnError::Reset);
+        }
+
+        // Unexpected SYN in a synchronised state → half-open detection.
+        if is_unexpected_syn(h.flags, self.state) {
+            let rst = build_rst_for(&pkt);
+            let _ = self.socket.send_to(&rst, self.peer).await;
+            log::debug!("[gbn] ← unexpected SYN in {:?}; → RST", self.state);
+            self.state = ConnectionState::Closed;
+            return Err(ConnError::Reset);
+        }
+
+        // Sequence number validation: reject segments with wildly implausible
+        // seq values (likely from a stale or spoofed connection).
+        if !pkt.payload.is_empty() && !self.receiver.is_seq_plausible(h.seq) {
+            let rst = build_rst_for(&pkt);
+            let _ = self.socket.send_to(&rst, self.peer).await;
+            log::debug!(
+                "[gbn] ← implausible seq={} (rcv_nxt={}); → RST",
+                h.seq,
+                self.receiver.ack_number()
+            );
             self.state = ConnectionState::Closed;
             return Err(ConnError::Reset);
         }
@@ -921,6 +995,11 @@ impl<CC: CongestionControl> GbnConnection<CC> {
 
             match timeout(rto, self.socket.recv_from()).await {
                 Ok(Ok((pkt, addr))) if addr == self.peer => {
+                    if pkt.header.flags & flags::RST != 0 {
+                        log::debug!("[gbn] passive close ← RST → CLOSED");
+                        self.state = ConnectionState::Closed;
+                        return Ok(());
+                    }
                     if pkt.header.flags & flags::ACK != 0
                         && pkt.header.ack == fin_seq.wrapping_add(1)
                     {
@@ -956,6 +1035,19 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 continue;
             }
             let h = &pkt.header;
+
+            if h.flags & flags::RST != 0 {
+                self.state = ConnectionState::Closed;
+                return Err(ConnError::Reset);
+            }
+
+            if is_unexpected_syn(h.flags, self.state) {
+                let rst = build_rst_for(&pkt);
+                let _ = self.socket.send_to(&rst, self.peer).await;
+                log::debug!("[gbn] FIN_WAIT_2 ← unexpected SYN; → RST");
+                self.state = ConnectionState::Closed;
+                return Err(ConnError::Reset);
+            }
 
             if h.flags & flags::FIN != 0 {
                 self.receiver.on_fin(h.seq);
@@ -1024,6 +1116,11 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         for _attempt in 0..=MAX_RETRIES {
             match timeout(rto, self.socket.recv_from()).await {
                 Ok(Ok((pkt, addr))) if addr == self.peer => {
+                    if pkt.header.flags & flags::RST != 0 {
+                        log::debug!("[gbn] CLOSING ← RST → CLOSED");
+                        self.state = ConnectionState::Closed;
+                        return Ok(());
+                    }
                     if pkt.header.flags & flags::ACK != 0
                         && pkt.header.ack == fin_seq.wrapping_add(1)
                     {
@@ -1292,7 +1389,30 @@ async fn event_loop<CC: CongestionControl>(
 
                 let h = &pkt.header;
 
+                // RST received → notify app and shut down.
                 if h.flags & flags::RST != 0 {
+                    let _ = app_tx.send(Err(ConnError::Reset)).await;
+                    break;
+                }
+
+                // Unexpected SYN in a synchronised state → half-open detection.
+                if is_unexpected_syn(h.flags, ConnectionState::Established) {
+                    let rst = build_rst_for(&pkt);
+                    let _ = socket.send_to(&rst, peer).await;
+                    log::debug!("[gbn:loop] ← unexpected SYN; → RST");
+                    let _ = app_tx.send(Err(ConnError::Reset)).await;
+                    break;
+                }
+
+                // Sequence number validation for data segments.
+                if !pkt.payload.is_empty() && !receiver.is_seq_plausible(h.seq) {
+                    let rst = build_rst_for(&pkt);
+                    let _ = socket.send_to(&rst, peer).await;
+                    log::debug!(
+                        "[gbn:loop] ← implausible seq={} (rcv_nxt={}); → RST",
+                        h.seq,
+                        receiver.ack_number()
+                    );
                     let _ = app_tx.send(Err(ConnError::Reset)).await;
                     break;
                 }
@@ -1567,4 +1687,67 @@ fn extract_sack_blocks(pkt: &Packet) -> Vec<SackBlock> {
         })
         .flat_map(|b| b.iter().cloned())
         .collect()
+}
+
+/// Build an RST packet in response to an incoming segment (RFC 793 §3.4).
+///
+/// If the incoming segment has ACK set, the RST carries `seq = incoming.ack`
+/// so the peer considers it in-window.  Otherwise the RST carries `seq = 0`
+/// with `ack = seg.seq + seg.len` and the ACK flag set.
+fn build_rst_for(incoming: &Packet) -> Packet {
+    if incoming.header.flags & flags::ACK != 0 {
+        Packet {
+            header: Header {
+                seq: incoming.header.ack,
+                ack: 0,
+                flags: flags::RST,
+                window: 0,
+                checksum: 0,
+            },
+            options: vec![],
+            payload: vec![],
+        }
+    } else {
+        let seg_len = incoming.payload.len() as u32
+            + if incoming.header.flags & (flags::SYN | flags::FIN) != 0 { 1 } else { 0 };
+        Packet {
+            header: Header {
+                seq: 0,
+                ack: incoming.header.seq.wrapping_add(seg_len),
+                flags: flags::RST | flags::ACK,
+                window: 0,
+                checksum: 0,
+            },
+            options: vec![],
+            payload: vec![],
+        }
+    }
+}
+
+/// Build an RST originating from our side (for `abort()`).
+fn build_rst_from<CC: CongestionControl>(sender: &GbnSender<CC>) -> Packet {
+    Packet {
+        header: Header {
+            seq: sender.next_seq,
+            ack: 0,
+            flags: flags::RST,
+            window: 0,
+            checksum: 0,
+        },
+        options: vec![],
+        payload: vec![],
+    }
+}
+
+/// Returns `true` if the incoming packet carries a SYN in a state where it
+/// is unexpected (any synchronised state: Established, FinWait*, etc.).
+///
+/// Receiving SYN in a synchronised state indicates a half-open connection
+/// (peer has restarted) and must be answered with RST per RFC 793 §3.4.
+fn is_unexpected_syn(flags: u8, state: ConnectionState) -> bool {
+    flags & flags::SYN != 0
+        && !matches!(
+            state,
+            ConnectionState::Closed | ConnectionState::SynSent | ConnectionState::SynReceived
+        )
 }

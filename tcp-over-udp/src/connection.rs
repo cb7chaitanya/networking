@@ -507,6 +507,35 @@ impl Connection {
     }
 
     // -----------------------------------------------------------------------
+    // Abort (RST)
+    // -----------------------------------------------------------------------
+
+    /// Abort the connection immediately by sending RST.
+    ///
+    /// Transitions to `Closed` without the graceful FIN handshake.  The peer
+    /// will observe [`ConnError::Reset`] on its next socket operation.
+    pub async fn abort(&mut self) -> Result<(), ConnError> {
+        if matches!(self.state, ConnectionState::Closed) {
+            return Ok(());
+        }
+        let rst = Packet {
+            header: Header {
+                seq: self.sender.next_seq,
+                ack: 0,
+                flags: flags::RST,
+                window: 0,
+                checksum: 0,
+            },
+            options: vec![],
+            payload: vec![],
+        };
+        self.socket.send_to(&rst, self.peer).await?;
+        log::debug!("→ RST (abort) seq={}", rst.header.seq);
+        self.state = ConnectionState::Closed;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
     // Decomposition
     // -----------------------------------------------------------------------
 

@@ -220,6 +220,19 @@ impl GbnReceiver {
         let d = seq.wrapping_sub(self.rcv_nxt);
         d > 0 && d <= (u32::MAX / 2)
     }
+
+    /// `true` when `seq` is plausibly related to this connection.
+    ///
+    /// A sequence number is *implausible* when its wrapping distance from
+    /// `rcv_nxt` exceeds twice the receive-buffer capacity in either
+    /// direction.  Such a segment almost certainly belongs to an old or
+    /// spoofed connection and warrants an RST rather than a dup-ACK.
+    pub fn is_seq_plausible(&self, seq: u32) -> bool {
+        let threshold = (self.capacity as u32).saturating_mul(2).max(65536);
+        let forward = seq.wrapping_sub(self.rcv_nxt);
+        let backward = self.rcv_nxt.wrapping_sub(seq);
+        forward <= threshold || backward <= threshold
+    }
 }
 
 // ---------------------------------------------------------------------------
