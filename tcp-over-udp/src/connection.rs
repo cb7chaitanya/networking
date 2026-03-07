@@ -127,6 +127,8 @@ pub struct Connection {
     ///
     /// Defaults to [`DEFAULT_MSS`] when the peer does not advertise an MSS.
     pub negotiated_mss: u16,
+    /// Most recent TSval received from the peer (echoed in our ACKs as TSecr).
+    last_peer_tsval: u32,
 }
 
 impl Connection {
@@ -150,6 +152,7 @@ impl Connection {
             peer,
             rto: INITIAL_RTO,
             negotiated_mss,
+            last_peer_tsval: 0,
         }
     }
 
@@ -178,8 +181,12 @@ impl Connection {
         local_mss: u16,
     ) -> Result<Self, ConnError> {
         let isn = rand_isn();
-        let syn = make_syn_with_opts(isn, &[TcpOption::Mss(local_mss)]);
-        let mut rto = INITIAL_RTO;
+        let tsval = now_tsval();
+        let syn = make_syn_with_opts(isn, &[
+            TcpOption::Mss(local_mss),
+            TcpOption::Timestamp(tsval, 0),
+        ]);
+        let mut rto = INITIAL_RTO;    
 
         for attempt in 0..=MAX_RETRIES {
             socket.send_to(&syn, peer).await?;
@@ -197,20 +204,22 @@ impl Connection {
                             == (flags::SYN | flags::ACK);
                         if is_syn_ack && h.ack == isn.wrapping_add(1) {
                             let peer_isn = h.seq;
-                            // Extract peer MSS; fall back to DEFAULT_MSS for old peers.
                             let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
                             let negotiated = local_mss.min(peer_mss);
-                            // Send ACK to complete the handshake.
-                            let ack =
-                                make_ack(isn.wrapping_add(1), peer_isn.wrapping_add(1));
+                            let peer_tsval = extract_tsval(&pkt.options).unwrap_or(0);
+                            if let Some(tsecr) = extract_tsecr(&pkt.options) {
+                                let rtt = Duration::from_millis(now_tsval().wrapping_sub(tsecr) as u64);
+                                log::debug!("[client] RTT sample from timestamp: {rtt:?}");
+                            }
+                            let ack = make_ack(isn.wrapping_add(1), peer_isn.wrapping_add(1));
                             socket.send_to(&ack, peer).await?;
                             log::debug!(
                                 "[client] ← SYN-ACK peer_isn={peer_isn} peer_mss={peer_mss} \
-                                 negotiated_mss={negotiated}; → ACK"
+                                negotiated_mss={negotiated}; → ACK"
                             );
-                            return Ok(Self::established_with_mss(
-                                socket, peer, isn, peer_isn, negotiated,
-                            ));
+                            let mut conn = Self::established_with_mss(socket, peer, isn, peer_isn, negotiated);
+                            conn.last_peer_tsval = peer_tsval;
+                            return Ok(conn);
                         }
                         // Wrong packet — keep waiting.
                     }
@@ -249,9 +258,10 @@ impl Connection {
         let isn = rand_isn();
 
         // Step 1: wait for SYN (no timeout — passive open).
-        let (client_addr, client_isn, peer_mss) = loop {
+        let (client_addr, client_isn, peer_mss,client_tsval) = loop {
             let (pkt, addr) = socket.recv_from().await?;
             let h = &pkt.header;
+            let client_tsval = extract_tsval(&pkt.options).unwrap_or(0);
             // A pure SYN has SYN set and ACK clear.
             if h.flags & flags::SYN != 0 && h.flags & flags::ACK == 0 {
                 let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
@@ -259,7 +269,7 @@ impl Connection {
                     "[server] ← SYN seq={} peer_mss={peer_mss} from {addr}",
                     h.seq
                 );
-                break (addr, h.seq, peer_mss);
+                break (addr, h.seq, peer_mss,client_tsval);
             }
         };
 
@@ -269,7 +279,7 @@ impl Connection {
         let syn_ack = make_syn_ack_with_opts(
             isn,
             client_isn.wrapping_add(1),
-            &[TcpOption::Mss(local_mss)],
+            &[TcpOption::Mss(local_mss), TcpOption::Timestamp(now_tsval(), client_tsval)],
         );
         let mut rto = INITIAL_RTO;
 
@@ -295,13 +305,10 @@ impl Connection {
                             log::debug!(
                                 "[server] ← ACK — handshake complete negotiated_mss={negotiated}"
                             );
-                            return Ok(Self::established_with_mss(
-                                socket,
-                                client_addr,
-                                isn,
-                                client_isn,
-                                negotiated,
-                            ));
+                            let ack_tsval = extract_tsval(&pkt.options).unwrap_or(0);
+                            let mut conn = Self::established_with_mss(socket, client_addr, isn, client_isn, negotiated);
+                            conn.last_peer_tsval = ack_tsval;
+                            return Ok(conn);
                         }
                         // Could be a retransmitted SYN — keep waiting.
                     }
@@ -429,6 +436,10 @@ impl Connection {
                 continue;
             }
 
+            if let Some(tsval) = extract_tsval(&pkt.options) {
+                self.last_peer_tsval = tsval;
+            }
+
             let accepted = self.receiver.on_segment(h.seq, &pkt.payload);
             let ack = self.make_ack();
             self.socket.send_to(&ack, self.peer).await?;
@@ -553,7 +564,7 @@ impl Connection {
                 window: self.receiver.window_size(),
                 checksum: 0,
             },
-            options: vec![],
+            options: vec![TcpOption::Timestamp(now_tsval(), self.last_peer_tsval)],
             payload: vec![],
         }
     }
@@ -587,6 +598,28 @@ fn extract_mss(options: &[TcpOption]) -> Option<u16> {
         } else {
             None
         }
+    })
+}
+
+/// Returns a millisecond timestamp for use as TSval.
+/// Wraps at u32::MAX — matches RFC 1323 behaviour.
+fn now_tsval() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32
+}
+
+fn extract_tsval(options: &[TcpOption]) -> Option<u32> {
+    options.iter().find_map(|o| {
+        if let TcpOption::Timestamp(tsval, _) = o { Some(*tsval) } else { None }
+    })
+}
+
+fn extract_tsecr(options: &[TcpOption]) -> Option<u32> {
+    options.iter().find_map(|o| {
+        if let TcpOption::Timestamp(_, tsecr) = o { Some(*tsecr) } else { None }
     })
 }
 

@@ -88,6 +88,8 @@ pub mod option_kind {
     pub const MSS: u8 = 2;
     /// Selective Acknowledgement blocks — Kind=5, Length=2+8n, Data=n×(left:u32,right:u32).
     pub const SACK: u8 = 5;
+    /// TCP Timestamps (RFC 1323) — Kind=8, Length=10, TSval(4)+TSecr(4).
+    pub const TIMESTAMP: u8 = 8;
 }
 
 /// Default MSS when the peer does not advertise one.
@@ -154,6 +156,12 @@ pub enum TcpOption {
     /// packets to inform the sender which segments can be skipped on
     /// retransmission.
     Sack(Vec<SackBlock>),
+    /// TCP Timestamps (RFC 1323).
+    /// 
+    /// `TSval` is the sender's current timestamp clock.
+    // `TSecr` echoes the TSval from the most recent segment received.
+    /// Carried on SYN, SYN-ACK, and all subsequent ACKs.
+Timestamp(u32, u32),
 }
 
 impl TcpOption {
@@ -164,6 +172,7 @@ impl TcpOption {
             TcpOption::Nop => 1,
             TcpOption::Mss(_) => 4,                  // kind(1) + length(1) + value(2)
             TcpOption::Sack(b) => 2 + 8 * b.len(),  // kind(1) + length(1) + n×8
+            TcpOption::Timestamp(_, _) => 10, // kind(1) + length(1) + tsval(4) + tsecr(4)
         }
     }
 }
@@ -373,6 +382,12 @@ fn encode_options(options: &[TcpOption]) -> Vec<u8> {
                     buf.extend_from_slice(&block.right.to_be_bytes());
                 }
             }
+            TcpOption::Timestamp(tsval, tsecr) => {
+                buf.push(option_kind::TIMESTAMP);
+                buf.push(10);
+                buf.extend_from_slice(&tsval.to_be_bytes());
+                buf.extend_from_slice(&tsecr.to_be_bytes());
+            }
         }
     }
     buf.push(option_kind::EOL);
@@ -440,6 +455,19 @@ fn decode_options_from(data: &[u8]) -> (Vec<TcpOption>, &[u8]) {
                 options.push(TcpOption::Sack(blocks));
                 i += len;
             }
+            option_kind::TIMESTAMP => {
+                if i + 10 > data.len() {
+                break;
+            }
+            let len = data[i + 1];
+            if len != 10 {
+                break;
+            }
+            let tsval = u32::from_be_bytes(data[i + 2..i + 6].try_into().unwrap());
+            let tsecr = u32::from_be_bytes(data[i + 6..i + 10].try_into().unwrap());
+            options.push(TcpOption::Timestamp(tsval, tsecr));
+            i += 10;
+        }
             _ => break, // unknown kind — stop and leave byte in payload
         }
     }
