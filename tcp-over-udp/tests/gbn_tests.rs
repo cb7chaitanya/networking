@@ -177,8 +177,12 @@ async fn test_gbn_concurrent_session() {
             .expect("accept");
         loop {
             match conn.recv().await {
-                Ok(data) => conn.send(&data).await.expect("echo"),
-                Err(ConnError::Eof) => break,
+                Ok(data) => {
+                    conn.send(&data).await.expect("echo");
+                }
+                Err(ConnError::Eof) => {
+                    break;
+                }
                 Err(e) => panic!("server: {e}"),
             }
         }
@@ -194,35 +198,59 @@ async fn test_gbn_concurrent_session() {
 
         let mut session = conn.run();
 
+        // Build expected total payload for verification.
+        let mut expected_total = Vec::new();
+        for i in 0..MSG_COUNT {
+            expected_total.extend_from_slice(format!("item-{i}").as_bytes());
+        }
+
         // Send all messages through the channel (non-blocking).
         for i in 0..MSG_COUNT {
             let msg = format!("item-{i}");
             session.send(msg.into_bytes()).await.expect("session send");
         }
 
-        // Collect echoes.
-        let mut replies = Vec::new();
-        for _ in 0..MSG_COUNT {
+        // Collect echoes.  TCP is a byte stream, so the server's synchronous
+        // send_segment may coalesce incoming data while blocked on window space.
+        // We therefore collect all received bytes rather than expecting exactly
+        // MSG_COUNT separate messages.
+        let mut received_total = Vec::new();
+        loop {
             match session.recv().await {
-                Ok(data) => replies.push(data),
+                Ok(data) => {
+                    received_total.extend_from_slice(&data);
+                    // Stop once we have all expected bytes.
+                    if received_total.len() >= expected_total.len() {
+                        break;
+                    }
+                }
                 Err(ConnError::Eof) => break,
                 Err(e) => panic!("client session recv: {e}"),
             }
         }
 
         session.close().await;
-        replies
+        (received_total, expected_total)
     });
 
     let (sr, cr) = tokio::join!(server, client);
     sr.unwrap();
-    let replies = cr.unwrap();
+    let (received_total, expected_total) = cr.unwrap();
 
-    assert_eq!(replies.len(), MSG_COUNT);
-    for (i, r) in replies.iter().enumerate() {
-        let expected = format!("item-{i}");
-        assert_eq!(r, expected.as_bytes());
-    }
+    // Verify total bytes match (TCP byte-stream semantics).
+    assert_eq!(
+        received_total.len(),
+        expected_total.len(),
+        "total bytes mismatch: got {}, expected {}",
+        received_total.len(),
+        expected_total.len()
+    );
+    assert_eq!(
+        received_total, expected_total,
+        "byte content mismatch:\n  received: {:?}\n  expected: {:?}",
+        String::from_utf8_lossy(&received_total),
+        String::from_utf8_lossy(&expected_total)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2061,4 +2089,266 @@ fn test_sack_two_disjoint_gaps() {
 
     // Exactly two retransmits occurred — one per gap.
     assert_eq!(sender.sr_retransmit_count(), 2, "exactly two retransmits for two gaps");
+}
+
+// ---------------------------------------------------------------------------
+// Window Scaling Integration Tests
+// ---------------------------------------------------------------------------
+
+/// Verify that window scaling is negotiated during GbnConnection handshake.
+#[tokio::test]
+async fn test_gbn_window_scale_negotiation() {
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let conn = GbnConnection::accept(server_sock, 4)
+            .await
+            .expect("accept");
+
+        // Window scaling should be negotiated.
+        assert!(
+            conn.snd_wscale().is_some(),
+            "server should have negotiated snd_wscale"
+        );
+        assert!(
+            conn.rcv_wscale().is_some(),
+            "server should have negotiated rcv_wscale"
+        );
+
+        // Scale factors should be within valid TCP range (0-14).
+        let snd = conn.snd_wscale().unwrap();
+        let rcv = conn.rcv_wscale().unwrap();
+        assert!(snd <= 14, "snd_wscale must be <= 14");
+        assert!(rcv <= 14, "rcv_wscale must be <= 14");
+
+        conn
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let conn = GbnConnection::connect(sock, server_addr, 4)
+            .await
+            .expect("connect");
+
+        // Window scaling should be negotiated.
+        assert!(
+            conn.snd_wscale().is_some(),
+            "client should have negotiated snd_wscale"
+        );
+        assert!(
+            conn.rcv_wscale().is_some(),
+            "client should have negotiated rcv_wscale"
+        );
+
+        conn
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    let server_conn = sr.unwrap();
+    let client_conn = cr.unwrap();
+
+    // Both sides should have the same scale factors.
+    assert_eq!(
+        server_conn.snd_wscale(),
+        client_conn.snd_wscale(),
+        "both sides should negotiate the same snd_wscale"
+    );
+    assert_eq!(
+        server_conn.rcv_wscale(),
+        client_conn.rcv_wscale(),
+        "both sides should negotiate the same rcv_wscale"
+    );
+}
+
+/// Test data transfer with window scaling enabled.
+/// This verifies that window scaling works correctly for actual data exchange.
+#[tokio::test]
+async fn test_gbn_window_scale_data_transfer() {
+    const WINDOW: usize = 8;
+    const DATA_SIZE: usize = 32 * 1024; // 32 KiB
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW)
+            .await
+            .expect("accept");
+
+        // Verify window scaling is enabled.
+        assert!(conn.snd_wscale().is_some(), "window scaling should be enabled");
+
+        // Receive all data.
+        let mut total_received = 0;
+        loop {
+            match conn.recv().await {
+                Ok(data) => {
+                    total_received += data.len();
+                    if total_received >= DATA_SIZE {
+                        break;
+                    }
+                }
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv error: {e:?}"),
+            }
+        }
+
+        assert_eq!(total_received, DATA_SIZE, "should receive all data");
+        conn.close().await.ok();
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        // Verify window scaling is enabled.
+        assert!(conn.snd_wscale().is_some(), "window scaling should be enabled");
+
+        // Send data in chunks.
+        let data = vec![0xABu8; DATA_SIZE];
+        conn.send(&data).await.expect("client send");
+        conn.close().await.expect("client close");
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    sr.unwrap();
+    cr.unwrap();
+}
+
+/// Test large data transfer that benefits from window scaling.
+/// With a scale factor of 7, we can advertise windows up to 8 MiB,
+/// which allows for high bandwidth-delay product scenarios.
+#[tokio::test]
+async fn test_gbn_large_transfer_with_window_scaling() {
+    const WINDOW: usize = 16;
+    const DATA_SIZE: usize = 128 * 1024; // 128 KiB - larger transfer
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW)
+            .await
+            .expect("accept");
+
+        // Use a large receive buffer to allow window scaling to be effective.
+        // The default is 64 KiB, which with scale factor 7 allows advertising
+        // windows up to 64 KiB (limited by actual buffer size).
+
+        let mut total_received = 0;
+        let mut received_data = Vec::new();
+
+        loop {
+            match conn.recv().await {
+                Ok(data) => {
+                    total_received += data.len();
+                    received_data.extend_from_slice(&data);
+                    if total_received >= DATA_SIZE {
+                        break;
+                    }
+                }
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv error: {e:?}"),
+            }
+        }
+
+        assert_eq!(total_received, DATA_SIZE, "should receive all data");
+
+        // Verify data integrity.
+        for (i, &byte) in received_data.iter().enumerate() {
+            let expected = (i % 256) as u8;
+            assert_eq!(byte, expected, "data corruption at byte {i}");
+        }
+
+        conn.close().await.ok();
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        // Create test data with a recognizable pattern.
+        let data: Vec<u8> = (0..DATA_SIZE).map(|i| (i % 256) as u8).collect();
+
+        conn.send(&data).await.expect("client send");
+        conn.close().await.expect("client close");
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    sr.unwrap();
+    cr.unwrap();
+}
+
+/// Test bidirectional transfer with window scaling.
+#[tokio::test]
+async fn test_gbn_bidirectional_with_window_scaling() {
+    const WINDOW: usize = 8;
+    const MSG_SIZE: usize = 16 * 1024; // 16 KiB each way
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW)
+            .await
+            .expect("accept");
+
+        // Receive client's data.
+        let mut received = Vec::new();
+        while received.len() < MSG_SIZE {
+            match conn.recv().await {
+                Ok(data) => received.extend_from_slice(&data),
+                Err(e) => panic!("server recv error: {e:?}"),
+            }
+        }
+
+        // Verify received data.
+        assert_eq!(received.len(), MSG_SIZE);
+        for (i, &byte) in received.iter().enumerate() {
+            assert_eq!(byte, 0xAA, "unexpected byte at position {i}");
+        }
+
+        // Send response back.
+        let response = vec![0xBBu8; MSG_SIZE];
+        conn.send(&response).await.expect("server send");
+        conn.close().await.expect("server close");
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        // Send data to server.
+        let request = vec![0xAAu8; MSG_SIZE];
+        conn.send(&request).await.expect("client send");
+
+        // Receive response.
+        let mut received = Vec::new();
+        while received.len() < MSG_SIZE {
+            match conn.recv().await {
+                Ok(data) => received.extend_from_slice(&data),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("client recv error: {e:?}"),
+            }
+        }
+
+        // Verify response.
+        assert_eq!(received.len(), MSG_SIZE);
+        for (i, &byte) in received.iter().enumerate() {
+            assert_eq!(byte, 0xBB, "unexpected byte at position {i}");
+        }
+
+        conn.close().await.expect("client close");
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    sr.unwrap();
+    cr.unwrap();
 }
