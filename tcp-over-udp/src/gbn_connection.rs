@@ -1123,6 +1123,14 @@ async fn event_loop<CC: CongestionControl>(
     // return multiple segments (e.g. when data > MSS) without losing them.
     let mut staged: VecDeque<Vec<u8>> = VecDeque::new();
 
+    // Pending payload: holds a single payload received from the app channel
+    // when the staging queue is not empty.  This decouples channel closure
+    // detection from flow-control gating: we always poll the channel (to see
+    // `None`), but we only consume `Some(payload)` when staging is empty.
+    // When staging is non-empty and we receive `Some(payload)`, we stash it
+    // here and stop polling until staging drains.
+    let mut pending_payload: Option<Vec<u8>> = None;
+
     // `fin_pending` becomes true as soon as app_rx returns None (send_tx
     // dropped).  The actual FIN wire packet is sent by the drain phase once
     // the staging slot is empty and all in-flight data is acknowledged.
@@ -1181,11 +1189,54 @@ async fn event_loop<CC: CongestionControl>(
             log::debug!("[gbn:loop] staged → DATA in_flight={}", sender.in_flight());
         }
 
-        // 2. Send our FIN once: app closed + staging queue empty + window drained.
+        // 1b. If staging is now empty and we have a pending payload, process it.
+        //     This ensures forward progress when the app channel delivered data
+        //     while staging was non-empty.
+        if staged.is_empty() {
+            if let Some(payload) = pending_payload.take() {
+                let mut ready = sender.nagle_push(&payload, mss);
+
+                if ready.is_empty() {
+                    // Nagle is coalescing: data sits in nagle_buf.
+                } else if sender.can_send() {
+                    // Fast path: window open — send the first segment inline.
+                    let first = ready.remove(0);
+                    let pkt = sender.build_data_packet(
+                        first,
+                        receiver.ack_number(),
+                        scale_our_window(receiver.window_size()),
+                    );
+                    if socket.send_to(&pkt, peer).await.is_err() {
+                        // Don't break entirely; let outer loop handle the error.
+                    } else {
+                        sender.record_sent(pkt);
+                        retries = 0;
+                        if !retransmit_armed {
+                            retransmit_tmr.as_mut().reset(tok_now() + rto);
+                            retransmit_armed = true;
+                        }
+                        log::debug!("[gbn:loop] pending → DATA in_flight={}", sender.in_flight());
+                    }
+                    // Overflow segments go to staged.
+                    staged.extend(ready);
+                } else {
+                    // Slow path: window shut — queue all ready segments.
+                    staged.extend(ready);
+                    if sender.persist.is_active() {
+                        persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
+                    } else if !retransmit_armed {
+                        retransmit_tmr.as_mut().reset(tok_now() + rto);
+                        retransmit_armed = true;
+                    }
+                }
+            }
+        }
+
+        // 2. Send our FIN once: app closed + staging queue empty + no pending + window drained.
         //    Decoupling FIN from can_send() is the whole point of this
         //    restructure: FIN is a lifecycle event, not a data segment.
         //    Also force-drain the Nagle buffer so held data is sent before FIN.
-        if fin_pending && !half_closed && staged.is_empty() && !sender.has_unacked() {
+        if fin_pending && !half_closed && staged.is_empty() && pending_payload.is_none() && !sender.has_unacked() {
             // If Nagle is holding any data, flush it into the staging queue
             // and let the drain phase send it before we emit the FIN.
             if let Some(buffered) = sender.nagle_force_flush() {
@@ -1205,64 +1256,61 @@ async fn event_loop<CC: CongestionControl>(
         tokio::select! {
             // ── Branch 1: application data or channel close ───────────────
             //
-            // Guard: lifecycle conditions ONLY — sender.can_send() is
-            // intentionally absent.  The channel must always be observable so
-            // that None (send_tx dropped) is never hidden by window state.
+            // Guard: Poll channel when:
+            //   - No pending_payload (haven't consumed a payload we can't process)
+            //   - Not already fin_pending
+            //   - Not already half_closed
             //
-            // The one-slot `staged` buffer prevents consuming items faster
-            // than they can be dispatched while still allowing None to be
-            // seen the moment the slot is free.
-            // Guard: accept from the channel when the staging queue is empty.
-            //
-            // When staged is empty AND Nagle is enabled and holding data in
-            // nagle_buf, Branch 1 can still fire — each new write is pushed
-            // into nagle_buf for coalescing.  None (send_tx dropped) is
-            // observable as soon as staged is free.
-            msg = app_rx.recv(), if staged.is_empty() && !fin_pending && !half_closed => {
+            // This decouples channel closure detection from flow-control:
+            // we always poll the channel to observe `None`, but we stash
+            // `Some(payload)` in `pending_payload` if staging is non-empty.
+            // This prevents unbounded staging growth while ensuring FIN is
+            // never blocked by window state.
+            msg = app_rx.recv(), if pending_payload.is_none() && !fin_pending && !half_closed => {
                 match msg {
                     Some(payload) => {
-                        // Push through the Nagle buffer.  When Nagle is disabled
-                        // (default), nagle_push returns MSS-sized chunks immediately;
-                        // when enabled, sub-MSS data may be held until the pipe
-                        // empties or the buffer reaches one MSS.
-                        let mut ready = sender.nagle_push(&payload, mss);
+                        // Check if we can accept this payload now (staging empty)
+                        // or need to stash it for later.
+                        if staged.is_empty() {
+                            // Process immediately.
+                            let mut ready = sender.nagle_push(&payload, mss);
 
-                        if ready.is_empty() {
-                            // Nagle is coalescing: data sits in nagle_buf.
-                            // staged stays empty → Branch 1 can fire again on
-                            // the next select! to accumulate more writes.
-                        } else if sender.can_send() {
-                            // Fast path: window open — send the first segment
-                            // inline (mirrors the original behaviour; critical
-                            // for test correctness and liveness).
-                            let first = ready.remove(0);
-                            let pkt = sender.build_data_packet(
-                                first,
-                                receiver.ack_number(),
-                                receiver.window_size(),
-                            );
-                            if socket.send_to(&pkt, peer).await.is_err() {
-                                break;
+                            if ready.is_empty() {
+                                // Nagle is coalescing: data sits in nagle_buf.
+                            } else if sender.can_send() {
+                                // Fast path: window open — send the first segment inline.
+                                let first = ready.remove(0);
+                                let pkt = sender.build_data_packet(
+                                    first,
+                                    receiver.ack_number(),
+                                    scale_our_window(receiver.window_size()),
+                                );
+                                if socket.send_to(&pkt, peer).await.is_err() {
+                                    break;
+                                }
+                                sender.record_sent(pkt);
+                                retries = 0;
+                                if !retransmit_armed {
+                                    retransmit_tmr.as_mut().reset(tok_now() + rto);
+                                    retransmit_armed = true;
+                                }
+                                log::debug!("[gbn:loop] → DATA in_flight={}", sender.in_flight());
+                                // Overflow segments (data > MSS) go to staged.
+                                staged.extend(ready);
+                            } else {
+                                // Slow path: window shut — queue all ready segments.
+                                staged.extend(ready);
+                                if sender.persist.is_active() {
+                                    persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
+                                } else if !retransmit_armed {
+                                    retransmit_tmr.as_mut().reset(tok_now() + rto);
+                                    retransmit_armed = true;
+                                }
                             }
-                            sender.record_sent(pkt);
-                            retries = 0;
-                            if !retransmit_armed {
-                                retransmit_tmr.as_mut().reset(tok_now() + rto);
-                                retransmit_armed = true;
-                            }
-                            log::debug!("[gbn:loop] → DATA in_flight={}", sender.in_flight());
-                            // Overflow segments (data > MSS) go to staged and
-                            // are drained at the top of the next iteration.
-                            staged.extend(ready);
                         } else {
-                            // Slow path: window shut — queue all ready segments.
-                            staged.extend(ready);
-                            if sender.persist.is_active() {
-                                persist_tmr.as_mut().reset(tok_now() + sender.persist.interval());
-                            } else if !retransmit_armed {
-                                retransmit_tmr.as_mut().reset(tok_now() + rto);
-                                retransmit_armed = true;
-                            }
+                            // Staging is non-empty: stash this payload for later.
+                            // The drain phase will process it once staging empties.
+                            pending_payload = Some(payload);
                         }
                     }
                     None => {
@@ -1272,9 +1320,10 @@ async fn event_loop<CC: CongestionControl>(
                         fin_pending = true;
                         log::debug!(
                             "[gbn:loop] app closed; FIN pending \
-                             (in_flight={} staged={})",
+                             (in_flight={} staged={} pending={})",
                             sender.in_flight(),
-                            staged.len()
+                            staged.len(),
+                            pending_payload.is_some()
                         );
                     }
                 }
