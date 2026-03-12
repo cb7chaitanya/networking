@@ -134,6 +134,8 @@ pub struct Connection {
     ///
     /// Defaults to [`DEFAULT_MSS`] when the peer does not advertise an MSS.
     pub negotiated_mss: u16,
+    /// Most recent TSval received from the peer (echoed in our ACKs as TSecr).
+    last_peer_tsval: u32,
     /// Window scale shift count to apply when sending our window (local shift).
     ///
     /// When advertising our receive window in outgoing packets, we must shift
@@ -171,6 +173,7 @@ impl Connection {
             peer,
             rto: INITIAL_RTO,
             negotiated_mss,
+            last_peer_tsval: 0,
             snd_wscale,
             rcv_wscale,
         }
@@ -204,15 +207,20 @@ impl Connection {
         peer: SocketAddr,
         local_mss: u16,
     ) -> Result<Self, ConnError> {
-        let isn = rand_isn();
-        let local_wscale = DEFAULT_WINDOW_SCALE;
-        let syn = make_syn_with_opts(
-            isn,
-            &[TcpOption::Mss(local_mss), TcpOption::WindowScale(local_wscale)],
-        );
-        let mut rto = INITIAL_RTO;
-
-        for attempt in 0..=MAX_RETRIES {
+      let isn = rand_isn();
+      let tsval = now_tsval();
+      let local_wscale = DEFAULT_WINDOW_SCALE;
+      let syn = make_syn_with_opts(
+        isn,
+        &[
+          TcpOption::Mss(local_mss),
+          TcpOption::WindowScale(local_wscale),
+          TcpOption::Timestamp(tsval, 0),
+        ],
+      );
+      let mut rto = INITIAL_RTO;
+      
+      for attempt in 0..=MAX_RETRIES {
             socket.send_to(&syn, peer).await?;
             log::debug!(
                 "[client] → SYN seq={isn} mss={local_mss} wscale={local_wscale} (attempt {attempt})"
@@ -230,10 +238,13 @@ impl Connection {
                             == (flags::SYN | flags::ACK);
                         if is_syn_ack && h.ack == isn.wrapping_add(1) {
                             let peer_isn = h.seq;
-                            // Extract peer MSS; fall back to DEFAULT_MSS for old peers.
                             let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
                             let negotiated = local_mss.min(peer_mss);
-
+                            let peer_tsval = extract_tsval(&pkt.options).unwrap_or(0);
+                            if let Some(tsecr) = extract_tsecr(&pkt.options) {
+                                let rtt = Duration::from_millis(now_tsval().wrapping_sub(tsecr) as u64);
+                                log::debug!("[client] RTT sample from timestamp: {rtt:?}");
+                            }
                             // snd_wscale = our shift (for outgoing window advertisements)
                             // rcv_wscale = peer's shift (for interpreting peer's window)
                             let (snd_wscale, rcv_wscale) =
@@ -251,9 +262,17 @@ impl Connection {
                                  negotiated_mss={negotiated} snd_wscale={snd_wscale:?} \
                                  rcv_wscale={rcv_wscale:?}; → ACK"
                             );
-                            return Ok(Self::established_with_mss(
-                                socket, peer, isn, peer_isn, negotiated, snd_wscale, rcv_wscale,
-                            ));
+                            let mut conn = Self::established_with_mss(
+                              socket,
+                              peer,
+                              isn,
+                              peer_isn,
+                              negotiated,
+                              snd_wscale,
+                              rcv_wscale,
+                          );
+                          conn.last_peer_tsval = peer_tsval;
+                          return Ok(conn);
                         }
                         // Wrong packet — keep waiting.
                     }
@@ -298,33 +317,48 @@ impl Connection {
         let local_wscale = DEFAULT_WINDOW_SCALE;
 
         // Step 1: wait for SYN (no timeout — passive open).
-        let (client_addr, client_isn, peer_mss, peer_wscale) = loop {
-            let (pkt, addr) = socket.recv_from().await?;
-            let h = &pkt.header;
-            // A pure SYN has SYN set and ACK clear.
-            if h.flags & flags::SYN != 0 && h.flags & flags::ACK == 0 {
-                let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
-                let peer_wscale = extract_window_scale(&pkt.options);
-                log::debug!(
-                    "[server] ← SYN seq={} peer_mss={peer_mss} peer_wscale={peer_wscale:?} from {addr}",
-                    h.seq
-                );
-                break (addr, h.seq, peer_mss, peer_wscale);
-            }
-        };
+        let (client_addr, client_isn, peer_mss, peer_wscale, client_tsval) = loop {
+          let (pkt, addr) = socket.recv_from().await?;
+          let h = &pkt.header;
+          let client_tsval = extract_tsval(&pkt.options).unwrap_or(0);
+
+          if h.flags & flags::SYN != 0 && h.flags & flags::ACK == 0 {
+            let peer_mss = extract_mss(&pkt.options).unwrap_or(DEFAULT_MSS);
+            let peer_wscale = extract_window_scale(&pkt.options);
+
+            log::debug!(
+              "[server] ← SYN seq={} peer_mss={peer_mss} peer_wscale={peer_wscale:?} from {addr}",
+              h.seq
+            );
+
+            break (addr, h.seq, peer_mss, peer_wscale, client_tsval);
+          }
+      };
 
         let negotiated = local_mss.min(peer_mss);
 
+        // Step 2: send SYN-ACK (advertising our own MSS), then wait for final ACK.
         // Window scaling: echo back our scale only if client sent one.
         // server must not send WindowScale unless client did.
         let (snd_wscale, rcv_wscale, syn_ack_opts) = match peer_wscale {
-            Some(peer_shift) => (
-                Some(local_wscale),
-                Some(peer_shift),
-                vec![TcpOption::Mss(local_mss), TcpOption::WindowScale(local_wscale)],
-            ),
-            None => (None, None, vec![TcpOption::Mss(local_mss)]),
-        };
+          Some(peer_shift) => (
+            Some(local_wscale),
+            Some(peer_shift),
+            vec![
+              TcpOption::Mss(local_mss),
+              TcpOption::WindowScale(local_wscale),
+              TcpOption::Timestamp(now_tsval(), client_tsval),
+            ],
+          ),
+          None => (
+            None,
+            None,
+            vec![
+              TcpOption::Mss(local_mss),
+              TcpOption::Timestamp(now_tsval(), client_tsval),
+            ],
+          ),
+      };
 
         // Step 2: send SYN-ACK (advertising our own MSS and optionally WindowScale),
         // then wait for final ACK.
@@ -354,15 +388,18 @@ impl Connection {
                                 "[server] ← ACK — handshake complete negotiated_mss={negotiated} \
                                  snd_wscale={snd_wscale:?} rcv_wscale={rcv_wscale:?}"
                             );
-                            return Ok(Self::established_with_mss(
-                                socket,
-                                client_addr,
-                                isn,
-                                client_isn,
-                                negotiated,
-                                snd_wscale,
-                                rcv_wscale,
-                            ));
+                            let ack_tsval = extract_tsval(&pkt.options).unwrap_or(0);
+                            let mut conn = Self::established_with_mss(
+                              socket,
+                              client_addr,
+                              isn,
+                              client_isn,
+                              negotiated,
+                              snd_wscale,
+                              rcv_wscale,
+                          );
+                          conn.last_peer_tsval = ack_tsval;
+                          return Ok(conn);
                         }
                         // Could be a retransmitted SYN — keep waiting.
                     }
@@ -488,6 +525,10 @@ impl Connection {
             if pkt.payload.is_empty() {
                 // Pure ACK (e.g. from our own previous send) — ignore.
                 continue;
+            }
+
+            if let Some(tsval) = extract_tsval(&pkt.options) {
+                self.last_peer_tsval = tsval;
             }
 
             let accepted = self.receiver.on_segment(h.seq, &pkt.payload);
@@ -679,7 +720,7 @@ impl Connection {
                 window: self.receiver.window_size(),
                 checksum: 0,
             },
-            options: vec![],
+            options: vec![TcpOption::Timestamp(now_tsval(), self.last_peer_tsval)],
             payload: vec![],
         }
     }
@@ -716,6 +757,31 @@ fn extract_mss(options: &[TcpOption]) -> Option<u16> {
     })
 }
 
+/// Returns a millisecond timestamp for use as TSval.
+/// Wraps at u32::MAX — matches RFC 1323 behaviour.
+fn now_tsval() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32
+}
+
+fn extract_tsval(options: &[TcpOption]) -> Option<u32> {
+    options.iter().find_map(|o| {
+        if let TcpOption::Timestamp(tsval, _) = o { Some(*tsval) } else { None }
+    })
+}
+
+fn extract_tsecr(options: &[TcpOption]) -> Option<u32> {
+    options.iter().find_map(|o| {
+        if let TcpOption::Timestamp(_, tsecr) = o {
+            Some(*tsecr)
+        } else {
+            None
+        }
+    })
+}
 /// Extract the window scale shift count from a parsed options list.
 ///
 /// Returns `None` when no WindowScale option is present (peer does not
