@@ -2092,6 +2092,163 @@ fn test_sack_two_disjoint_gaps() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 39:  SACK blocks emitted by build_ack — event loop AC3
+// ---------------------------------------------------------------------------
+//
+// The receiver buffers two out-of-order segments while seq=0 is still
+// missing, producing one SACK block [10,20).  The ACK packet built by the
+// event loop must include this SACK option and set the OPT flag.  The test
+// also verifies the blocks survive encode/decode.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sack_build_ack_emits_sack_blocks_when_ooo() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+    use tcp_over_udp::gbn_sender::GbnSender;
+    use tcp_over_udp::packet::{flags, Header, Packet, SackBlock, TcpOption};
+
+    let sender = GbnSender::new(0, 4);
+    let mut receiver = GbnReceiver::new(0);
+
+    // Buffer two contiguous OOO segments — seq=0 is the gap.
+    receiver.on_segment(10, b"hello"); // [10, 15)
+    receiver.on_segment(15, b"world"); // [15, 20) —> merges into [10, 20)
+
+    // Replicate what the fixed build_ack() does in the event loop.
+    let sack_blocks = receiver.sack_blocks();
+    assert!(!sack_blocks.is_empty(), "OOO data must produce SACK blocks");
+    assert_eq!(sack_blocks[0], SackBlock { left: 10, right: 20 });
+
+    let options: Vec<TcpOption> = if sack_blocks.is_empty() {
+        vec![]
+    } else {
+        vec![TcpOption::Sack(sack_blocks.clone())]
+    };
+
+    let pkt = Packet {
+        header: Header {
+            seq: sender.next_seq,
+            ack: receiver.ack_number(),
+            flags: flags::ACK,
+            window: receiver.window_size().min(u16::MAX as usize) as u16,
+            checksum: 0,
+        },
+        options,
+        payload: vec![],
+    };
+
+    let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
+
+    // OLD build_ack() never set OPT -> this would fail on unfixed code.
+    assert_ne!(decoded.header.flags & flags::OPT, 0,
+        "OPT flag must be set when SACK option is present");
+
+    let recovered: Vec<SackBlock> = decoded.options.iter()
+        .filter_map(|o| if let TcpOption::Sack(b) = o { Some(b.clone()) } else { None })
+        .flatten()
+        .collect();
+    assert_eq!(recovered, sack_blocks,
+        "SACK blocks must survive encode/decode round-trip");
+}
+
+// ---------------------------------------------------------------------------
+// Test 40:  event loop processes incoming SACK via run() — AC1
+// ---------------------------------------------------------------------------
+//
+// A client sends multiple messages using `run()`.  Incoming ACK packets may
+// contain SACK options, which the event loop must pass to
+// `sender.process_sack()`.  If this step is missing the sender window can
+// stall.  The test ensures the session completes and all messages arrive.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_sack_event_loop_processes_incoming_sack() {
+    const WINDOW: usize = 8;
+    const MSG_COUNT: usize = 20;
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW).await.expect("accept");
+        let mut received = Vec::new();
+        loop {
+            match conn.recv().await {
+                Ok(data) => received.push(data),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server: {e}"),
+            }
+            if received.len() == MSG_COUNT { break; }
+        }
+        conn.close().await.ok();
+        received
+    });
+
+    // Client uses run() — hits Branch 2 of event_loop() where process_sack() was missing.
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let conn = GbnConnection::connect(sock, server_addr, WINDOW).await.expect("connect");
+        let session = conn.run();
+        for i in 0..MSG_COUNT {
+            session.send(format!("sack-msg-{i:02}").into_bytes()).await.expect("send");
+        }
+        session.close().await;
+    });
+
+    let received = tokio::time::timeout(DEADLINE, async {
+        let (s, c) = tokio::join!(server, client);
+        c.unwrap(); s.unwrap()
+    })
+    .await
+    .expect("timed out — possible deadlock from unprocessed SACK in event loop");
+
+    assert_eq!(received.len(), MSG_COUNT);
+    for (i, chunk) in received.iter().enumerate() {
+        assert_eq!(chunk, format!("sack-msg-{i:02}").as_bytes());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 41: fast-retransmit in event loop skips sacked entries — AC2
+// ---------------------------------------------------------------------------
+//
+// Three segments are in flight.  seq=0 is marked as SACKed, simulating a
+// receiver that already has it.  After three duplicate ACKs trigger fast
+// retransmit, `retransmit_oldest()` must skip seq=0 and retransmit seq=10.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sack_fast_retransmit_skips_sacked_in_event_loop() {
+    use tcp_over_udp::gbn_sender::GbnSender;
+    use tcp_over_udp::packet::SackBlock;
+
+    let mut sender = GbnSender::new(0, 8);
+    sender.cc.cwnd = 8;
+
+    for _ in 0..3 {
+        let pkt = sender.build_data_packet(vec![0u8; 10], 0, 8192);
+        sender.record_sent(pkt);
+    }
+    // Window: seq=0, seq=10, seq=20.
+
+    // Mark seq=0 as sacked — this is what process_sack() does in the fixed event loop.
+    sender.process_sack(&[SackBlock { left: 0, right: 10 }]);
+
+    // Simulate 3 duplicate ACKs.
+    for _ in 0..3 {
+        let r = sender.on_ack(0);
+        assert!(r.dup_ack);
+    }
+    sender.on_triple_dup_ack_cc();
+
+    let pkt = sender.retransmit_oldest().expect("must find unsacked segment");
+    assert_eq!(pkt.header.seq, 10,
+        "fast-retransmit must skip sacked seq=0 and target seq=10");
+    assert_eq!(sender.sr_retransmit_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Window Scaling Integration Tests
 // ---------------------------------------------------------------------------
 
