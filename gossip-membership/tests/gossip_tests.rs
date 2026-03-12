@@ -21,7 +21,7 @@ use gossip_membership::transport::Transport;
 use gossip_membership::{
     failure_detector::FailureDetector,
     gossip,
-    membership::wire_to_node_state,
+    membership::{placeholder_id_for, wire_to_node_state},
     message::{build_ack, build_ping, build_ping_req, MessagePayload},
     node::{generate_node_id, NodeState},
 };
@@ -70,6 +70,8 @@ pub async fn run_test_node(
 
             result = node.transport.recv_from() => {
                 if let Ok((msg, from)) = result {
+                    // Clean up any bootstrap placeholder before inserting real entry.
+                    node.table.remove_placeholder_for_addr(from, msg.sender_id);
                     // Record sender liveness.
                     let alive = NodeState::new_alive(msg.sender_id, from, msg.sender_heartbeat);
                     node.table.merge_entry(&alive);
@@ -529,6 +531,101 @@ async fn test_star_topology_five_nodes() {
             assert!(
                 node.table.entries.values().any(|e| e.node_id == expected_id),
                 "node[{i}] does not know about node[{j}] (id={expected_id})"
+            );
+        }
+    }
+}
+
+/// When node B bootstraps with node A's address, a placeholder entry is created
+/// under a synthetic ID.  Once node A sends its first message, the placeholder
+/// must be removed and replaced by A's real entry — no duplicates.
+#[tokio::test]
+async fn test_placeholder_cleaned_up_on_first_message() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let ta = bind_local().await;
+    let tb = bind_local().await;
+    let addr_a = ta.local_addr;
+
+    // Node A has no bootstrap peers; node B bootstraps with A's address.
+    let na = TestNode::new(ta, cfg.clone(), &[]);
+    let nb = TestNode::new(tb, cfg.clone(), &[addr_a]);
+    let id_a = na.id;
+
+    // Before any gossip, B's table must contain the placeholder for A's address.
+    let placeholder = placeholder_id_for(addr_a);
+    assert!(
+        nb.table.entries.contains_key(&placeholder),
+        "placeholder entry should exist in B's table before any gossip"
+    );
+
+    let (tx_a, rx_a) = oneshot::channel::<()>();
+    let (tx_b, rx_b) = oneshot::channel::<()>();
+
+    let ha = tokio::spawn(run_test_node(na, rx_a));
+    let hb = tokio::spawn(run_test_node(nb, rx_b));
+
+    // Allow several gossip rounds (gossip_interval_ms = 50 ms in fast config).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let _ = tx_a.send(());
+    let _ = tx_b.send(());
+
+    let _node_a = ha.await.unwrap();
+    let node_b = hb.await.unwrap();
+
+    // B must have A's real entry.
+    assert!(
+        node_b.table.entries.contains_key(&id_a),
+        "node B should have real entry for node A after gossip"
+    );
+
+    // Placeholder must be gone.
+    assert!(
+        !node_b.table.entries.contains_key(&placeholder),
+        "placeholder entry for node A's address must be removed once real entry is seen"
+    );
+}
+
+/// After bootstrap and a few gossip rounds, each peer address appears exactly
+/// once in each node's membership table (no duplicate entries).
+#[tokio::test]
+async fn test_no_duplicate_entries_after_gossip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let ta = bind_local().await;
+    let tb = bind_local().await;
+    let addr_a = ta.local_addr;
+    let addr_b = tb.local_addr;
+
+    // Both nodes bootstrap with each other — each starts with one placeholder.
+    let na = TestNode::new(ta, cfg.clone(), &[addr_b]);
+    let nb = TestNode::new(tb, cfg.clone(), &[addr_a]);
+
+    let (tx_a, rx_a) = oneshot::channel::<()>();
+    let (tx_b, rx_b) = oneshot::channel::<()>();
+
+    let ha = tokio::spawn(run_test_node(na, rx_a));
+    let hb = tokio::spawn(run_test_node(nb, rx_b));
+
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let _ = tx_a.send(());
+    let _ = tx_b.send(());
+
+    let node_a = ha.await.unwrap();
+    let node_b = hb.await.unwrap();
+
+    // No address should appear more than once in either table.
+    for (name, node) in [("node_a", &node_a), ("node_b", &node_b)] {
+        let mut seen = std::collections::HashSet::new();
+        for entry in node.table.entries.values() {
+            assert!(
+                seen.insert(entry.addr),
+                "{name}: address {} appears more than once (duplicate entry)",
+                entry.addr
             );
         }
     }
