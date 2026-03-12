@@ -22,7 +22,7 @@ use std::net::SocketAddr;
 
 use tokio::sync::mpsc;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, DEFAULT_WINDOW_SCALE};
 use crate::packet::{TcpOption, Packet, DEFAULT_MSS};
 use crate::socket::Socket;
 
@@ -60,6 +60,10 @@ struct HalfOpen {
     server_isn: u32,
     /// MSS negotiated during the SYN exchange.
     negotiated_mss: u16,
+    /// Our window-scale shift (None if scaling not negotiated).
+    snd_wscale: Option<u8>,
+    /// Peer's window-scale shift (None if scaling not negotiated).
+    rcv_wscale: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +139,10 @@ impl Listener {
         let server_isn = rand_isn();
         let peer_mss = extract_mss(&packet.options).unwrap_or(DEFAULT_MSS);
         let negotiated_mss = DEFAULT_MSS.min(peer_mss);
+        let (snd_wscale, rcv_wscale) = match extract_window_scale(&packet.options) {
+            Some(peer_shift) => (Some(DEFAULT_WINDOW_SCALE), Some(peer_shift)),
+            None => (None, None),
+        };
 
         log::debug!(
             "[listener] SYN from {peer} seq={client_isn} mss={peer_mss} \
@@ -146,6 +154,8 @@ impl Listener {
             client_isn,
             server_isn,
             negotiated_mss,
+            snd_wscale,
+            rcv_wscale,
         });
     }
 
@@ -181,6 +191,8 @@ impl Listener {
             entry.server_isn,
             entry.client_isn,
             entry.negotiated_mss,
+            entry.snd_wscale,
+            entry.rcv_wscale,
         );
 
         // If the receiver has already dropped, the connection is simply lost.
@@ -230,6 +242,17 @@ fn extract_mss(options: &[TcpOption]) -> Option<u16> {
     options.iter().find_map(|o| {
         if let TcpOption::Mss(m) = o {
             Some(*m)
+        } else {
+            None
+        }
+    })
+}
+
+/// Extract the WindowScale shift from an options list, if present.
+fn extract_window_scale(options: &[TcpOption]) -> Option<u8> {
+    options.iter().find_map(|o| {
+        if let TcpOption::WindowScale(shift) = o {
+            Some((*shift).min(14))
         } else {
             None
         }
