@@ -151,7 +151,7 @@ pub struct GbnSender<CC: CongestionControl = RenoCC> {
     pub(crate) window: VecDeque<GbnEntry>,
 
     // ── Receiver-side flow control ───────────────────────────────────────
-
+    
     /// Peer's advertised receive window in bytes (`rwnd`).
     ///
     /// Updated each time an ACK is received via [`update_peer_rwnd`].
@@ -162,7 +162,7 @@ pub struct GbnSender<CC: CongestionControl = RenoCC> {
     peer_rwnd: usize,
 
     // ── Congestion control ───────────────────────────────────────────────
-
+    
     /// Pluggable congestion-control algorithm.
     ///
     /// Exposes `cwnd()`, `on_ack()`, and `on_loss()`.  For TCP Reno the
@@ -177,7 +177,7 @@ pub struct GbnSender<CC: CongestionControl = RenoCC> {
     pub dup_ack_count: u32,
 
     // ── Persist timer ────────────────────────────────────────────────────
-
+    
     /// RFC 793 persist timer state — active only while `peer_rwnd == 0`.
     ///
     /// The actual `tokio::time::Sleep` future lives in the connection layer;
@@ -198,7 +198,7 @@ pub struct GbnSender<CC: CongestionControl = RenoCC> {
     sr_retransmit_count: u64,
 
     // ── Nagle's algorithm ─────────────────────────────────────────────────
-
+    
     /// Write-coalescing buffer (RFC 896 Nagle algorithm).
     ///
     /// Small writes are appended here.  The buffer is drained into actual
@@ -534,12 +534,16 @@ impl<CC: CongestionControl> GbnSender<CC> {
     /// Call this every time an ACK arrives — the ACK's `window` field carries
     /// the peer's current free buffer space in bytes.
     ///
+    /// The `rwnd` parameter should be the **scaled** receive window when window
+    /// scaling is in effect: `raw_header_window << rcv_wscale`.  Callers that
+    /// have not negotiated window scaling should pass the raw header value.
+    ///
     /// Returns a [`PersistTransition`] indicating whether the persist timer
     /// should be armed (`Activated`), disarmed (`Deactivated`), or left
     /// unchanged.  The connection layer uses this to manage the underlying
     /// `tokio::time::Sleep` futures.
-    pub fn update_peer_rwnd(&mut self, rwnd: u16) -> PersistTransition {
-        self.peer_rwnd = rwnd as usize;
+    pub fn update_peer_rwnd(&mut self, rwnd: usize) -> PersistTransition {
+        self.peer_rwnd = rwnd;
         let t = self.persist.on_rwnd_update(self.peer_rwnd);
         log::trace!("[sender] peer_rwnd={} persist_transition={:?}", self.peer_rwnd, t);
         t

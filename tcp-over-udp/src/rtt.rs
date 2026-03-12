@@ -115,7 +115,11 @@ impl RttEstimator {
             }
             (Some(srtt), Some(rttvar)) => {
                 // Subsequent measurements (RFC 6298 §2.3).
-                let diff = sample.abs_diff(srtt);
+                let diff = if sample > srtt {
+                    sample - srtt
+                } else {
+                    srtt - sample
+                };
                 self.rttvar = Some(rttvar * 3 / 4 + diff / 4);
                 self.srtt = Some(srtt * 7 / 8 + sample / 8);
             }
@@ -233,7 +237,10 @@ mod tests {
         }
         let srtt = r.srtt().unwrap();
         // Allow ±2 ms rounding error from integer arithmetic.
-        assert!(srtt.as_millis().abs_diff(50) <= 2, "SRTT should ≈ 50ms, got {srtt:?}");
+        assert!(
+            srtt.as_millis().abs_diff(50) <= 2,
+            "SRTT should ≈ 50ms, got {srtt:?}"
+        );
     }
 
     #[test]
@@ -287,7 +294,10 @@ mod tests {
         // First clean ACK: re-derives RTO from SRTT/RTTVAR.
         r.record_sample(Duration::from_millis(100));
         // RTO = 100ms + 4×50ms = 300ms < 4s
-        assert!(r.rto() < Duration::from_secs(4), "record_sample should undo back-off");
+        assert!(
+            r.rto() < Duration::from_secs(4),
+            "record_sample should undo back-off"
+        );
     }
 
     #[test]
@@ -305,7 +315,10 @@ mod tests {
             "jitter should inflate RTTVAR, got {rttvar:?}"
         );
         // And RTO should exceed SRTT.
-        assert!(r.rto() > r.srtt().unwrap(), "RTO must exceed SRTT when there is jitter");
+        assert!(
+            r.rto() > r.srtt().unwrap(),
+            "RTO must exceed SRTT when there is jitter"
+        );
     }
 
     #[test]

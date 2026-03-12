@@ -127,3 +127,66 @@ async fn connect_to_silent_peer_fails_with_max_retries() {
         "expected HandshakeFailed, got: {result:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Window Scale Tests
+// ---------------------------------------------------------------------------
+
+/// Both sides should negotiate window scaling during handshake.
+#[tokio::test]
+async fn handshake_negotiates_window_scale() {
+    let (server_socket, server_addr) = bind_server().await;
+
+    let server_task =
+        tokio::spawn(async move { Connection::accept(server_socket).await });
+
+    let client_socket = Socket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+        .await
+        .expect("bind client socket");
+    let client_conn = tokio::time::timeout(
+        Duration::from_secs(5),
+        Connection::connect(client_socket, server_addr),
+    )
+    .await
+    .expect("client connect timed out")
+    .expect("client connect failed");
+
+    let server_conn = tokio::time::timeout(Duration::from_secs(5), server_task)
+        .await
+        .expect("server accept timed out")
+        .expect("server task panicked")
+        .expect("server accept failed");
+
+    // Both sides should have negotiated window scaling.
+    // DEFAULT_WINDOW_SCALE is 7, so both should use scale factor 7.
+    assert!(
+        client_conn.snd_wscale().is_some(),
+        "client should have negotiated snd_wscale"
+    );
+    assert!(
+        client_conn.rcv_wscale().is_some(),
+        "client should have negotiated rcv_wscale"
+    );
+    assert!(
+        server_conn.snd_wscale().is_some(),
+        "server should have negotiated snd_wscale"
+    );
+    assert!(
+        server_conn.rcv_wscale().is_some(),
+        "server should have negotiated rcv_wscale"
+    );
+
+    // The scale factors should be reasonable (typically 7 for DEFAULT_WINDOW_SCALE).
+    let client_snd = client_conn.snd_wscale().unwrap();
+    let client_rcv = client_conn.rcv_wscale().unwrap();
+    let server_snd = server_conn.snd_wscale().unwrap();
+    let server_rcv = server_conn.rcv_wscale().unwrap();
+
+    // Both sides advertise the same scale factor (DEFAULT_WINDOW_SCALE = 7).
+    assert_eq!(client_snd, server_snd, "both sides should use the same snd_wscale");
+    assert_eq!(client_rcv, server_rcv, "both sides should use the same rcv_wscale");
+
+    // Scale factors should be within valid TCP range (0-14).
+    assert!(client_snd <= 14, "snd_wscale must be <= 14");
+    assert!(client_rcv <= 14, "rcv_wscale must be <= 14");
+}

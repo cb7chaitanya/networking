@@ -116,7 +116,9 @@ impl GbnReceiver {
         } else if self.is_future(seq) && payload.len() <= free {
             // Out-of-order segment: buffer it.  Use entry() so a duplicate
             // OOO retransmission does not overwrite an already-buffered copy.
-            self.ooo_buffer.entry(seq).or_insert_with(|| payload.to_vec());
+            self.ooo_buffer
+                .entry(seq)
+                .or_insert_with(|| payload.to_vec());
             false
         } else {
             // Duplicate (seq < rcv_nxt) or no buffer space.
@@ -174,10 +176,13 @@ impl GbnReceiver {
     /// buffer), clamped to [`u16::MAX`].  A return value of `0` (buffer
     /// full) tells the sender to stop transmitting until a later ACK opens
     /// the window.
-    pub fn window_size(&self) -> u16 {
+    ///
+    /// Returns the actual free buffer space in bytes (as `usize`).  The caller
+    /// is responsible for applying window scaling (if negotiated) before
+    /// placing the value in a 16-bit header field.
+    pub fn window_size(&self) -> usize {
         let used = self.app_buffer.len() + self.ooo_bytes();
-        let free = self.capacity.saturating_sub(used);
-        free.min(u16::MAX as usize) as u16
+        self.capacity.saturating_sub(used)
     }
 
     /// Copy up to `buf.len()` in-order bytes from the application buffer into
@@ -220,6 +225,19 @@ impl GbnReceiver {
         let d = seq.wrapping_sub(self.rcv_nxt);
         d > 0 && d <= (u32::MAX / 2)
     }
+
+    /// `true` when `seq` is plausibly related to this connection.
+    ///
+    /// A sequence number is *implausible* when its wrapping distance from
+    /// `rcv_nxt` exceeds twice the receive-buffer capacity in either
+    /// direction.  Such a segment almost certainly belongs to an old or
+    /// spoofed connection and warrants an RST rather than a dup-ACK.
+    pub fn is_seq_plausible(&self, seq: u32) -> bool {
+        let threshold = (self.capacity as u32).saturating_mul(2).max(65536);
+        let forward = seq.wrapping_sub(self.rcv_nxt);
+        let backward = self.rcv_nxt.wrapping_sub(seq);
+        forward <= threshold || backward <= threshold
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -236,8 +254,9 @@ mod tests {
         assert_eq!(r.rcv_nxt, 42);
         assert!(r.app_buffer.is_empty());
         assert_eq!(r.ack_number(), 42);
-        // Default capacity is 65536.
-        assert_eq!(r.window_size(), 65535); // clamped to u16::MAX
+        // Default capacity is 65536; window_size() now returns the true
+        // capacity as usize (callers apply scaling when needed).
+        assert_eq!(r.window_size(), 65536);
     }
 
     #[test]
@@ -292,8 +311,8 @@ mod tests {
     #[test]
     fn sequential_segments_advance_rcv_nxt() {
         let mut r = GbnReceiver::new(0);
-        assert!(r.on_segment(0, b"abc"));  // rcv_nxt → 3
-        assert!(r.on_segment(3, b"de"));   // rcv_nxt → 5
+        assert!(r.on_segment(0, b"abc")); // rcv_nxt → 3
+        assert!(r.on_segment(3, b"de")); // rcv_nxt → 5
         assert!(r.on_segment(5, b"fghi")); // rcv_nxt → 9
         assert_eq!(r.rcv_nxt, 9);
         assert_eq!(r.app_buffer.len(), 9);
@@ -372,7 +391,7 @@ mod tests {
         // capacity=20; buffer an OOO segment of 15 bytes; window shrinks.
         let mut r = GbnReceiver::with_capacity(0, 20);
         assert!(!r.on_segment(5, &[0u8; 15])); // OOO, buffered
-        // window_size accounts for OOO bytes.
+                                               // window_size accounts for OOO bytes.
         assert_eq!(r.window_size(), 5, "ooo bytes must count toward capacity");
 
         // In-order segment of 5 bytes: accepted, then OOO delivered.
@@ -451,8 +470,20 @@ mod tests {
         r.on_segment(20, b"BBB"); // [20, 23)  — disjoint gap at [13,20)
         let blocks = r.sack_blocks();
         assert_eq!(blocks.len(), 2);
-        assert_eq!(blocks[0], crate::packet::SackBlock { left: 10, right: 13 });
-        assert_eq!(blocks[1], crate::packet::SackBlock { left: 20, right: 23 });
+        assert_eq!(
+            blocks[0],
+            crate::packet::SackBlock {
+                left: 10,
+                right: 13
+            }
+        );
+        assert_eq!(
+            blocks[1],
+            crate::packet::SackBlock {
+                left: 20,
+                right: 23
+            }
+        );
     }
 
     #[test]

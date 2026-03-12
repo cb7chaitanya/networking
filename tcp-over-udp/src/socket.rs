@@ -8,6 +8,8 @@ use std::net::SocketAddr;
 
 use tokio::net::UdpSocket;
 
+use std::sync::Arc;  
+
 use crate::packet::{Packet, PacketError};
 
 /// Maximum UDP payload size (theoretical limit; in practice kept much smaller).
@@ -56,11 +58,11 @@ impl From<PacketError> for SocketError {
 /// An async, packet-oriented UDP socket.
 ///
 /// All methods are `&self` so the socket can be shared across tasks if needed.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Socket {
     /// Address this socket is bound to (filled in after OS assigns ephemeral port).
     pub local_addr: SocketAddr,
-    inner: UdpSocket,
+    inner: Arc<UdpSocket>, 
 }
 
 impl Socket {
@@ -70,7 +72,7 @@ impl Socket {
     pub async fn bind(local_addr: SocketAddr) -> Result<Self, SocketError> {
         let inner = UdpSocket::bind(local_addr).await?;
         let local_addr = inner.local_addr()?;
-        Ok(Self { local_addr, inner })
+        Ok(Self { local_addr, inner: Arc::new(inner) })
     }
 
     /// Encode `packet` and send it as a single UDP datagram to `dest`.

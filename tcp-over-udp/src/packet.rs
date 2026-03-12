@@ -86,6 +86,8 @@ pub mod option_kind {
     pub const NOP: u8 = 1;
     /// Maximum Segment Size — Kind=2, Length=4, Data=u16 big-endian.
     pub const MSS: u8 = 2;
+    /// Window Scale — Kind=3, Length=3, Data=u8 shift count (RFC 7323).
+    pub const WSCALE: u8 = 3;
     /// Selective Acknowledgement blocks — Kind=5, Length=2+8n, Data=n×(left:u32,right:u32).
     pub const SACK: u8 = 5;
     /// TCP Timestamps (RFC 1323) — Kind=8, Length=10, TSval(4)+TSecr(4).
@@ -149,6 +151,14 @@ pub enum TcpOption {
     /// No-operation padding byte (kind = 1, no length/data field).
     Nop,
 
+    /// Window Scale factor (kind = 3, RFC 7323).
+    ///
+    /// Carried **only** in SYN and SYN-ACK packets.  The value is a shift
+    /// count (0–14); the true receive window is `header.window << shift`.
+    /// A peer that does not include this option in its SYN has an implicit
+    /// scale of 0 (no scaling).
+    WindowScale(u8),
+
     /// Selective Acknowledgement blocks (kind = 5).
     ///
     /// Each block describes a half-open range `[left, right)` of bytes the
@@ -161,7 +171,7 @@ pub enum TcpOption {
     /// `TSval` is the sender's current timestamp clock.
     // `TSecr` echoes the TSval from the most recent segment received.
     /// Carried on SYN, SYN-ACK, and all subsequent ACKs.
-Timestamp(u32, u32),
+    Timestamp(u32, u32),
 }
 
 impl TcpOption {
@@ -173,6 +183,7 @@ impl TcpOption {
             TcpOption::Mss(_) => 4,                  // kind(1) + length(1) + value(2)
             TcpOption::Sack(b) => 2 + 8 * b.len(),  // kind(1) + length(1) + n×8
             TcpOption::Timestamp(_, _) => 10, // kind(1) + length(1) + tsval(4) + tsecr(4)
+            TcpOption::WindowScale(_) => 3, // kind(1) + length(1) + shift(1)
         }
     }
 }
@@ -374,6 +385,11 @@ fn encode_options(options: &[TcpOption]) -> Vec<u8> {
                 buf.push(4); // total option length (kind + length + 2-byte value)
                 buf.extend_from_slice(&mss.to_be_bytes());
             }
+            TcpOption::WindowScale(shift) => {
+                buf.push(option_kind::WSCALE);
+                buf.push(3); // total option length (kind + length + 1-byte shift)
+                buf.push(*shift);
+            }
             TcpOption::Sack(blocks) => {
                 buf.push(option_kind::SACK);
                 buf.push((2 + 8 * blocks.len()) as u8); // kind(1)+len(1)+n*8
@@ -430,6 +446,19 @@ fn decode_options_from(data: &[u8]) -> (Vec<TcpOption>, &[u8]) {
                 options.push(TcpOption::Mss(mss));
                 i += 4;
             }
+            option_kind::WSCALE => {
+                // Need kind(1) + length(1) + shift(1) = 3 bytes.
+                if i + 3 > data.len() {
+                    break; // truncated option — stop, treat rest as payload
+                }
+                let len = data[i + 1];
+                if len != 3 {
+                    break; // malformed length — stop
+                }
+                let shift = data[i + 2];
+                options.push(TcpOption::WindowScale(shift));
+                i += 3;
+            }
             option_kind::SACK => {
                 // Need at least kind(1) + length(1).
                 if i + 2 > data.len() {
@@ -437,37 +466,33 @@ fn decode_options_from(data: &[u8]) -> (Vec<TcpOption>, &[u8]) {
                 }
                 let len = data[i + 1] as usize;
                 // Length must be >= 2 (kind+len) and data portion divisible by 8.
-                if len < 2 || !(len - 2).is_multiple_of(8) || i + len > data.len() {
+                if len < 2 || (len - 2) % 8 != 0 || i + len > data.len() {
                     break;
                 }
                 let n = (len - 2) / 8;
                 let mut blocks = Vec::with_capacity(n);
                 for j in 0..n {
                     let off = i + 2 + j * 8;
-                    let left = u32::from_be_bytes(
-                        data[off..off + 4].try_into().unwrap(),
-                    );
-                    let right = u32::from_be_bytes(
-                        data[off + 4..off + 8].try_into().unwrap(),
-                    );
+                    let left = u32::from_be_bytes(data[off..off + 4].try_into().unwrap());
+                    let right = u32::from_be_bytes(data[off + 4..off + 8].try_into().unwrap());
                     blocks.push(SackBlock { left, right });
                 }
                 options.push(TcpOption::Sack(blocks));
                 i += len;
             }
             option_kind::TIMESTAMP => {
-                if i + 10 > data.len() {
+              if i + 10 > data.len() {
                 break;
-            }
-            let len = data[i + 1];
-            if len != 10 {
+              }
+              let len = data[i + 1];
+              if len != 10 {
                 break;
-            }
-            let tsval = u32::from_be_bytes(data[i + 2..i + 6].try_into().unwrap());
-            let tsecr = u32::from_be_bytes(data[i + 6..i + 10].try_into().unwrap());
-            options.push(TcpOption::Timestamp(tsval, tsecr));
-            i += 10;
-        }
+              }
+              let tsval = u32::from_be_bytes(data[i + 2..i + 6].try_into().unwrap());
+              let tsecr = u32::from_be_bytes(data[i + 6..i + 10].try_into().unwrap());
+              options.push(TcpOption::Timestamp(tsval, tsecr));
+              i += 10;
+          }
             _ => break, // unknown kind — stop and leave byte in payload
         }
     }
@@ -659,7 +684,9 @@ mod tests {
 
     #[test]
     fn seq_ack_big_endian_on_wire() {
-        let bytes = make_packet(0x0102_0304, 0x0506_0708, 0, 0, b"").encode().unwrap();
+        let bytes = make_packet(0x0102_0304, 0x0506_0708, 0, 0, b"")
+            .encode()
+            .unwrap();
         assert_eq!(&bytes[OFF_SEQ..OFF_SEQ + 4], &[0x01, 0x02, 0x03, 0x04]);
         assert_eq!(&bytes[OFF_ACK..OFF_ACK + 4], &[0x05, 0x06, 0x07, 0x08]);
     }
@@ -816,7 +843,10 @@ mod tests {
                 window: 8192,
                 checksum: 0,
             },
-            options: vec![TcpOption::Sack(vec![SackBlock { left: 110, right: 120 }])],
+            options: vec![TcpOption::Sack(vec![SackBlock {
+                left: 110,
+                right: 120,
+            }])],
             payload: vec![],
         };
         let bytes = pkt.encode().unwrap();
@@ -825,7 +855,10 @@ mod tests {
         let decoded = Packet::decode(&bytes).unwrap();
         assert_eq!(
             decoded.options,
-            vec![TcpOption::Sack(vec![SackBlock { left: 110, right: 120 }])]
+            vec![TcpOption::Sack(vec![SackBlock {
+                left: 110,
+                right: 120
+            }])]
         );
         assert!(decoded.payload.is_empty());
     }
@@ -833,9 +866,18 @@ mod tests {
     #[test]
     fn sack_option_multiple_blocks_roundtrip() {
         let blocks = vec![
-            SackBlock { left: 10, right: 20 },
-            SackBlock { left: 30, right: 40 },
-            SackBlock { left: 50, right: 60 },
+            SackBlock {
+                left: 10,
+                right: 20,
+            },
+            SackBlock {
+                left: 30,
+                right: 40,
+            },
+            SackBlock {
+                left: 50,
+                right: 60,
+            },
         ];
         let pkt = Packet {
             header: Header {
@@ -859,7 +901,13 @@ mod tests {
         let opt = TcpOption::Sack(vec![SackBlock { left: 0, right: 8 }]);
         assert_eq!(opt.wire_len(), 10); // kind(1)+len(1)+1*8
         let pkt = Packet {
-            header: Header { seq: 0, ack: 0, flags: flags::ACK, window: 0, checksum: 0 },
+            header: Header {
+                seq: 0,
+                ack: 0,
+                flags: flags::ACK,
+                window: 0,
+                checksum: 0,
+            },
             options: vec![opt],
             payload: vec![],
         };
@@ -879,11 +927,115 @@ mod tests {
     fn sack_zero_blocks_roundtrip() {
         // Sack(vec![]) is a degenerate option: kind(1)+len(1)+EOL(1) = 3 bytes.
         let pkt = Packet {
-            header: Header { seq: 0, ack: 0, flags: flags::ACK, window: 0, checksum: 0 },
+            header: Header {
+                seq: 0,
+                ack: 0,
+                flags: flags::ACK,
+                window: 0,
+                checksum: 0,
+            },
             options: vec![TcpOption::Sack(vec![])],
             payload: vec![],
         };
         let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
         assert_eq!(decoded.options, vec![TcpOption::Sack(vec![])]);
+    }
+
+    // ── Window Scale option ──────────────────────────────────────────────────
+
+    #[test]
+    fn window_scale_option_roundtrip() {
+        let pkt = Packet {
+            header: Header {
+                seq: 100,
+                ack: 0,
+                flags: flags::SYN,
+                window: 8192,
+                checksum: 0,
+            },
+            options: vec![TcpOption::WindowScale(7)],
+            payload: vec![],
+        };
+        let bytes = pkt.encode().unwrap();
+        let decoded = Packet::decode(&bytes).unwrap();
+        assert_eq!(decoded.options, vec![TcpOption::WindowScale(7)]);
+        assert!(decoded.payload.is_empty());
+    }
+
+    #[test]
+    fn window_scale_wire_length_correct() {
+        // WindowScale: kind(1) + length(1) + shift(1) = 3 bytes.
+        let opt = TcpOption::WindowScale(14);
+        assert_eq!(opt.wire_len(), 3);
+        let pkt = Packet {
+            header: Header {
+                seq: 0,
+                ack: 0,
+                flags: flags::SYN,
+                window: 0,
+                checksum: 0,
+            },
+            options: vec![opt],
+            payload: vec![],
+        };
+        // Wire: HEADER_LEN + options(3) + EOL(1) = HEADER_LEN + 4.
+        assert_eq!(pkt.encode().unwrap().len(), HEADER_LEN + 4);
+    }
+
+    #[test]
+    fn window_scale_with_mss_roundtrip() {
+        // Typical SYN: MSS + WindowScale together.
+        let pkt = Packet {
+            header: Header {
+                seq: 42,
+                ack: 0,
+                flags: flags::SYN,
+                window: 65535,
+                checksum: 0,
+            },
+            options: vec![TcpOption::Mss(1460), TcpOption::WindowScale(7)],
+            payload: vec![],
+        };
+        let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
+        assert_eq!(
+            decoded.options,
+            vec![TcpOption::Mss(1460), TcpOption::WindowScale(7)]
+        );
+    }
+
+    #[test]
+    fn window_scale_max_shift_roundtrip() {
+        // RFC 7323 allows shift values 0–14.
+        let pkt = Packet {
+            header: Header {
+                seq: 0,
+                ack: 0,
+                flags: flags::SYN,
+                window: 0,
+                checksum: 0,
+            },
+            options: vec![TcpOption::WindowScale(14)],
+            payload: vec![],
+        };
+        let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
+        assert_eq!(decoded.options, vec![TcpOption::WindowScale(14)]);
+    }
+
+    #[test]
+    fn window_scale_zero_shift_roundtrip() {
+        // Shift of 0 means no scaling (1:1).
+        let pkt = Packet {
+            header: Header {
+                seq: 0,
+                ack: 0,
+                flags: flags::SYN,
+                window: 0,
+                checksum: 0,
+            },
+            options: vec![TcpOption::WindowScale(0)],
+            payload: vec![],
+        };
+        let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
+        assert_eq!(decoded.options, vec![TcpOption::WindowScale(0)]);
     }
 }

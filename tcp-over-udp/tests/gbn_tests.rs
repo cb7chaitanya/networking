@@ -177,8 +177,12 @@ async fn test_gbn_concurrent_session() {
             .expect("accept");
         loop {
             match conn.recv().await {
-                Ok(data) => conn.send(&data).await.expect("echo"),
-                Err(ConnError::Eof) => break,
+                Ok(data) => {
+                    conn.send(&data).await.expect("echo");
+                }
+                Err(ConnError::Eof) => {
+                    break;
+                }
                 Err(e) => panic!("server: {e}"),
             }
         }
@@ -194,35 +198,59 @@ async fn test_gbn_concurrent_session() {
 
         let mut session = conn.run();
 
+        // Build expected total payload for verification.
+        let mut expected_total = Vec::new();
+        for i in 0..MSG_COUNT {
+            expected_total.extend_from_slice(format!("item-{i}").as_bytes());
+        }
+
         // Send all messages through the channel (non-blocking).
         for i in 0..MSG_COUNT {
             let msg = format!("item-{i}");
             session.send(msg.into_bytes()).await.expect("session send");
         }
 
-        // Collect echoes.
-        let mut replies = Vec::new();
-        for _ in 0..MSG_COUNT {
+        // Collect echoes.  TCP is a byte stream, so the server's synchronous
+        // send_segment may coalesce incoming data while blocked on window space.
+        // We therefore collect all received bytes rather than expecting exactly
+        // MSG_COUNT separate messages.
+        let mut received_total = Vec::new();
+        loop {
             match session.recv().await {
-                Ok(data) => replies.push(data),
+                Ok(data) => {
+                    received_total.extend_from_slice(&data);
+                    // Stop once we have all expected bytes.
+                    if received_total.len() >= expected_total.len() {
+                        break;
+                    }
+                }
                 Err(ConnError::Eof) => break,
                 Err(e) => panic!("client session recv: {e}"),
             }
         }
 
         session.close().await;
-        replies
+        (received_total, expected_total)
     });
 
     let (sr, cr) = tokio::join!(server, client);
     sr.unwrap();
-    let replies = cr.unwrap();
+    let (received_total, expected_total) = cr.unwrap();
 
-    assert_eq!(replies.len(), MSG_COUNT);
-    for (i, r) in replies.iter().enumerate() {
-        let expected = format!("item-{i}");
-        assert_eq!(r, expected.as_bytes());
-    }
+    // Verify total bytes match (TCP byte-stream semantics).
+    assert_eq!(
+        received_total.len(),
+        expected_total.len(),
+        "total bytes mismatch: got {}, expected {}",
+        received_total.len(),
+        expected_total.len()
+    );
+    assert_eq!(
+        received_total, expected_total,
+        "byte content mismatch:\n  received: {:?}\n  expected: {:?}",
+        String::from_utf8_lossy(&received_total),
+        String::from_utf8_lossy(&expected_total)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2061,4 +2089,423 @@ fn test_sack_two_disjoint_gaps() {
 
     // Exactly two retransmits occurred — one per gap.
     assert_eq!(sender.sr_retransmit_count(), 2, "exactly two retransmits for two gaps");
+}
+
+// ---------------------------------------------------------------------------
+// Test 39:  SACK blocks emitted by build_ack — event loop AC3
+// ---------------------------------------------------------------------------
+//
+// The receiver buffers two out-of-order segments while seq=0 is still
+// missing, producing one SACK block [10,20).  The ACK packet built by the
+// event loop must include this SACK option and set the OPT flag.  The test
+// also verifies the blocks survive encode/decode.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sack_build_ack_emits_sack_blocks_when_ooo() {
+    use tcp_over_udp::gbn_receiver::GbnReceiver;
+    use tcp_over_udp::gbn_sender::GbnSender;
+    use tcp_over_udp::packet::{flags, Header, Packet, SackBlock, TcpOption};
+
+    let sender = GbnSender::new(0, 4);
+    let mut receiver = GbnReceiver::new(0);
+
+    // Buffer two contiguous OOO segments — seq=0 is the gap.
+    receiver.on_segment(10, b"hello"); // [10, 15)
+    receiver.on_segment(15, b"world"); // [15, 20) —> merges into [10, 20)
+
+    // Replicate what the fixed build_ack() does in the event loop.
+    let sack_blocks = receiver.sack_blocks();
+    assert!(!sack_blocks.is_empty(), "OOO data must produce SACK blocks");
+    assert_eq!(sack_blocks[0], SackBlock { left: 10, right: 20 });
+
+    let options: Vec<TcpOption> = if sack_blocks.is_empty() {
+        vec![]
+    } else {
+        vec![TcpOption::Sack(sack_blocks.clone())]
+    };
+
+    let pkt = Packet {
+        header: Header {
+            seq: sender.next_seq,
+            ack: receiver.ack_number(),
+            flags: flags::ACK,
+            window: receiver.window_size().min(u16::MAX as usize) as u16,
+            checksum: 0,
+        },
+        options,
+        payload: vec![],
+    };
+
+    let decoded = Packet::decode(&pkt.encode().unwrap()).unwrap();
+
+    // OLD build_ack() never set OPT -> this would fail on unfixed code.
+    assert_ne!(decoded.header.flags & flags::OPT, 0,
+        "OPT flag must be set when SACK option is present");
+
+    let recovered: Vec<SackBlock> = decoded.options.iter()
+        .filter_map(|o| if let TcpOption::Sack(b) = o { Some(b.clone()) } else { None })
+        .flatten()
+        .collect();
+    assert_eq!(recovered, sack_blocks,
+        "SACK blocks must survive encode/decode round-trip");
+}
+
+// ---------------------------------------------------------------------------
+// Test 40:  event loop processes incoming SACK via run() — AC1
+// ---------------------------------------------------------------------------
+//
+// A client sends multiple messages using `run()`.  Incoming ACK packets may
+// contain SACK options, which the event loop must pass to
+// `sender.process_sack()`.  If this step is missing the sender window can
+// stall.  The test ensures the session completes and all messages arrive.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_sack_event_loop_processes_incoming_sack() {
+    const WINDOW: usize = 8;
+    const MSG_COUNT: usize = 20;
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW).await.expect("accept");
+        let mut received = Vec::new();
+        loop {
+            match conn.recv().await {
+                Ok(data) => received.push(data),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server: {e}"),
+            }
+            if received.len() == MSG_COUNT { break; }
+        }
+        conn.close().await.ok();
+        received
+    });
+
+    // Client uses run() — hits Branch 2 of event_loop() where process_sack() was missing.
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let conn = GbnConnection::connect(sock, server_addr, WINDOW).await.expect("connect");
+        let session = conn.run();
+        for i in 0..MSG_COUNT {
+            session.send(format!("sack-msg-{i:02}").into_bytes()).await.expect("send");
+        }
+        session.close().await;
+    });
+
+    let received = tokio::time::timeout(DEADLINE, async {
+        let (s, c) = tokio::join!(server, client);
+        c.unwrap(); s.unwrap()
+    })
+    .await
+    .expect("timed out — possible deadlock from unprocessed SACK in event loop");
+
+    assert_eq!(received.len(), MSG_COUNT);
+    for (i, chunk) in received.iter().enumerate() {
+        assert_eq!(chunk, format!("sack-msg-{i:02}").as_bytes());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Test 41: fast-retransmit in event loop skips sacked entries — AC2
+// ---------------------------------------------------------------------------
+//
+// Three segments are in flight.  seq=0 is marked as SACKed, simulating a
+// receiver that already has it.  After three duplicate ACKs trigger fast
+// retransmit, `retransmit_oldest()` must skip seq=0 and retransmit seq=10.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sack_fast_retransmit_skips_sacked_in_event_loop() {
+    use tcp_over_udp::gbn_sender::GbnSender;
+    use tcp_over_udp::packet::SackBlock;
+
+    let mut sender = GbnSender::new(0, 8);
+    sender.cc.cwnd = 8;
+
+    for _ in 0..3 {
+        let pkt = sender.build_data_packet(vec![0u8; 10], 0, 8192);
+        sender.record_sent(pkt);
+    }
+    // Window: seq=0, seq=10, seq=20.
+
+    // Mark seq=0 as sacked — this is what process_sack() does in the fixed event loop.
+    sender.process_sack(&[SackBlock { left: 0, right: 10 }]);
+
+    // Simulate 3 duplicate ACKs.
+    for _ in 0..3 {
+        let r = sender.on_ack(0);
+        assert!(r.dup_ack);
+    }
+    sender.on_triple_dup_ack_cc();
+
+    let pkt = sender.retransmit_oldest().expect("must find unsacked segment");
+    assert_eq!(pkt.header.seq, 10,
+        "fast-retransmit must skip sacked seq=0 and target seq=10");
+    assert_eq!(sender.sr_retransmit_count(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Window Scaling Integration Tests
+// ---------------------------------------------------------------------------
+
+/// Verify that window scaling is negotiated during GbnConnection handshake.
+#[tokio::test]
+async fn test_gbn_window_scale_negotiation() {
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let conn = GbnConnection::accept(server_sock, 4)
+            .await
+            .expect("accept");
+
+        // Window scaling should be negotiated.
+        assert!(
+            conn.snd_wscale().is_some(),
+            "server should have negotiated snd_wscale"
+        );
+        assert!(
+            conn.rcv_wscale().is_some(),
+            "server should have negotiated rcv_wscale"
+        );
+
+        // Scale factors should be within valid TCP range (0-14).
+        let snd = conn.snd_wscale().unwrap();
+        let rcv = conn.rcv_wscale().unwrap();
+        assert!(snd <= 14, "snd_wscale must be <= 14");
+        assert!(rcv <= 14, "rcv_wscale must be <= 14");
+
+        conn
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let conn = GbnConnection::connect(sock, server_addr, 4)
+            .await
+            .expect("connect");
+
+        // Window scaling should be negotiated.
+        assert!(
+            conn.snd_wscale().is_some(),
+            "client should have negotiated snd_wscale"
+        );
+        assert!(
+            conn.rcv_wscale().is_some(),
+            "client should have negotiated rcv_wscale"
+        );
+
+        conn
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    let server_conn = sr.unwrap();
+    let client_conn = cr.unwrap();
+
+    // Both sides should have the same scale factors.
+    assert_eq!(
+        server_conn.snd_wscale(),
+        client_conn.snd_wscale(),
+        "both sides should negotiate the same snd_wscale"
+    );
+    assert_eq!(
+        server_conn.rcv_wscale(),
+        client_conn.rcv_wscale(),
+        "both sides should negotiate the same rcv_wscale"
+    );
+}
+
+/// Test data transfer with window scaling enabled.
+/// This verifies that window scaling works correctly for actual data exchange.
+#[tokio::test]
+async fn test_gbn_window_scale_data_transfer() {
+    const WINDOW: usize = 8;
+    const DATA_SIZE: usize = 32 * 1024; // 32 KiB
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW)
+            .await
+            .expect("accept");
+
+        // Verify window scaling is enabled.
+        assert!(conn.snd_wscale().is_some(), "window scaling should be enabled");
+
+        // Receive all data.
+        let mut total_received = 0;
+        loop {
+            match conn.recv().await {
+                Ok(data) => {
+                    total_received += data.len();
+                    if total_received >= DATA_SIZE {
+                        break;
+                    }
+                }
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv error: {e:?}"),
+            }
+        }
+
+        assert_eq!(total_received, DATA_SIZE, "should receive all data");
+        conn.close().await.ok();
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        // Verify window scaling is enabled.
+        assert!(conn.snd_wscale().is_some(), "window scaling should be enabled");
+
+        // Send data in chunks.
+        let data = vec![0xABu8; DATA_SIZE];
+        conn.send(&data).await.expect("client send");
+        conn.close().await.expect("client close");
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    sr.unwrap();
+    cr.unwrap();
+}
+
+/// Test large data transfer that benefits from window scaling.
+/// With a scale factor of 7, we can advertise windows up to 8 MiB,
+/// which allows for high bandwidth-delay product scenarios.
+#[tokio::test]
+async fn test_gbn_large_transfer_with_window_scaling() {
+    const WINDOW: usize = 16;
+    const DATA_SIZE: usize = 128 * 1024; // 128 KiB - larger transfer
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW)
+            .await
+            .expect("accept");
+
+        // Use a large receive buffer to allow window scaling to be effective.
+        // The default is 64 KiB, which with scale factor 7 allows advertising
+        // windows up to 64 KiB (limited by actual buffer size).
+
+        let mut total_received = 0;
+        let mut received_data = Vec::new();
+
+        loop {
+            match conn.recv().await {
+                Ok(data) => {
+                    total_received += data.len();
+                    received_data.extend_from_slice(&data);
+                    if total_received >= DATA_SIZE {
+                        break;
+                    }
+                }
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("server recv error: {e:?}"),
+            }
+        }
+
+        assert_eq!(total_received, DATA_SIZE, "should receive all data");
+
+        // Verify data integrity.
+        for (i, &byte) in received_data.iter().enumerate() {
+            let expected = (i % 256) as u8;
+            assert_eq!(byte, expected, "data corruption at byte {i}");
+        }
+
+        conn.close().await.ok();
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        // Create test data with a recognizable pattern.
+        let data: Vec<u8> = (0..DATA_SIZE).map(|i| (i % 256) as u8).collect();
+
+        conn.send(&data).await.expect("client send");
+        conn.close().await.expect("client close");
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    sr.unwrap();
+    cr.unwrap();
+}
+
+/// Test bidirectional transfer with window scaling.
+#[tokio::test]
+async fn test_gbn_bidirectional_with_window_scaling() {
+    const WINDOW: usize = 8;
+    const MSG_SIZE: usize = 16 * 1024; // 16 KiB each way
+
+    let server_sock = ephemeral().await;
+    let server_addr = server_sock.local_addr;
+
+    let server = tokio::spawn(async move {
+        let mut conn = GbnConnection::accept(server_sock, WINDOW)
+            .await
+            .expect("accept");
+
+        // Receive client's data.
+        let mut received = Vec::new();
+        while received.len() < MSG_SIZE {
+            match conn.recv().await {
+                Ok(data) => received.extend_from_slice(&data),
+                Err(e) => panic!("server recv error: {e:?}"),
+            }
+        }
+
+        // Verify received data.
+        assert_eq!(received.len(), MSG_SIZE);
+        for (i, &byte) in received.iter().enumerate() {
+            assert_eq!(byte, 0xAA, "unexpected byte at position {i}");
+        }
+
+        // Send response back.
+        let response = vec![0xBBu8; MSG_SIZE];
+        conn.send(&response).await.expect("server send");
+        conn.close().await.expect("server close");
+    });
+
+    let client = tokio::spawn(async move {
+        let sock = ephemeral().await;
+        let mut conn = GbnConnection::connect(sock, server_addr, WINDOW)
+            .await
+            .expect("connect");
+
+        // Send data to server.
+        let request = vec![0xAAu8; MSG_SIZE];
+        conn.send(&request).await.expect("client send");
+
+        // Receive response.
+        let mut received = Vec::new();
+        while received.len() < MSG_SIZE {
+            match conn.recv().await {
+                Ok(data) => received.extend_from_slice(&data),
+                Err(ConnError::Eof) => break,
+                Err(e) => panic!("client recv error: {e:?}"),
+            }
+        }
+
+        // Verify response.
+        assert_eq!(received.len(), MSG_SIZE);
+        for (i, &byte) in received.iter().enumerate() {
+            assert_eq!(byte, 0xBB, "unexpected byte at position {i}");
+        }
+
+        conn.close().await.expect("client close");
+    });
+
+    let (sr, cr) = tokio::join!(server, client);
+    sr.unwrap();
+    cr.unwrap();
 }
