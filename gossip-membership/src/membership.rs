@@ -107,8 +107,8 @@ impl MembershipTable {
                     return;
                 }
 
-                let update = if incoming.heartbeat > existing.heartbeat {
-                    // Rule 4: higher heartbeat wins.
+                let update = if is_newer(incoming.heartbeat, existing.heartbeat) {
+                    // Rule 4: newer heartbeat wins (wrapping-safe comparison).
                     true
                 } else if incoming.heartbeat == existing.heartbeat
                     && incoming.status > existing.status
@@ -320,6 +320,26 @@ pub fn placeholder_id_for(addr: SocketAddr) -> NodeId {
     h.finish() ^ 0xDEAD_BEEF_0000_0000
 }
 
+// ── Heartbeat ordering ────────────────────────────────────────────────────────
+
+/// Returns `true` if heartbeat `a` is strictly newer than `b` using
+/// TCP-style serial-number arithmetic (RFC 1982).
+///
+/// A heartbeat is newer when `(a.wrapping_sub(b)) < 2^31`, which handles
+/// wrap-around from `u32::MAX` back to `0` correctly.
+///
+/// # Examples
+/// ```
+/// use gossip_membership::membership::is_newer;
+/// assert!(is_newer(1, 0));
+/// assert!(is_newer(0, u32::MAX));   // wrap: 0 is newer than MAX
+/// assert!(!is_newer(0, 1));
+/// assert!(!is_newer(5, 5));         // equal → not newer
+/// ```
+pub fn is_newer(a: u32, b: u32) -> bool {
+    a != b && a.wrapping_sub(b) < (1u32 << 31)
+}
+
 // ── Status wire constants exposed for tests ───────────────────────────────────
 pub use status::{ALIVE, DEAD, SUSPECT};
 
@@ -431,6 +451,67 @@ mod tests {
         assert!(live.contains(&2));
         assert!(!live.contains(&3));
         assert!(!live.contains(&1)); // self
+    }
+
+    // ── is_newer unit tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn is_newer_basic() {
+        assert!(is_newer(1, 0));
+        assert!(is_newer(100, 99));
+        assert!(!is_newer(0, 1));
+        assert!(!is_newer(99, 100));
+    }
+
+    #[test]
+    fn is_newer_equal_is_not_newer() {
+        assert!(!is_newer(0, 0));
+        assert!(!is_newer(5, 5));
+        assert!(!is_newer(u32::MAX, u32::MAX));
+    }
+
+    #[test]
+    fn is_newer_wraparound_max_to_zero() {
+        // 0 was produced by wrapping_add(MAX, 1) — it is newer than MAX.
+        assert!(is_newer(0, u32::MAX));
+        assert!(is_newer(1, u32::MAX));
+        assert!(is_newer(0, u32::MAX - 1));
+    }
+
+    #[test]
+    fn is_newer_near_boundary() {
+        let half = 1u32 << 31; // 2^31
+        // Exactly half the range apart: a.wrapping_sub(b) == 2^31 → NOT newer
+        // (ambiguous region; we treat it as not newer for safety).
+        assert!(!is_newer(half, 0));
+        // One less than half: clearly newer.
+        assert!(is_newer(half - 1, 0));
+        // One more than half: clearly older.
+        assert!(!is_newer(half + 1, 0));
+    }
+
+    // ── merge_entry wraparound tests ──────────────────────────────────────────
+
+    #[test]
+    fn merge_accepts_wrapped_heartbeat() {
+        // Simulate a node whose heartbeat wrapped: existing=MAX, incoming=1.
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), u32::MAX));
+        // Wrapped heartbeat (0, then 1) must win over MAX.
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 0));
+        assert_eq!(t.entries[&2].heartbeat, 0, "wrapped hb=0 should beat hb=MAX");
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 1));
+        assert_eq!(t.entries[&2].heartbeat, 1, "wrapped hb=1 should beat hb=0");
+    }
+
+    #[test]
+    fn merge_rejects_old_heartbeat_after_wraparound() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        // Node has already wrapped; current heartbeat is 5.
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 5));
+        // A stale pre-wrap value (e.g. MAX) must not overwrite the newer 5.
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), u32::MAX));
+        assert_eq!(t.entries[&2].heartbeat, 5, "stale pre-wrap hb=MAX must not overwrite hb=5");
     }
 
     #[test]
