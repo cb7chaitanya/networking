@@ -44,6 +44,10 @@ pub struct NodeState {
     pub node_id: NodeId,
     pub addr: SocketAddr,
     pub heartbeat: u32,
+    /// Incarnation number (SWIM §4.2). A node increments its own incarnation
+    /// when it learns that it has been suspected, allowing it to refute the
+    /// suspicion without inflating its heartbeat counter.
+    pub incarnation: u32,
     pub status: NodeStatus,
     /// Monotonic timestamp of last update. NOT transmitted on the wire.
     pub last_update: Instant,
@@ -52,11 +56,13 @@ pub struct NodeState {
 }
 
 impl NodeState {
+    /// Create a new Alive entry at incarnation 0.
     pub fn new_alive(node_id: NodeId, addr: SocketAddr, heartbeat: u32) -> Self {
         Self {
             node_id,
             addr,
             heartbeat,
+            incarnation: 0,
             status: NodeStatus::Alive,
             last_update: Instant::now(),
             suspect_since: None,

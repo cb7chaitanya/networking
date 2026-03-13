@@ -45,21 +45,23 @@ pub mod status {
 }
 
 // ── Wire-level node entry ────────────────────────────────────────────────────
-/// One membership record on the wire (19 bytes, IPv4 only).
+/// One membership record on the wire (23 bytes, IPv4 only).
 ///
 /// ```text
-///  Bytes 0-7  : node_id    (u64)
-///  Bytes 8-11 : heartbeat  (u32)
-///  Byte  12   : status     (u8)  — 0=Alive, 1=Suspect, 2=Dead
-///  Bytes 13-16: ip         (u32) — IPv4 address, big-endian
-///  Bytes 17-18: port       (u16)
+///  Bytes  0-7  : node_id     (u64)
+///  Bytes  8-11 : heartbeat   (u32)
+///  Bytes 12-15 : incarnation (u32) — SWIM incarnation number
+///  Byte   16   : status      (u8)  — 0=Alive, 1=Suspect, 2=Dead
+///  Bytes 17-20 : ip          (u32) — IPv4 address, big-endian
+///  Bytes 21-22 : port        (u16)
 /// ```
-pub const NODE_ENTRY_LEN: usize = 19;
+pub const NODE_ENTRY_LEN: usize = 23;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireNodeEntry {
     pub node_id: u64,
     pub heartbeat: u32,
+    pub incarnation: u32,
     pub status: u8,
     pub ip: u32,
     pub port: u16,
@@ -69,6 +71,7 @@ impl WireNodeEntry {
     pub fn encode_into(&self, buf: &mut Vec<u8>) {
         buf.extend_from_slice(&self.node_id.to_be_bytes());
         buf.extend_from_slice(&self.heartbeat.to_be_bytes());
+        buf.extend_from_slice(&self.incarnation.to_be_bytes());
         buf.push(self.status);
         buf.extend_from_slice(&self.ip.to_be_bytes());
         buf.extend_from_slice(&self.port.to_be_bytes());
@@ -81,9 +84,10 @@ impl WireNodeEntry {
         Some(Self {
             node_id: u64::from_be_bytes(buf[0..8].try_into().ok()?),
             heartbeat: u32::from_be_bytes(buf[8..12].try_into().ok()?),
-            status: buf[12],
-            ip: u32::from_be_bytes(buf[13..17].try_into().ok()?),
-            port: u16::from_be_bytes(buf[17..19].try_into().ok()?),
+            incarnation: u32::from_be_bytes(buf[12..16].try_into().ok()?),
+            status: buf[16],
+            ip: u32::from_be_bytes(buf[17..21].try_into().ok()?),
+            port: u16::from_be_bytes(buf[21..23].try_into().ok()?),
         })
     }
 
@@ -381,6 +385,7 @@ mod tests {
         let entry = WireNodeEntry {
             node_id: 999,
             heartbeat: 5,
+            incarnation: 0,
             status: status::ALIVE,
             ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
             port: 8080,
@@ -472,6 +477,7 @@ mod tests {
             build_gossip(7, 3, vec![WireNodeEntry {
                 node_id: 1,
                 heartbeat: 0,
+                incarnation: 0,
                 status: status::ALIVE,
                 ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
                 port: 9000,
@@ -540,6 +546,7 @@ mod tests {
             .map(|i| WireNodeEntry {
                 node_id: i,
                 heartbeat: i as u32 * 3,
+                incarnation: i as u32,
                 status: (i % 3) as u8,
                 ip: u32::from(Ipv4Addr::new(192, 168, 1, i as u8)),
                 port: 9000 + i as u16,

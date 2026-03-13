@@ -411,6 +411,7 @@ async fn test_gossip_message_encode_decode() {
     let entry = WireNodeEntry {
         node_id: 12345,
         heartbeat: 7,
+        incarnation: 0,
         status: status::ALIVE,
         ip: u32::from(Ipv4Addr::new(127, 0, 0, 1)),
         port: 8080,

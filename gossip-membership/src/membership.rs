@@ -13,6 +13,9 @@ pub struct MembershipTable {
     pub local_id: NodeId,
     local_addr: SocketAddr,
     local_heartbeat: u32,
+    /// Our own incarnation number. Incremented whenever we learn we have been
+    /// suspected, allowing us to refute without inflating our heartbeat counter.
+    local_incarnation: u32,
 }
 
 impl MembershipTable {
@@ -22,8 +25,9 @@ impl MembershipTable {
             local_id,
             local_addr,
             local_heartbeat: 0,
+            local_incarnation: 0,
         };
-        // Seed our own entry as Alive with heartbeat 0.
+        // Seed our own entry as Alive with heartbeat 0, incarnation 0.
         t.entries.insert(
             local_id,
             NodeState::new_alive(local_id, local_addr, 0),
@@ -35,17 +39,23 @@ impl MembershipTable {
         self.local_heartbeat
     }
 
+    pub fn our_incarnation(&self) -> u32 {
+        self.local_incarnation
+    }
+
     /// Increment our own heartbeat counter and refresh our membership entry.
     /// Called on every heartbeat tick.
     pub fn tick_heartbeat(&mut self) {
         self.local_heartbeat = self.local_heartbeat.wrapping_add(1);
         let hb = self.local_heartbeat;
+        let inc = self.local_incarnation;
         let addr = self.local_addr;
         let id = self.local_id;
         let entry = self.entries.entry(id).or_insert_with(|| {
             NodeState::new_alive(id, addr, 0)
         });
         entry.heartbeat = hb;
+        entry.incarnation = inc;
         entry.status = NodeStatus::Alive;
         entry.last_update = Instant::now();
     }
@@ -55,26 +65,48 @@ impl MembershipTable {
     ///
     /// Rules (in priority order):
     /// 1. Ignore entries about ourselves — we are the authority on our own state.
+    ///    Exception: if remote gossip says we are Suspect/Dead at an incarnation
+    ///    >= ours, we must refute by incrementing our incarnation and re-asserting
+    ///    Alive (SWIM §4.2 — no heartbeat inflation).
     /// 2. Insert unknown entries unconditionally.
     /// 3. Dead entries are terminal — never downgrade from Dead.
-    /// 4. Higher heartbeat wins, carrying the incoming status.
-    /// 5. Same heartbeat: more severe status wins (Dead > Suspect > Alive).
-    /// 6. Otherwise discard — existing entry is equally or more current.
+    /// 4. Higher incarnation always wins (wrapping-safe, RFC 1982 arithmetic).
+    /// 5. Equal incarnation: higher heartbeat wins.
+    /// 6. Equal incarnation + equal heartbeat: more severe status wins.
+    /// 7. Otherwise discard — existing entry is equally or more current.
     pub fn merge_entry(&mut self, incoming: &NodeState) {
+        // Discard stale placeholder views of our own address.  When a peer
+        // bootstraps it creates a synthetic placeholder entry for us (with a
+        // derived node_id) and may gossip it before learning our real id.
+        // That entry has our local_addr but a different node_id, so the
+        // self-id check below would miss it and create a duplicate address entry.
+        // We are always the authority on our own address, so any entry that
+        // carries local_addr but a different node_id must be discarded.
+        if incoming.addr == self.local_addr && incoming.node_id != self.local_id {
+            return;
+        }
+
         // Rule 1: never let remote nodes overwrite our own entry.
         if incoming.node_id == self.local_id {
-            // Exception: if remote gossip says we are Suspect/Dead, we must
-            // refute it by bumping our heartbeat immediately.
-            if incoming.status != NodeStatus::Alive {
-                log::info!(
-                    "[membership] received refutation-needed entry: we appear {:?} to others; bumping heartbeat",
-                    incoming.status
-                );
-                self.local_heartbeat = self.local_heartbeat.wrapping_add(10);
+            // Refute suspicion: only act when the remote claims our status is
+            // non-Alive at an incarnation >= our current one.  If the remote's
+            // incarnation is stale (lower than ours), our already-gossiped
+            // refutation supersedes it — no action needed.
+            if incoming.status != NodeStatus::Alive
+                && !is_newer(self.local_incarnation, incoming.incarnation)
+            {
+                self.local_incarnation = self.local_incarnation.wrapping_add(1);
+                let inc = self.local_incarnation;
                 let hb = self.local_heartbeat;
                 let addr = self.local_addr;
                 let id = self.local_id;
+                log::info!(
+                    "[membership] received suspicion at incarnation {}; refuting with incarnation {}",
+                    incoming.incarnation,
+                    inc,
+                );
                 let e = self.entries.entry(id).or_insert_with(|| NodeState::new_alive(id, addr, 0));
+                e.incarnation = inc;
                 e.heartbeat = hb;
                 e.status = NodeStatus::Alive;
                 e.last_update = Instant::now();
@@ -94,10 +126,11 @@ impl MembershipTable {
                     s
                 });
                 log::info!(
-                    "[membership] new node {} @ {} (hb={}, status={:?})",
+                    "[membership] new node {} @ {} (hb={}, inc={}, status={:?})",
                     incoming.node_id,
                     incoming.addr,
                     incoming.heartbeat,
+                    incoming.incarnation,
                     incoming.status
                 );
             }
@@ -107,16 +140,24 @@ impl MembershipTable {
                     return;
                 }
 
-                let update = if is_newer(incoming.heartbeat, existing.heartbeat) {
-                    // Rule 4: newer heartbeat wins (wrapping-safe comparison).
+                let update = if is_newer(incoming.incarnation, existing.incarnation) {
+                    // Rule 4: higher incarnation always wins.
                     true
-                } else if incoming.heartbeat == existing.heartbeat
-                    && incoming.status > existing.status
-                {
-                    // Rule 5: same heartbeat, more severe status wins.
-                    true
+                } else if incoming.incarnation == existing.incarnation {
+                    if is_newer(incoming.heartbeat, existing.heartbeat) {
+                        // Rule 5: same incarnation, newer heartbeat wins.
+                        true
+                    } else if incoming.heartbeat == existing.heartbeat
+                        && incoming.status > existing.status
+                    {
+                        // Rule 6: same incarnation + heartbeat, more severe status wins.
+                        true
+                    } else {
+                        // Rule 7: discard.
+                        false
+                    }
                 } else {
-                    // Rule 6: discard.
+                    // Incoming incarnation is older — discard.
                     false
                 };
 
@@ -124,16 +165,18 @@ impl MembershipTable {
                     let old_status = existing.status;
                     let entry = self.entries.get_mut(&incoming.node_id).unwrap();
                     entry.heartbeat = incoming.heartbeat;
+                    entry.incarnation = incoming.incarnation;
                     entry.addr = incoming.addr;
                     entry.last_update = now;
 
                     if incoming.status != old_status {
                         log::info!(
-                            "[membership] node {} status: {:?} → {:?} (hb={})",
+                            "[membership] node {} status: {:?} → {:?} (hb={}, inc={})",
                             incoming.node_id,
                             old_status,
                             incoming.status,
-                            incoming.heartbeat
+                            incoming.heartbeat,
+                            incoming.incarnation,
                         );
                     }
 
@@ -283,6 +326,7 @@ pub fn node_state_to_wire(s: &NodeState) -> Option<WireNodeEntry> {
     Some(WireNodeEntry {
         node_id: s.node_id,
         heartbeat: s.heartbeat,
+        incarnation: s.incarnation,
         status: s.status.to_wire(),
         ip,
         port,
@@ -297,6 +341,7 @@ pub fn wire_to_node_state(e: &WireNodeEntry) -> Option<NodeState> {
         node_id: e.node_id,
         addr,
         heartbeat: e.heartbeat,
+        incarnation: e.incarnation,
         status,
         last_update: Instant::now(),
         suspect_since: if status == NodeStatus::Suspect {
@@ -529,5 +574,147 @@ mod tests {
         let digest = t.gossip_digest(3);
         // Node 6 has the most recent last_update and must appear first.
         assert_eq!(digest[0].node_id, 6);
+    }
+
+    // ── Incarnation tests ─────────────────────────────────────────────────────
+
+    /// When a node receives gossip claiming it is Suspected at the same
+    /// incarnation, it must bump its incarnation to 1 and remain Alive.
+    #[test]
+    fn refute_suspicion_increments_incarnation() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        assert_eq!(t.our_incarnation(), 0);
+
+        // Simulate receiving gossip that says we (node 1) are Suspect at inc=0.
+        let mut suspect_self = NodeState::new_alive(1, make_addr(1000), 5);
+        suspect_self.status = NodeStatus::Suspect;
+        suspect_self.incarnation = 0;
+        t.merge_entry(&suspect_self);
+
+        // Incarnation must have been bumped.
+        assert_eq!(t.our_incarnation(), 1, "incarnation must increment on refutation");
+        // Our own entry must be Alive.
+        assert_eq!(t.entries[&1].status, NodeStatus::Alive);
+        assert_eq!(t.entries[&1].incarnation, 1);
+    }
+
+    /// Stale suspicion (lower incarnation than ours) must be silently ignored;
+    /// no refutation is needed because our already-gossiped incarnation wins.
+    #[test]
+    fn stale_suspicion_not_refuted() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        // Advance our incarnation to 3 (as if we've already refuted twice).
+        t.local_incarnation = 3;
+        t.entries.get_mut(&1).unwrap().incarnation = 3;
+
+        // Receive an old suspicion at incarnation 1.
+        let mut stale_suspect = NodeState::new_alive(1, make_addr(1000), 0);
+        stale_suspect.status = NodeStatus::Suspect;
+        stale_suspect.incarnation = 1;
+        t.merge_entry(&stale_suspect);
+
+        // Incarnation must not have changed.
+        assert_eq!(t.our_incarnation(), 3, "stale suspicion must not trigger refutation");
+        assert_eq!(t.entries[&1].status, NodeStatus::Alive);
+    }
+
+    /// A Dead accusation at our current incarnation also triggers a refutation.
+    #[test]
+    fn refute_dead_accusation() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        let mut dead_self = NodeState::new_alive(1, make_addr(1000), 0);
+        dead_self.status = NodeStatus::Dead;
+        dead_self.incarnation = 0;
+        t.merge_entry(&dead_self);
+
+        assert_eq!(t.our_incarnation(), 1, "Dead accusation must trigger incarnation bump");
+        assert_eq!(t.entries[&1].status, NodeStatus::Alive);
+    }
+
+    /// Higher incarnation beats lower incarnation regardless of heartbeat.
+    #[test]
+    fn higher_incarnation_wins_over_heartbeat() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        // Insert peer at incarnation=0, heartbeat=100.
+        let mut old = NodeState::new_alive(2, make_addr(2000), 100);
+        old.incarnation = 0;
+        t.merge_entry(&old);
+        assert_eq!(t.entries[&2].heartbeat, 100);
+
+        // Incoming at incarnation=1, heartbeat=0 must win.
+        let mut newer_inc = NodeState::new_alive(2, make_addr(2000), 0);
+        newer_inc.incarnation = 1;
+        t.merge_entry(&newer_inc);
+        assert_eq!(t.entries[&2].incarnation, 1, "higher incarnation must win");
+        assert_eq!(t.entries[&2].heartbeat, 0, "heartbeat must update to the winner's value");
+    }
+
+    /// Lower incarnation must not overwrite a higher incarnation entry.
+    #[test]
+    fn lower_incarnation_ignored() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        let mut current = NodeState::new_alive(2, make_addr(2000), 5);
+        current.incarnation = 2;
+        t.merge_entry(&current);
+
+        // Stale entry at incarnation=1, even with higher heartbeat — must be discarded.
+        let mut stale = NodeState::new_alive(2, make_addr(2000), 999);
+        stale.incarnation = 1;
+        t.merge_entry(&stale);
+
+        assert_eq!(t.entries[&2].incarnation, 2, "stale incarnation must be discarded");
+        assert_eq!(t.entries[&2].heartbeat, 5, "heartbeat must not be overwritten");
+    }
+
+    /// Same incarnation: higher heartbeat wins (existing per-incarnation rule).
+    #[test]
+    fn same_incarnation_higher_heartbeat_wins() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        let mut a = NodeState::new_alive(2, make_addr(2000), 3);
+        a.incarnation = 1;
+        t.merge_entry(&a);
+
+        let mut b = NodeState::new_alive(2, make_addr(2000), 10);
+        b.incarnation = 1;
+        t.merge_entry(&b);
+
+        assert_eq!(t.entries[&2].heartbeat, 10);
+        assert_eq!(t.entries[&2].incarnation, 1);
+    }
+
+    /// Same incarnation + same heartbeat: Suspect beats Alive.
+    #[test]
+    fn same_incarnation_same_heartbeat_suspect_beats_alive() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        let mut alive = NodeState::new_alive(2, make_addr(2000), 7);
+        alive.incarnation = 2;
+        t.merge_entry(&alive);
+
+        let mut suspect = NodeState::new_alive(2, make_addr(2000), 7);
+        suspect.incarnation = 2;
+        suspect.status = NodeStatus::Suspect;
+        t.merge_entry(&suspect);
+
+        assert_eq!(t.entries[&2].status, NodeStatus::Suspect);
+    }
+
+    /// Incarnation numbers survive a node_state → wire → node_state roundtrip.
+    #[test]
+    fn incarnation_survives_wire_roundtrip() {
+        let mut s = NodeState::new_alive(42, make_addr(5000), 7);
+        s.incarnation = 3;
+        s.status = NodeStatus::Suspect;
+
+        let wire = node_state_to_wire(&s).expect("IPv4 must produce Some");
+        assert_eq!(wire.incarnation, 3);
+
+        let back = wire_to_node_state(&wire).expect("valid wire entry");
+        assert_eq!(back.incarnation, 3);
+        assert_eq!(back.status, NodeStatus::Suspect);
     }
 }
