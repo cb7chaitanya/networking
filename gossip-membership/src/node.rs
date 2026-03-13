@@ -101,6 +101,8 @@ pub struct NodeConfig {
     pub gossip_fanout: usize,
     /// How long after becoming Dead before an entry is garbage-collected (ms).
     pub dead_retention_ms: u64,
+    /// Max membership entries to piggyback on PING/ACK messages.
+    pub piggyback_max: usize,
 }
 
 impl Default for NodeConfig {
@@ -114,6 +116,7 @@ impl Default for NodeConfig {
             indirect_probe_k: 2,
             gossip_fanout: 50,
             dead_retention_ms: 15_000,
+            piggyback_max: 6,
         }
     }
 }
@@ -130,6 +133,7 @@ impl NodeConfig {
             indirect_probe_k: 2,
             gossip_fanout: 50,
             dead_retention_ms: 1_000,
+            piggyback_max: 6,
         }
     }
 }

@@ -196,7 +196,8 @@ pub async fn run_node(
                     gossip::pick_random_peer(&node.table, node.id)
                 {
                     if !node.failure_det.is_probing(target_id) {
-                        let ping = build_ping(node.id, node.table.our_heartbeat());
+                        let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
+                        let ping = build_ping(node.id, node.table.our_heartbeat(), piggyback);
                         match node.transport.send_to(&ping, target_addr).await {
                             Ok(()) => {
                                 node.failure_det.record_probe_sent(target_id);
@@ -252,9 +253,15 @@ async fn handle_message(
             node.table.merge_digest(&states);
         }
 
-        MessagePayload::Ping => {
+        MessagePayload::Ping(ref entries) => {
+            // Merge piggybacked membership entries.
+            if !entries.is_empty() {
+                let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
+                node.table.merge_digest(&states);
+            }
             // Respond immediately with an ACK so the sender clears its probe.
-            let ack = build_ack(node.id, node.table.our_heartbeat());
+            let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
+            let ack = build_ack(node.id, node.table.our_heartbeat(), piggyback);
             if let Err(e) = node.transport.send_to(&ack, from_addr).await {
                 log::warn!("[node {}] ACK send failed to {from_addr}: {e}", node.id);
             } else {
@@ -267,7 +274,8 @@ async fn handle_message(
             // We do not wait for or forward the ACK — the requester has its
             // own timeout and will receive the ACK directly if the target is alive.
             let target_addr = SocketAddr::V4(req.target_addr);
-            let ping = build_ping(node.id, node.table.our_heartbeat());
+            let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
+            let ping = build_ping(node.id, node.table.our_heartbeat(), piggyback);
             if let Err(e) = node.transport.send_to(&ping, target_addr).await {
                 log::warn!(
                     "[node {}] indirect PING to {} failed: {e}",
@@ -283,13 +291,18 @@ async fn handle_message(
             }
         }
 
-        MessagePayload::Ack => {
-            // ACK was already handled above via `record_ack`.
+        MessagePayload::Ack(ref entries) => {
+            // Merge piggybacked membership entries.
+            if !entries.is_empty() {
+                let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
+                node.table.merge_digest(&states);
+            }
             log::trace!(
-                "[node {}] ACK from {} @ {}",
+                "[node {}] ACK from {} @ {} ({} piggybacked)",
                 node.id,
                 msg.sender_id,
-                from_addr
+                from_addr,
+                entries.len()
             );
         }
     }

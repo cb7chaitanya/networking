@@ -82,15 +82,26 @@ pub async fn run_test_node(
                             let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
                             node.table.merge_digest(&states);
                         }
-                        MessagePayload::Ping => {
-                            let ack = build_ack(node.id, node.table.our_heartbeat());
+                        MessagePayload::Ping(entries) => {
+                            if !entries.is_empty() {
+                                let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
+                                node.table.merge_digest(&states);
+                            }
+                            let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
+                            let ack = build_ack(node.id, node.table.our_heartbeat(), piggyback);
                             let _ = node.transport.send_to(&ack, from).await;
                         }
                         MessagePayload::PingReq(req) => {
-                            let ping = build_ping(node.id, node.table.our_heartbeat());
+                            let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
+                            let ping = build_ping(node.id, node.table.our_heartbeat(), piggyback);
                             let _ = node.transport.send_to(&ping, SocketAddr::V4(req.target_addr)).await;
                         }
-                        MessagePayload::Ack => {}
+                        MessagePayload::Ack(entries) => {
+                            if !entries.is_empty() {
+                                let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
+                                node.table.merge_digest(&states);
+                            }
+                        }
                     }
                 }
             }
@@ -137,7 +148,8 @@ pub async fn run_test_node(
 
                 if let Some((target_id, target_addr)) = gossip::pick_random_peer(&node.table, node.id) {
                     if !node.failure_det.is_probing(target_id) {
-                        let ping = build_ping(node.id, node.table.our_heartbeat());
+                        let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
+                        let ping = build_ping(node.id, node.table.our_heartbeat(), piggyback);
                         if node.transport.send_to(&ping, target_addr).await.is_ok() {
                             node.failure_det.record_probe_sent(target_id);
                         }
