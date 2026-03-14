@@ -42,6 +42,7 @@ pub mod kind {
     pub const PING_REQ: u8 = 0x03;
     pub const ACK: u8 = 0x04;
     pub const LEAVE: u8 = 0x05;
+    pub const ANTI_ENTROPY: u8 = 0x06;
 }
 
 // ── Flags ────────────────────────────────────────────────────────────────────
@@ -245,6 +246,49 @@ pub enum MessagePayload {
     /// identifies the departing node.  Receivers immediately mark the node
     /// as Dead, bypassing the Suspect phase.
     Leave,
+    /// Anti-entropy chunk: one fragment of a full membership table sync.
+    AntiEntropyChunk(AntiEntropyChunkPayload),
+}
+
+/// One chunk of a multi-part anti-entropy full table sync.
+///
+/// ```text
+///  Bytes 0-7   : table_version  (u64)  — monotonic snapshot id
+///  Bytes 8-9   : chunk_index    (u16)  — 0-based index of this chunk
+///  Bytes 10-11 : total_chunks   (u16)  — how many chunks make up the full table
+///  Bytes 12+   : entries        (variable) — WireNodeEntry sequence
+/// ```
+#[derive(Debug, Clone)]
+pub struct AntiEntropyChunkPayload {
+    pub table_version: u64,
+    pub chunk_index: u16,
+    pub total_chunks: u16,
+    pub entries: Vec<WireNodeEntry>,
+}
+
+pub const AE_CHUNK_HEADER: usize = 12; // 8 + 2 + 2
+
+impl AntiEntropyChunkPayload {
+    fn encode_into(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&self.table_version.to_be_bytes());
+        buf.extend_from_slice(&self.chunk_index.to_be_bytes());
+        buf.extend_from_slice(&self.total_chunks.to_be_bytes());
+        encode_node_entries(&self.entries, buf);
+    }
+
+    fn decode(buf: &[u8]) -> Option<(Self, usize)> {
+        if buf.len() < AE_CHUNK_HEADER {
+            return None;
+        }
+        let table_version = u64::from_be_bytes(buf[0..8].try_into().ok()?);
+        let chunk_index = u16::from_be_bytes(buf[8..10].try_into().ok()?);
+        let total_chunks = u16::from_be_bytes(buf[10..12].try_into().ok()?);
+        let entries = parse_node_entries(&buf[AE_CHUNK_HEADER..]).ok()?;
+        Some((
+            Self { table_version, chunk_index, total_chunks, entries },
+            buf.len(),
+        ))
+    }
 }
 
 /// Parse a payload buffer into a vector of `WireNodeEntry`.
@@ -354,6 +398,9 @@ impl Message {
             MessagePayload::Leave => {
                 // No payload body — header is sufficient.
             }
+            MessagePayload::AntiEntropyChunk(c) => {
+                c.encode_into(&mut payload_bytes);
+            }
         }
 
         let payload_len = payload_bytes.len();
@@ -453,6 +500,14 @@ impl Message {
             kind::LEAVE => {
                 MessagePayload::Leave
             }
+            kind::ANTI_ENTROPY => {
+                let (c, consumed) = AntiEntropyChunkPayload::decode(payload_buf)
+                    .ok_or(MessageError::MalformedPayload)?;
+                if consumed != payload_len {
+                    return Err(MessageError::MalformedPayload);
+                }
+                MessagePayload::AntiEntropyChunk(c)
+            }
             other => return Err(MessageError::UnknownKind(other)),
         };
 
@@ -538,6 +593,31 @@ pub fn build_ack(
         sender_incarnation,
         flags: 0,
         payload: MessagePayload::Ack(entries),
+    }
+}
+
+pub fn build_anti_entropy_chunk(
+    sender_id: u64,
+    sender_heartbeat: u32,
+    sender_incarnation: u32,
+    table_version: u64,
+    chunk_index: u16,
+    total_chunks: u16,
+    entries: Vec<WireNodeEntry>,
+) -> Message {
+    Message {
+        version: VERSION,
+        kind: kind::ANTI_ENTROPY,
+        sender_id,
+        sender_heartbeat,
+        sender_incarnation,
+        flags: 0,
+        payload: MessagePayload::AntiEntropyChunk(AntiEntropyChunkPayload {
+            table_version,
+            chunk_index,
+            total_chunks,
+            entries,
+        }),
     }
 }
 

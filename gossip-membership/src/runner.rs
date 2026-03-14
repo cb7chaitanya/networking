@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::anti_entropy::ChunkAssembler;
 use crate::failure_detector::FailureDetector;
 use crate::gossip;
 use crate::membership::{wire_to_node_state, MembershipTable};
@@ -30,6 +31,9 @@ pub struct Node {
     pub failure_det: FailureDetector,
     pub metrics: Metrics,
     pub pending_acks: PendingAcks,
+    pub chunk_assembler: ChunkAssembler,
+    /// Monotonic counter for anti-entropy table snapshots.
+    ae_version: u64,
 }
 
 impl Node {
@@ -48,6 +52,7 @@ impl Node {
             id,
             transport.local_addr
         );
+        let chunk_assembler = ChunkAssembler::new(Duration::from_secs(5));
         Self {
             id,
             config,
@@ -56,6 +61,8 @@ impl Node {
             failure_det,
             metrics: Metrics::default(),
             pending_acks,
+            chunk_assembler,
+            ae_version: 0,
         }
     }
 }
@@ -343,31 +350,43 @@ pub async fn run_node(
                 }
             }
 
-            // ── Branch 5: anti-entropy full sync ─────────────────────────────
+            // ── Branch 5: anti-entropy chunked sync ──────────────────────────
             _ = anti_entropy_tick.tick(), if anti_entropy_ms > 0 => {
                 if let Some((peer_id, peer_addr)) =
                     gossip::pick_random_peer(&node.table, node.id)
                 {
-                    let msg = gossip::build_full_sync_message(
-                        &node.table,
+                    node.ae_version = node.ae_version.wrapping_add(1);
+                    let entries = node.table.gossip_wire_entries(usize::MAX);
+                    let chunks = crate::anti_entropy::build_chunks(
+                        &entries,
                         node.id,
                         node.table.our_heartbeat(),
                         node.table.our_incarnation(),
+                        node.ae_version,
                     );
-                    match node.transport.send_to(&msg, peer_addr).await {
-                        Ok(()) => {
-                            node.metrics.anti_entropy_sent += 1;
-                            log::debug!(
-                                "[node {}] anti-entropy full sync → peer {} @ {}",
-                                node.id, peer_id, peer_addr
-                            );
+                    let n_chunks = chunks.len();
+                    for chunk_msg in chunks {
+                        match node.transport.send_to(&chunk_msg, peer_addr).await {
+                            Ok(()) => {
+                                node.metrics.anti_entropy_sent += 1;
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "[node {}] anti-entropy chunk send failed to {peer_addr}: {e}",
+                                    node.id
+                                );
+                                break;
+                            }
                         }
-                        Err(e) => log::warn!(
-                            "[node {}] anti-entropy send failed to {peer_addr}: {e}",
-                            node.id
-                        ),
                     }
+                    log::debug!(
+                        "[node {}] anti-entropy → peer {} @ {} ({} chunks, version {})",
+                        node.id, peer_id, peer_addr, n_chunks, node.ae_version
+                    );
                 }
+
+                // Expire stale incomplete assemblies.
+                node.chunk_assembler.expire(Instant::now());
             }
 
             // ── Branch 6: periodic metrics log ───────────────────────────────
@@ -515,6 +534,35 @@ async fn handle_message(
                 node.metrics.acks_sent += 1;
             }
             node.table.declare_dead(msg.sender_id);
+        }
+
+        MessagePayload::AntiEntropyChunk(ref chunk) => {
+            log::debug!(
+                "[node {}] anti-entropy chunk {}/{} from {} (version {})",
+                node.id,
+                chunk.chunk_index + 1,
+                chunk.total_chunks,
+                msg.sender_id,
+                chunk.table_version,
+            );
+            if let Some(all_entries) = node.chunk_assembler.feed(
+                msg.sender_id,
+                chunk.table_version,
+                chunk.chunk_index,
+                chunk.total_chunks,
+                chunk.entries.clone(),
+            ) {
+                let states: Vec<_> = all_entries.iter().filter_map(wire_to_node_state).collect();
+                log::debug!(
+                    "[node {}] anti-entropy assembly complete: {} entries from {}",
+                    node.id,
+                    states.len(),
+                    msg.sender_id,
+                );
+                for o in node.table.merge_digest(&states) {
+                    node.metrics.record_merge(o);
+                }
+            }
         }
     }
 }
