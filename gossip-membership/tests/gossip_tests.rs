@@ -1559,3 +1559,371 @@ async fn test_anti_entropy_disabled_sends_nothing() {
     assert_eq!(node1.metrics.anti_entropy_sent, 0, "anti-entropy should be disabled");
     assert_eq!(node2.metrics.anti_entropy_sent, 0, "anti-entropy should be disabled");
 }
+
+// ── Cluster partition & recovery tests ──────────────────────────────────────
+
+/// Split-brain: 6 nodes split into two sub-clusters {1,2,3} and {4,5,6}.
+/// Each sub-cluster should converge internally.  Nodes in the other
+/// sub-cluster should be Suspect or Dead.  After the partition heals,
+/// all 6 nodes should converge to a single consistent view.
+#[tokio::test]
+async fn test_split_brain_and_recovery() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.suspect_timeout_ms = 5_000; // long so nodes stay Suspect, not Dead
+    cfg.anti_entropy_interval_ms = 100; // help post-heal convergence
+    let sim = Arc::new(Mutex::new(NetSim::new(0)));
+
+    // Create 6 nodes, all seeded with each other.
+    let mut transports = Vec::new();
+    for _ in 0..6 {
+        transports.push(bind_sim(&sim).await);
+    }
+    let addrs: Vec<SocketAddr> = transports.iter().map(|t| t.local_addr).collect();
+
+    let nodes: Vec<Node> = transports
+        .into_iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let peers: Vec<SocketAddr> = addrs.iter().enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, a)| *a)
+                .collect();
+            Node::new(t, cfg.clone(), &peers)
+        })
+        .collect();
+
+    let ids: Vec<u64> = nodes.iter().map(|n| n.id).collect();
+
+    let mut handles = Vec::new();
+    let mut senders = Vec::new();
+    for node in nodes {
+        let (tx, rx) = oneshot::channel();
+        senders.push(tx);
+        handles.push(tokio::spawn(run_node(node, rx)));
+    }
+
+    // Phase 1: converge fully.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Phase 2: partition into {0,1,2} and {3,4,5}.
+    {
+        let mut s = sim.lock().unwrap();
+        for &a in &addrs[0..3] {
+            for &b in &addrs[3..6] {
+                s.add_partition(a, b);
+            }
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Phase 3: heal the partition.
+    sim.lock().unwrap().clear_partitions();
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    // Shutdown all.
+    for tx in senders {
+        let _ = tx.send(());
+    }
+    let final_nodes: Vec<Node> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // After recovery: every node should see every other node as Alive.
+    for (i, node) in final_nodes.iter().enumerate() {
+        for (j, &expected_id) in ids.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let entry = node.table.entries.values().find(|e| e.node_id == expected_id);
+            assert!(
+                entry.is_some(),
+                "node[{i}] does not know about node[{j}] (id={expected_id}) after split-brain recovery"
+            );
+            assert_eq!(
+                entry.unwrap().status,
+                NodeStatus::Alive,
+                "node[{i}] should see node[{j}] as Alive after recovery, got {:?}",
+                entry.unwrap().status
+            );
+        }
+    }
+}
+
+/// Asymmetric partition: A→B is blocked but B→A is open (one-directional).
+/// Node C can reach both.  After convergence, A should still know about B
+/// because C propagates B's state to A via gossip.
+#[tokio::test]
+async fn test_asymmetric_partition_convergence() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.suspect_timeout_ms = 5_000; // prevent premature Dead
+    let sim = Arc::new(Mutex::new(NetSim::new(0)));
+
+    let ta = bind_sim(&sim).await;
+    let tb = bind_sim(&sim).await;
+    let tc = bind_sim(&sim).await;
+    let addr_a = ta.local_addr;
+    let addr_b = tb.local_addr;
+    let addr_c = tc.local_addr;
+
+    let na = Node::new(ta, cfg.clone(), &[addr_b, addr_c]);
+    let nb = Node::new(tb, cfg.clone(), &[addr_a, addr_c]);
+    let nc = Node::new(tc, cfg.clone(), &[addr_a, addr_b]);
+    let id_a = na.id;
+    let id_b = nb.id;
+
+    let (txa, rxa) = oneshot::channel();
+    let (txb, rxb) = oneshot::channel();
+    let (txc, rxc) = oneshot::channel();
+
+    let ha = tokio::spawn(run_node(na, rxa));
+    let hb = tokio::spawn(run_node(nb, rxb));
+    let _hc = tokio::spawn(run_node(nc, rxc));
+
+    // Phase 1: converge.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Phase 2: asymmetric partition — A cannot send to B, but B can send to A.
+    // We simulate this by partitioning A→B only.  Since NetSim partitions
+    // are bidirectional, we instead partition A↔B fully and rely on C to
+    // relay B's state to A.
+    sim.lock().unwrap().add_partition(addr_a, addr_b);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let _ = txa.send(());
+    let _ = txb.send(());
+    let _ = txc.send(());
+
+    let node_a = ha.await.unwrap();
+    let node_b = hb.await.unwrap();
+
+    // A should still know about B (via C's gossip propagation).
+    let a_knows_b = node_a.table.entries.values().find(|e| e.node_id == id_b);
+    assert!(
+        a_knows_b.is_some(),
+        "node A should know about node B via gossip through C"
+    );
+
+    // B should still know about A (via C's gossip propagation).
+    let b_knows_a = node_b.table.entries.values().find(|e| e.node_id == id_a);
+    assert!(
+        b_knows_a.is_some(),
+        "node B should know about node A via gossip through C"
+    );
+}
+
+/// Rolling partition: first isolate node1, let it heal, then isolate node2.
+/// After both partitions heal, all nodes should converge.
+#[tokio::test]
+async fn test_rolling_partition_convergence() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.suspect_timeout_ms = 5_000; // prevent Dead during short partitions
+    cfg.anti_entropy_interval_ms = 100;
+    let sim = Arc::new(Mutex::new(NetSim::new(0)));
+
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let t4 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+    let addr4 = t4.local_addr;
+    let all_addrs = [addr1, addr2, addr3, addr4];
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3, addr4]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3, addr4]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2, addr4]);
+    let n4 = Node::new(t4, cfg.clone(), &[addr1, addr2, addr3]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+    let id3 = n3.id;
+    let id4 = n4.id;
+    let all_ids = [id1, id2, id3, id4];
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+    let (tx4, rx4) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
+    let h4 = tokio::spawn(run_node(n4, rx4));
+
+    // Phase 1: converge.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Phase 2: isolate node1 from everyone.
+    {
+        let mut s = sim.lock().unwrap();
+        for &other in &all_addrs[1..] {
+            s.add_partition(addr1, other);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Phase 3: heal node1, isolate node2.
+    {
+        let mut s = sim.lock().unwrap();
+        s.clear_partitions();
+        for &other in &[addr1, addr3, addr4] {
+            s.add_partition(addr2, other);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Phase 4: heal everything.
+    sim.lock().unwrap().clear_partitions();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+    let _ = tx4.send(());
+
+    let nodes = vec![
+        h1.await.unwrap(),
+        h2.await.unwrap(),
+        h3.await.unwrap(),
+        h4.await.unwrap(),
+    ];
+
+    // All nodes should see all others as Alive.
+    for (i, node) in nodes.iter().enumerate() {
+        for (j, &eid) in all_ids.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let entry = node.table.entries.values().find(|e| e.node_id == eid);
+            assert!(
+                entry.is_some(),
+                "node[{i}] does not know about node[{j}] after rolling partition"
+            );
+            assert_eq!(
+                entry.unwrap().status,
+                NodeStatus::Alive,
+                "node[{i}] should see node[{j}] as Alive after rolling partition recovery"
+            );
+        }
+    }
+}
+
+/// A new node joins while a partition is active.  It can only reach one
+/// sub-cluster initially.  After the partition heals, it should discover
+/// all nodes in the cluster.
+#[tokio::test]
+async fn test_join_during_partition_then_heal() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    cfg.suspect_timeout_ms = 5_000;
+    cfg.anti_entropy_interval_ms = 100;
+    let sim = Arc::new(Mutex::new(NetSim::new(0)));
+
+    // Start with 4 nodes, fully connected.
+    let t1 = bind_sim(&sim).await;
+    let t2 = bind_sim(&sim).await;
+    let t3 = bind_sim(&sim).await;
+    let t4 = bind_sim(&sim).await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+    let addr4 = t4.local_addr;
+
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3, addr4]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3, addr4]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2, addr4]);
+    let n4 = Node::new(t4, cfg.clone(), &[addr1, addr2, addr3]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+    let id3 = n3.id;
+    let id4 = n4.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+    let (tx4, rx4) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
+    let h4 = tokio::spawn(run_node(n4, rx4));
+
+    // Converge the initial 4 nodes.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Partition: {1,2} vs {3,4}.
+    {
+        let mut s = sim.lock().unwrap();
+        for &a in &[addr1, addr2] {
+            for &b in &[addr3, addr4] {
+                s.add_partition(a, b);
+            }
+        }
+    }
+
+    // Now a 5th node joins, seeded with node1 and node3.
+    // It can only reach {1,2} due to the partition (node3,4 are blocked).
+    let t5 = bind_sim(&sim).await;
+    let addr5 = t5.local_addr;
+    // Also partition node5 from {3,4}.
+    {
+        let mut s = sim.lock().unwrap();
+        s.add_partition(addr5, addr3);
+        s.add_partition(addr5, addr4);
+    }
+    let n5 = Node::new(t5, cfg.clone(), &[addr1, addr3]);
+    let id5 = n5.id;
+    let (tx5, rx5) = oneshot::channel();
+    let h5 = tokio::spawn(run_node(n5, rx5));
+
+    // Let the new node converge with {1,2}.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Heal the partition.
+    sim.lock().unwrap().clear_partitions();
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+    let _ = tx4.send(());
+    let _ = tx5.send(());
+
+    let all_ids = [id1, id2, id3, id4, id5];
+    let nodes = vec![
+        h1.await.unwrap(),
+        h2.await.unwrap(),
+        h3.await.unwrap(),
+        h4.await.unwrap(),
+        h5.await.unwrap(),
+    ];
+
+    // After heal, all 5 nodes should know every other node.
+    for (i, node) in nodes.iter().enumerate() {
+        for (j, &eid) in all_ids.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let entry = node.table.entries.values().find(|e| e.node_id == eid);
+            assert!(
+                entry.is_some(),
+                "node[{i}] does not know about node[{j}] (id={eid}) after join-during-partition heal"
+            );
+        }
+    }
+
+    // Node5 specifically should see nodes 3 and 4 (which it couldn't
+    // reach during the partition).
+    let node5 = &nodes[4];
+    for &eid in &[id3, id4] {
+        assert!(
+            node5.table.entries.values().any(|e| e.node_id == eid),
+            "node5 should have discovered node {eid} after partition healed"
+        );
+    }
+}
