@@ -2005,3 +2005,55 @@ async fn test_metrics_http_endpoint() {
     h1.await.unwrap();
     h2.await.unwrap();
 }
+
+// ── Inbound rate limiting tests ─────────────────────────────────────────────
+
+/// A peer sending 1000 packets rapidly should have most of them dropped
+/// by the inbound rate limiter.
+#[tokio::test]
+async fn test_inbound_rate_limiting_drops_flood() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let mut cfg = NodeConfig::fast();
+    // Tight rate limits: 20 burst per peer, no refill.
+    cfg.inbound_global_capacity = 1000;
+    cfg.inbound_global_refill_rate = 0;
+    cfg.inbound_peer_capacity = 20;
+    cfg.inbound_peer_refill_rate = 0;
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let addr2 = t2.local_addr;
+
+    let raw_socket = t1.clone_socket();
+
+    // Node 2 has rate limiting enabled.
+    let n2 = Node::new(t2, cfg.clone(), &[]);
+    let (tx2, rx2) = oneshot::channel();
+    let h2 = tokio::spawn(run_node(n2, rx2));
+
+    // Flood 1000 valid packets from t1 to t2 as fast as possible.
+    let valid = gossip_membership::message::build_ping(1, 0, 0, vec![])
+        .encode()
+        .unwrap();
+    for _ in 0..1000 {
+        let _ = raw_socket.send_to(&valid, addr2).await;
+    }
+
+    // Give node2 time to process.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let _ = tx2.send(());
+    let node2 = h2.await.unwrap();
+
+    // Drain the counter manually since metrics tick may not have fired.
+    let dropped = node2.transport.rate_limited_count
+        .load(std::sync::atomic::Ordering::Relaxed)
+        + node2.metrics.rate_limited;
+
+    // With 20 peer capacity and no refill, at most 20 should pass.
+    // The rest (~980) should be rate-limited.
+    assert!(
+        dropped >= 900,
+        "expected >=900 packets dropped by rate limiter, got {dropped}"
+    );
+}

@@ -37,7 +37,18 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(transport: Transport, config: NodeConfig, peers: &[SocketAddr]) -> Self {
+    pub fn new(mut transport: Transport, config: NodeConfig, peers: &[SocketAddr]) -> Self {
+        // Attach inbound rate limiter if configured.
+        if config.inbound_global_capacity > 0 {
+            transport = transport.with_rate_limit(
+                crate::rate_limit::RateLimitConfig {
+                    global_capacity: config.inbound_global_capacity,
+                    global_refill_rate: config.inbound_global_refill_rate,
+                    peer_capacity: config.inbound_peer_capacity,
+                    peer_refill_rate: config.inbound_peer_refill_rate,
+                },
+            );
+        }
         let id = generate_node_id(transport.local_addr);
         let mut table = MembershipTable::new(id, transport.local_addr);
         for &peer_addr in peers {
@@ -391,6 +402,9 @@ pub async fn run_node(
 
             // ── Branch 6: periodic metrics log ───────────────────────────────
             _ = metrics_tick.tick(), if metrics_ms > 0 => {
+                // Drain rate-limited counter from transport into metrics.
+                node.metrics.rate_limited += node.transport.rate_limited_count
+                    .swap(0, std::sync::atomic::Ordering::Relaxed);
                 let (alive, suspect, dead) = node.table.status_counts();
                 log::info!(
                     "[metrics] {}",

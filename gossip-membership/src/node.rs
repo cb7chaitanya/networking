@@ -137,6 +137,15 @@ pub struct NodeConfig {
     /// Anti-entropy pushes the full membership table to one random peer,
     /// ensuring convergence even under sustained packet loss.
     pub anti_entropy_interval_ms: u64,
+    /// Inbound rate limiting: global token bucket capacity (burst).
+    /// 0 = disabled (no rate limiting).
+    pub inbound_global_capacity: u32,
+    /// Inbound rate limiting: global tokens refilled per second.
+    pub inbound_global_refill_rate: u32,
+    /// Inbound rate limiting: per-peer token bucket capacity (burst).
+    pub inbound_peer_capacity: u32,
+    /// Inbound rate limiting: per-peer tokens refilled per second.
+    pub inbound_peer_refill_rate: u32,
     /// Timeout before retransmitting a REQUEST_ACK message (ms).
     pub reliable_ack_timeout_ms: u64,
     /// Maximum number of retransmission attempts for REQUEST_ACK messages.
@@ -163,6 +172,10 @@ impl Default for NodeConfig {
             metrics_log_interval_ms: 10_000,
             metrics_server_port: 0, // disabled by default
             anti_entropy_interval_ms: 10_000,
+            inbound_global_capacity: 1000,
+            inbound_global_refill_rate: 500,
+            inbound_peer_capacity: 100,
+            inbound_peer_refill_rate: 50,
             reliable_ack_timeout_ms: 500,
             reliable_max_retries: 3,
         }
@@ -190,6 +203,10 @@ impl NodeConfig {
             metrics_log_interval_ms: 0, // disabled in tests
             metrics_server_port: 0, // disabled in tests
             anti_entropy_interval_ms: 0, // disabled by default in tests
+            inbound_global_capacity: 0, // disabled in tests
+            inbound_global_refill_rate: 0,
+            inbound_peer_capacity: 0,
+            inbound_peer_refill_rate: 0,
             reliable_ack_timeout_ms: 50,
             reliable_max_retries: 3,
         }

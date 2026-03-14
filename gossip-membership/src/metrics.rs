@@ -59,6 +59,10 @@ pub struct Metrics {
     /// Full-sync anti-entropy messages sent.
     pub anti_entropy_sent: u64,
 
+    // ── Rate limiting ─────────────────────────────────────────────────────
+    /// Inbound packets dropped by the rate limiter.
+    pub rate_limited: u64,
+
     // ── Reliable delivery ───────────────────────────────────────────────────
     /// REQUEST_ACK messages retransmitted after timeout.
     pub reliable_retries: u64,
@@ -114,6 +118,7 @@ impl Metrics {
         counter!("swim_merges_updated_total", "Existing entries updated.", self.merges_updated);
         counter!("swim_merges_stale_total", "Stale entries rejected.", self.merges_stale);
         counter!("swim_anti_entropy_sent_total", "Anti-entropy full syncs sent.", self.anti_entropy_sent);
+        counter!("swim_rate_limited_total", "Inbound packets dropped by rate limiter.", self.rate_limited);
         counter!("swim_reliable_retries_total", "REQUEST_ACK retransmissions.", self.reliable_retries);
         counter!("swim_reliable_exhausted_total", "REQUEST_ACK retries exhausted.", self.reliable_exhausted);
 
@@ -127,7 +132,7 @@ impl Metrics {
     /// Format as a JSON object for log-based dashboards.
     pub fn json(&self, alive: usize, suspect: usize, dead: usize) -> String {
         format!(
-            r#"{{"gossip_rounds":{},"gossip_sent":{},"gossip_recv":{},"pings_sent":{},"pings_recv":{},"acks_sent":{},"acks_recv":{},"ping_reqs_sent":{},"ping_reqs_recv":{},"probe_direct_timeouts":{},"probe_failures":{},"merges_new":{},"merges_updated":{},"merges_stale":{},"anti_entropy_sent":{},"reliable_retries":{},"reliable_exhausted":{},"alive":{},"suspect":{},"dead":{}}}"#,
+            r#"{{"gossip_rounds":{},"gossip_sent":{},"gossip_recv":{},"pings_sent":{},"pings_recv":{},"acks_sent":{},"acks_recv":{},"ping_reqs_sent":{},"ping_reqs_recv":{},"probe_direct_timeouts":{},"probe_failures":{},"merges_new":{},"merges_updated":{},"merges_stale":{},"anti_entropy_sent":{},"rate_limited":{},"reliable_retries":{},"reliable_exhausted":{},"alive":{},"suspect":{},"dead":{}}}"#,
             self.gossip_rounds, self.gossip_sent, self.gossip_recv,
             self.pings_sent, self.pings_recv,
             self.acks_sent, self.acks_recv,
@@ -135,6 +140,7 @@ impl Metrics {
             self.probe_direct_timeouts, self.probe_failures,
             self.merges_new, self.merges_updated, self.merges_stale,
             self.anti_entropy_sent,
+            self.rate_limited,
             self.reliable_retries, self.reliable_exhausted,
             alive, suspect, dead,
         )
@@ -148,7 +154,7 @@ impl Metrics {
              ping_reqs_sent={} ping_reqs_recv={} \
              probe_direct_timeouts={} probe_failures={} \
              merges_new={} merges_updated={} merges_stale={} \
-             anti_entropy_sent={} \
+             anti_entropy_sent={} rate_limited={} \
              reliable_retries={} reliable_exhausted={} \
              alive={} suspect={} dead={}",
             self.gossip_rounds,
@@ -166,6 +172,7 @@ impl Metrics {
             self.merges_updated,
             self.merges_stale,
             self.anti_entropy_sent,
+            self.rate_limited,
             self.reliable_retries,
             self.reliable_exhausted,
             alive,

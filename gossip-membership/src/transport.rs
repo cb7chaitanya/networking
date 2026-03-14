@@ -15,6 +15,7 @@ use tokio::net::UdpSocket;
 
 use crate::crypto::{ClusterKey, CryptoError};
 use crate::message::{Message, MessageError};
+use crate::rate_limit::{InboundRateLimiter, RateLimitConfig};
 use crate::simulator::NetSim;
 
 /// Practical UDP MTU ceiling — avoids fragmentation on most Ethernet paths.
@@ -56,6 +57,9 @@ pub struct Transport {
     socket: Arc<UdpSocket>,
     key: Option<ClusterKey>,
     sim: Option<Arc<Mutex<NetSim>>>,
+    rate_limiter: Option<Mutex<InboundRateLimiter>>,
+    /// Count of packets dropped by rate limiting (caller reads this).
+    pub rate_limited_count: std::sync::atomic::AtomicU64,
 }
 
 impl Transport {
@@ -68,6 +72,8 @@ impl Transport {
             socket: Arc::new(socket),
             key: None,
             sim: None,
+            rate_limiter: None,
+            rate_limited_count: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -80,6 +86,12 @@ impl Transport {
     /// Attach a network simulator for testing under adverse conditions.
     pub fn with_sim(mut self, sim: Arc<Mutex<NetSim>>) -> Self {
         self.sim = Some(sim);
+        self
+    }
+
+    /// Attach an inbound rate limiter.
+    pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
+        self.rate_limiter = Some(Mutex::new(InboundRateLimiter::new(&config)));
         self
     }
 
@@ -135,6 +147,17 @@ impl Transport {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             let (n, from) = self.socket.recv_from(&mut buf).await?;
+
+            // Rate-limit check before spending CPU on decode.
+            if let Some(rl) = &self.rate_limiter {
+                if !rl.lock().unwrap().allow(from, std::time::Instant::now()) {
+                    self.rate_limited_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    log::trace!("[transport] rate-limited datagram from {from}");
+                    continue;
+                }
+            }
+
             match self.decode_datagram(&buf[..n]) {
                 Ok(msg) => return Ok((msg, from)),
                 Err(e) => {
