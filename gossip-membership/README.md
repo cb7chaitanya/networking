@@ -173,6 +173,12 @@ docker compose up -d
 - **Prometheus**: http://localhost:9090
 - **Grafana**: http://localhost:3000 (admin/admin) — dashboard: "SWIM Gossip Protocol"
 
+### Grafana Dashboard
+
+![Cluster Membership, Gossip Throughput, Probe Activity, Failure Detection](docs/grafana-dashboard-top.png)
+
+![Merge Outcomes, Reliable Delivery, Gossip Rounds, Total Messages](docs/grafana-dashboard-bottom.png)
+
 ### Metrics exposed
 
 | Metric | Type | Description |
