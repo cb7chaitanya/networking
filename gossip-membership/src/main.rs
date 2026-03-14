@@ -21,7 +21,7 @@ use gossip_membership::failure_detector::FailureDetector;
 use gossip_membership::gossip;
 use gossip_membership::membership::{wire_to_node_state, MembershipTable};
 use gossip_membership::message::{
-    build_ack, build_ping, build_ping_req, MessagePayload,
+    build_ack, build_leave, build_ping, build_ping_req, MessagePayload,
 };
 use gossip_membership::metrics::Metrics;
 use gossip_membership::node::{generate_node_id, NodeConfig, NodeId};
@@ -116,7 +116,18 @@ pub async fn run_node(
         tokio::select! {
             // ── Shutdown signal ────────────────────────────────────────────────
             _ = &mut shutdown_rx => {
-                log::info!("[node {}] shutting down", node.id);
+                log::info!("[node {}] broadcasting LEAVE and shutting down", node.id);
+                let leave = build_leave(
+                    node.id,
+                    node.table.our_heartbeat(),
+                    node.table.our_incarnation(),
+                );
+                let live = node.table.live_nodes();
+                for peer_id in &live {
+                    if let Some(e) = node.table.entries.get(peer_id) {
+                        let _ = node.transport.send_to(&leave, e.addr).await;
+                    }
+                }
                 break;
             }
 
@@ -372,6 +383,16 @@ async fn handle_message(
                 from_addr,
                 entries.len()
             );
+        }
+
+        MessagePayload::Leave => {
+            log::info!(
+                "[node {}] LEAVE from {} @ {} — marking Dead immediately",
+                node.id,
+                msg.sender_id,
+                from_addr,
+            );
+            node.table.declare_dead(msg.sender_id);
         }
     }
 }

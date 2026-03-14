@@ -32,6 +32,7 @@ pub mod kind {
     pub const PING: u8 = 0x02;
     pub const PING_REQ: u8 = 0x03;
     pub const ACK: u8 = 0x04;
+    pub const LEAVE: u8 = 0x05;
 }
 
 // ── Flags ────────────────────────────────────────────────────────────────────
@@ -231,6 +232,10 @@ pub enum MessagePayload {
     PingReq(PingReqPayload),
     /// Probe acknowledgement.  Carries piggybacked membership entries (may be empty).
     Ack(Vec<WireNodeEntry>),
+    /// Graceful leave notification.  No payload — the header's sender_id
+    /// identifies the departing node.  Receivers immediately mark the node
+    /// as Dead, bypassing the Suspect phase.
+    Leave,
 }
 
 /// Parse a payload buffer into a vector of `WireNodeEntry`.
@@ -321,6 +326,9 @@ impl Message {
             MessagePayload::PingReq(p) => {
                 p.encode_into(&mut payload_bytes);
             }
+            MessagePayload::Leave => {
+                // No payload body — header is sufficient.
+            }
         }
 
         let payload_len = payload_bytes.len();
@@ -399,6 +407,9 @@ impl Message {
             }
             kind::ACK => {
                 MessagePayload::Ack(parse_node_entries(payload_buf)?)
+            }
+            kind::LEAVE => {
+                MessagePayload::Leave
             }
             other => return Err(MessageError::UnknownKind(other)),
         };
@@ -480,6 +491,21 @@ pub fn build_ack(
         sender_incarnation,
         flags: 0,
         payload: MessagePayload::Ack(entries),
+    }
+}
+
+pub fn build_leave(
+    sender_id: u64,
+    sender_heartbeat: u32,
+    sender_incarnation: u32,
+) -> Message {
+    Message {
+        kind: kind::LEAVE,
+        sender_id,
+        sender_heartbeat,
+        sender_incarnation,
+        flags: 0,
+        payload: MessagePayload::Leave,
     }
 }
 
@@ -753,6 +779,18 @@ mod tests {
             u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
         assert_ne!(stored, 0, "checksum of a non-zero buffer must not be 0");
         assert!(Message::decode(&buf).is_ok());
+    }
+
+    #[test]
+    fn roundtrip_leave() {
+        let msg = build_leave(99, 42, 3);
+        let buf = msg.encode().unwrap();
+        assert_eq!(buf.len(), HEADER_LEN); // no payload
+        let decoded = Message::decode(&buf).unwrap();
+        assert_eq!(decoded.sender_id, 99);
+        assert_eq!(decoded.sender_heartbeat, 42);
+        assert_eq!(decoded.sender_incarnation, 3);
+        assert!(matches!(decoded.payload, MessagePayload::Leave));
     }
 
     #[test]

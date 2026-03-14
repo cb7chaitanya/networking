@@ -24,7 +24,7 @@ use gossip_membership::{
     failure_detector::FailureDetector,
     gossip,
     membership::{placeholder_id_for, wire_to_node_state},
-    message::{build_ack, build_ping, build_ping_req, MessagePayload},
+    message::{build_ack, build_leave, build_ping, build_ping_req, MessagePayload},
     node::{generate_node_id, NodeState},
 };
 
@@ -69,7 +69,21 @@ pub async fn run_test_node(
 
     loop {
         tokio::select! {
-            _ = &mut shutdown_rx => break,
+            _ = &mut shutdown_rx => {
+                // Broadcast LEAVE to all live peers before stopping.
+                let leave = build_leave(
+                    node.id,
+                    node.table.our_heartbeat(),
+                    node.table.our_incarnation(),
+                );
+                let live = node.table.live_nodes();
+                for peer_id in &live {
+                    if let Some(e) = node.table.entries.get(peer_id) {
+                        let _ = node.transport.send_to(&leave, e.addr).await;
+                    }
+                }
+                break;
+            }
 
             result = node.transport.recv_from() => {
                 if let Ok((msg, from)) = result {
@@ -120,6 +134,9 @@ pub async fn run_test_node(
                                     node.metrics.record_merge(o);
                                 }
                             }
+                        }
+                        MessagePayload::Leave => {
+                            node.table.declare_dead(msg.sender_id);
                         }
                     }
                 }
@@ -1091,4 +1108,126 @@ async fn test_metrics_collected_after_convergence() {
     let summary = node1.metrics.summary(alive, suspect, dead);
     assert!(summary.contains("gossip_rounds="));
     assert!(summary.contains("alive="));
+}
+
+// ── Leave tests ──────────────────────────────────────────────────────────────
+
+/// When a node shuts down gracefully it broadcasts LEAVE. Peers that
+/// receive the LEAVE should immediately mark it Dead (no Suspect phase).
+#[tokio::test]
+async fn test_graceful_leave_marks_dead() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
+    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let id1 = n1.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_test_node(n1, rx1));
+    let h2 = tokio::spawn(run_test_node(n2, rx2));
+
+    // Let nodes converge first.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Gracefully shut down node1 (broadcasts LEAVE).
+    let _ = tx1.send(());
+    let _node1 = h1.await.unwrap();
+
+    // Give node2 time to process the LEAVE message.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Shut down node2 and inspect its table.
+    let _ = tx2.send(());
+    let node2 = h2.await.unwrap();
+
+    let status = node2
+        .table
+        .entries
+        .values()
+        .find(|e| e.node_id == id1)
+        .map(|e| e.status);
+
+    assert_eq!(
+        status,
+        Some(NodeStatus::Dead),
+        "node2 should have marked node1 as Dead after receiving LEAVE, got {status:?}"
+    );
+}
+
+/// In a three-node cluster, when one node leaves, the remaining two should
+/// still see each other as Alive and the departed node as Dead.
+#[tokio::test]
+async fn test_leave_does_not_affect_remaining_nodes() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let t3 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let n1 = TestNode::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = TestNode::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = TestNode::new(t3, cfg.clone(), &[addr1, addr2]);
+    let id1 = n1.id;
+    let id2 = n2.id;
+    let id3 = n3.id;
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_test_node(n1, rx1));
+    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h3 = tokio::spawn(run_test_node(n3, rx3));
+
+    // Converge.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Node1 leaves gracefully.
+    let _ = tx1.send(());
+    let _node1 = h1.await.unwrap();
+
+    // Let the LEAVE propagate and remaining nodes gossip.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+    let node2 = h2.await.unwrap();
+    let node3 = h3.await.unwrap();
+
+    // Node1 should be Dead on both remaining nodes.
+    for (name, node) in [("node2", &node2), ("node3", &node3)] {
+        let status = node
+            .table
+            .entries
+            .values()
+            .find(|e| e.node_id == id1)
+            .map(|e| e.status);
+        assert_eq!(
+            status,
+            Some(NodeStatus::Dead),
+            "{name} should see node1 as Dead after LEAVE"
+        );
+    }
+
+    // Remaining nodes should still see each other as Alive.
+    assert!(
+        node2.table.entries.values().any(|e| e.node_id == id3 && e.status == NodeStatus::Alive),
+        "node2 should still see node3 as Alive"
+    );
+    assert!(
+        node3.table.entries.values().any(|e| e.node_id == id2 && e.status == NodeStatus::Alive),
+        "node3 should still see node2 as Alive"
+    );
 }
