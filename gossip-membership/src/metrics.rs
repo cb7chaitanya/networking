@@ -54,6 +54,12 @@ pub struct Metrics {
     pub merges_updated: u64,
     /// Incoming entries rejected as stale (merge conflicts).
     pub merges_stale: u64,
+
+    // ── Reliable delivery ───────────────────────────────────────────────────
+    /// REQUEST_ACK messages retransmitted after timeout.
+    pub reliable_retries: u64,
+    /// REQUEST_ACK messages that exhausted all retries without receiving an ACK.
+    pub reliable_exhausted: u64,
 }
 
 impl Metrics {
@@ -75,6 +81,7 @@ impl Metrics {
              ping_reqs_sent={} ping_reqs_recv={} \
              probe_direct_timeouts={} probe_failures={} \
              merges_new={} merges_updated={} merges_stale={} \
+             reliable_retries={} reliable_exhausted={} \
              alive={} suspect={} dead={}",
             self.gossip_rounds,
             self.gossip_sent,
@@ -90,6 +97,8 @@ impl Metrics {
             self.merges_new,
             self.merges_updated,
             self.merges_stale,
+            self.reliable_retries,
+            self.reliable_exhausted,
             alive,
             suspect,
             dead,

@@ -5,4 +5,5 @@ pub mod membership;
 pub mod message;
 pub mod metrics;
 pub mod node;
+pub mod reliable;
 pub mod transport;

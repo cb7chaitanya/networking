@@ -270,6 +270,19 @@ pub struct Message {
     pub payload: MessagePayload,
 }
 
+impl Message {
+    /// Set the REQUEST_ACK flag so the receiver responds with an ACK.
+    pub fn with_request_ack(mut self) -> Self {
+        self.flags |= flags::REQUEST_ACK;
+        self
+    }
+
+    /// Returns `true` if the REQUEST_ACK flag is set.
+    pub fn requests_ack(&self) -> bool {
+        self.flags & flags::REQUEST_ACK != 0
+    }
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 #[derive(Debug)]
 pub enum MessageError {

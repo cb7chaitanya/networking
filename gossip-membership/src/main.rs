@@ -25,6 +25,7 @@ use gossip_membership::message::{
 };
 use gossip_membership::metrics::Metrics;
 use gossip_membership::node::{generate_node_id, NodeConfig, NodeId};
+use gossip_membership::reliable::PendingAcks;
 use gossip_membership::transport::Transport;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
@@ -57,6 +58,7 @@ pub struct Node {
     table: MembershipTable,
     failure_det: FailureDetector,
     pub metrics: Metrics,
+    pending_acks: PendingAcks,
 }
 
 impl Node {
@@ -68,6 +70,8 @@ impl Node {
         }
         let failure_det =
             FailureDetector::new(Duration::from_millis(config.probe_timeout_ms));
+        let pending_acks =
+            PendingAcks::new(Duration::from_millis(config.reliable_ack_timeout_ms));
         log::info!(
             "[node] started id={} addr={}",
             id,
@@ -80,6 +84,7 @@ impl Node {
             table,
             failure_det,
             metrics: Metrics::default(),
+            pending_acks,
         }
     }
 }
@@ -121,7 +126,7 @@ pub async fn run_node(
                     node.id,
                     node.table.our_heartbeat(),
                     node.table.our_incarnation(),
-                );
+                ).with_request_ack();
                 let live = node.table.live_nodes();
                 for peer_id in &live {
                     if let Some(e) = node.table.entries.get(peer_id) {
@@ -248,6 +253,18 @@ pub async fn run_node(
                 // Step 3: garbage-collect old Dead entries.
                 node.table.gc_dead(Duration::from_millis(node.config.dead_retention_ms));
 
+                // Step 3b: retransmit REQUEST_ACK messages that timed out.
+                let retry_result = node.pending_acks.collect_retries(now);
+                for (target_id, retry_msg, target_addr) in retry_result.retransmits {
+                    node.metrics.reliable_retries += 1;
+                    log::debug!(
+                        "[node {}] retransmitting REQUEST_ACK message to {} @ {}",
+                        node.id, target_id, target_addr
+                    );
+                    let _ = node.transport.send_to(&retry_msg, target_addr).await;
+                }
+                node.metrics.reliable_exhausted += retry_result.exhausted as u64;
+
                 // Step 4: probe one random live node.
                 if let Some((target_id, target_addr)) =
                     gossip::pick_random_peer(&node.table, node.id)
@@ -310,6 +327,9 @@ async fn handle_message(
     // If we had an in-flight probe for this sender, an incoming message resolves it.
     node.failure_det.record_ack(msg.sender_id);
 
+    // Clear any pending reliable-delivery entry for this sender.
+    node.pending_acks.ack(msg.sender_id);
+
     match &msg.payload {
         MessagePayload::Gossip(entries) => {
             node.metrics.gossip_recv += 1;
@@ -322,6 +342,13 @@ async fn handle_message(
             );
             for o in node.table.merge_digest(&states) {
                 node.metrics.record_merge(o);
+            }
+            // Respond with ACK if the sender requested reliable delivery.
+            if msg.requests_ack() {
+                let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), vec![]);
+                if node.transport.send_to(&ack, from_addr).await.is_ok() {
+                    node.metrics.acks_sent += 1;
+                }
             }
         }
 
@@ -392,6 +419,13 @@ async fn handle_message(
                 msg.sender_id,
                 from_addr,
             );
+            // Respond with ACK before marking dead so the departing node
+            // knows we received its LEAVE.
+            if msg.requests_ack() {
+                let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), vec![]);
+                let _ = node.transport.send_to(&ack, from_addr).await;
+                node.metrics.acks_sent += 1;
+            }
             node.table.declare_dead(msg.sender_id);
         }
     }
