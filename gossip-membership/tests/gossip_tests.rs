@@ -2,7 +2,6 @@
 ///
 /// Each test spawns multiple in-process nodes (real UDP sockets on 127.0.0.1:0),
 /// allows gossip to converge, then asserts on the final membership tables.
-/// This mirrors the pattern in tcp-over-udp's `tests/gbn_tests.rs`.
 ///
 /// Note: NodeConfig::fast() is used so tests complete in < 2 seconds.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -11,236 +10,11 @@ use std::time::Duration;
 use tokio::sync::oneshot;
 
 use gossip_membership::crypto::ClusterKey;
-use gossip_membership::membership::MembershipTable;
-use gossip_membership::metrics::Metrics;
 use gossip_membership::node::{NodeConfig, NodeStatus};
+use gossip_membership::runner::{run_node, Node};
 use gossip_membership::transport::Transport;
 
-// Re-export the public run_node from main is not possible directly; we use
-// the library's public items and duplicate the minimal harness here.
-// The Node and run_node are pub in main.rs (compiled as a binary).
-// For tests we use the library crate's public surface and copy the runner.
-use gossip_membership::{
-    failure_detector::FailureDetector,
-    gossip,
-    membership::{placeholder_id_for, wire_to_node_state},
-    message::{build_ack, build_leave, build_ping, build_ping_req, MessagePayload},
-    node::{generate_node_id, NodeState},
-    reliable::PendingAcks,
-};
-
-// ── Minimal in-test node runner ───────────────────────────────────────────────
-// We inline a stripped copy of run_node so the test crate does not need to
-// import from the binary crate.  (Importing from a [[bin]] is not supported.)
-
-pub struct TestNode {
-    pub id: u64,
-    pub config: NodeConfig,
-    transport: Transport,
-    pub table: MembershipTable,
-    failure_det: FailureDetector,
-    pub metrics: Metrics,
-    pub pending_acks: PendingAcks,
-}
-
-impl TestNode {
-    pub fn new(transport: Transport, config: NodeConfig, peers: &[SocketAddr]) -> Self {
-        let id = generate_node_id(transport.local_addr);
-        let mut table = MembershipTable::new(id, transport.local_addr);
-        for &p in peers {
-            table.add_bootstrap_peer(p);
-        }
-        let failure_det = FailureDetector::new(Duration::from_millis(config.probe_timeout_ms));
-        let pending_acks = PendingAcks::new(Duration::from_millis(config.reliable_ack_timeout_ms));
-        Self { id, config, transport, table, failure_det, metrics: Metrics::default(), pending_acks }
-    }
-}
-
-pub async fn run_test_node(
-    mut node: TestNode,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) -> TestNode {
-    let mut gossip_tick =
-        tokio::time::interval(Duration::from_millis(node.config.gossip_interval_ms));
-    let mut hb_tick =
-        tokio::time::interval(Duration::from_millis(node.config.heartbeat_interval_ms));
-    let mut probe_tick =
-        tokio::time::interval(Duration::from_millis(node.config.probe_interval_ms));
-    gossip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-    loop {
-        tokio::select! {
-            _ = &mut shutdown_rx => {
-                // Broadcast LEAVE with REQUEST_ACK to all live peers before stopping.
-                let leave = build_leave(
-                    node.id,
-                    node.table.our_heartbeat(),
-                    node.table.our_incarnation(),
-                ).with_request_ack();
-                let live = node.table.live_nodes();
-                for peer_id in &live {
-                    if let Some(e) = node.table.entries.get(peer_id) {
-                        let _ = node.transport.send_to(&leave, e.addr).await;
-                    }
-                }
-                break;
-            }
-
-            result = node.transport.recv_from() => {
-                if let Ok((msg, from)) = result {
-                    // Clean up any bootstrap placeholder before inserting real entry.
-                    node.table.remove_placeholder_for_addr(from, msg.sender_id);
-                    // Record sender liveness (including incarnation from header).
-                    let mut alive = NodeState::new_alive(msg.sender_id, from, msg.sender_heartbeat);
-                    alive.incarnation = msg.sender_incarnation;
-                    let outcome = node.table.merge_entry(&alive);
-                    node.metrics.record_merge(outcome);
-                    node.failure_det.record_ack(msg.sender_id);
-                    node.pending_acks.ack(msg.sender_id);
-
-                    match &msg.payload {
-                        MessagePayload::Gossip(entries) => {
-                            node.metrics.gossip_recv += 1;
-                            let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
-                            for o in node.table.merge_digest(&states) {
-                                node.metrics.record_merge(o);
-                            }
-                            if msg.requests_ack() {
-                                let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), vec![]);
-                                if node.transport.send_to(&ack, from).await.is_ok() {
-                                    node.metrics.acks_sent += 1;
-                                }
-                            }
-                        }
-                        MessagePayload::Ping(entries) => {
-                            node.metrics.pings_recv += 1;
-                            if !entries.is_empty() {
-                                let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
-                                for o in node.table.merge_digest(&states) {
-                                    node.metrics.record_merge(o);
-                                }
-                            }
-                            let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-                            let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
-                            if node.transport.send_to(&ack, from).await.is_ok() {
-                                node.metrics.acks_sent += 1;
-                            }
-                        }
-                        MessagePayload::PingReq(req) => {
-                            node.metrics.ping_reqs_recv += 1;
-                            let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-                            let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
-                            if node.transport.send_to(&ping, req.target_addr).await.is_ok() {
-                                node.metrics.pings_sent += 1;
-                            }
-                        }
-                        MessagePayload::Ack(entries) => {
-                            node.metrics.acks_recv += 1;
-                            if !entries.is_empty() {
-                                let states: Vec<_> = entries.iter().filter_map(wire_to_node_state).collect();
-                                for o in node.table.merge_digest(&states) {
-                                    node.metrics.record_merge(o);
-                                }
-                            }
-                        }
-                        MessagePayload::Leave => {
-                            if msg.requests_ack() {
-                                let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), vec![]);
-                                let _ = node.transport.send_to(&ack, from).await;
-                                node.metrics.acks_sent += 1;
-                            }
-                            node.table.declare_dead(msg.sender_id);
-                        }
-                    }
-                }
-            }
-
-            _ = hb_tick.tick() => {
-                node.table.tick_heartbeat();
-            }
-
-            _ = gossip_tick.tick() => {
-                let targets = gossip::pick_gossip_targets(
-                    &node.table, node.id, node.config.max_gossip_sends,
-                );
-                if !targets.is_empty() {
-                    node.metrics.gossip_rounds += 1;
-                    let fanout = gossip::effective_fanout(
-                        node.config.gossip_fanout,
-                        node.table.entries.len(),
-                        node.config.adaptive_fanout,
-                    );
-                    let msg = gossip::build_gossip_message(
-                        &node.table, node.id, node.table.our_heartbeat(), node.table.our_incarnation(), fanout,
-                    );
-                    for (_, peer_addr) in &targets {
-                        if node.transport.send_to(&msg, *peer_addr).await.is_ok() {
-                            node.metrics.gossip_sent += 1;
-                        }
-                    }
-                }
-            }
-
-            _ = probe_tick.tick() => {
-                use std::time::Instant;
-                let scan = node.failure_det.scan(Instant::now());
-                node.metrics.probe_direct_timeouts += scan.escalate_to_indirect.len() as u64;
-                for id in scan.escalate_to_indirect {
-                    if let Some(target_state) = node.table.entries.get(&id) {
-                        let target_addr = target_state.addr;
-                        let intermediaries = gossip::pick_k_random_peers(
-                            &node.table, node.id, id, node.config.indirect_probe_k,
-                        );
-                        for (_, inter_addr) in &intermediaries {
-                            let req = build_ping_req(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), id, target_addr);
-                            if node.transport.send_to(&req, *inter_addr).await.is_ok() {
-                                node.metrics.ping_reqs_sent += 1;
-                            }
-                        }
-                        if !intermediaries.is_empty() {
-                            node.failure_det.record_indirect_probe_sent(id);
-                        }
-                    }
-                }
-                node.metrics.probe_failures += scan.declare_suspect.len() as u64;
-                for id in scan.declare_suspect {
-                    node.table.suspect(id);
-                }
-                for id in node.table.expired_suspects_jittered(
-                    node.config.suspect_timeout_ms,
-                    node.config.suspect_timeout_multiplier,
-                    node.config.suspect_timeout_jitter_ms,
-                ) {
-                    node.table.declare_dead(id);
-                }
-                node.table.gc_dead(Duration::from_millis(node.config.dead_retention_ms));
-
-                // Retransmit REQUEST_ACK messages that timed out.
-                let now = Instant::now();
-                let retry_result = node.pending_acks.collect_retries(now);
-                for (_target_id, retry_msg, target_addr) in retry_result.retransmits {
-                    node.metrics.reliable_retries += 1;
-                    let _ = node.transport.send_to(&retry_msg, target_addr).await;
-                }
-                node.metrics.reliable_exhausted += retry_result.exhausted as u64;
-
-                if let Some((target_id, target_addr)) = gossip::pick_random_peer(&node.table, node.id) {
-                    if !node.failure_det.is_probing(target_id) {
-                        let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-                        let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
-                        if node.transport.send_to(&ping, target_addr).await.is_ok() {
-                            node.metrics.pings_sent += 1;
-                            node.failure_det.record_probe_sent(target_id);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    node
-}
+use gossip_membership::membership::placeholder_id_for;
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 async fn bind_local() -> Transport {
@@ -267,16 +41,16 @@ async fn test_two_nodes_discover_each_other() {
     let addr1 = t1.local_addr;
     let addr2 = t2.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
     let id1 = n1.id;
     let id2 = n2.id;
 
     let (tx1, rx1) = oneshot::channel::<()>();
     let (tx2, rx2) = oneshot::channel::<()>();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     // Allow several gossip rounds to complete.
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -311,9 +85,9 @@ async fn test_three_nodes_converge() {
     let addr2 = t2.local_addr;
     let addr3 = t3.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2, addr3]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1, addr3]);
-    let n3 = TestNode::new(t3, cfg.clone(), &[addr1, addr2]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
     let id1 = n1.id;
     let id2 = n2.id;
     let id3 = n3.id;
@@ -322,9 +96,9 @@ async fn test_three_nodes_converge() {
     let (tx2, rx2) = oneshot::channel();
     let (tx3, rx3) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
-    let h3 = tokio::spawn(run_test_node(n3, rx3));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
 
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -363,9 +137,9 @@ async fn test_gossip_propagation_ring() {
     let addr3 = t3.local_addr;
 
     // Ring: 1→2→3→1
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr3]);
-    let n3 = TestNode::new(t3, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1]);
     let id1 = n1.id;
     let id2 = n2.id;
     let id3 = n3.id;
@@ -374,9 +148,9 @@ async fn test_gossip_propagation_ring() {
     let (tx2, rx2) = oneshot::channel();
     let (tx3, rx3) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
-    let h3 = tokio::spawn(run_test_node(n3, rx3));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
 
     // Ring convergence requires multiple hops — allow more time.
     tokio::time::sleep(Duration::from_millis(1_200)).await;
@@ -470,16 +244,16 @@ async fn test_failure_detection_suspect() {
     let addr1 = t1.local_addr;
     let addr2 = t2.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
     let id2 = n2.id;
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
 
     // Start node1; node2 starts but we shut it down quickly so it stops responding.
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     // Let them discover each other first.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -593,7 +367,7 @@ async fn test_star_topology_five_nodes() {
     let addrs: Vec<_> = transports.iter().map(|t| t.local_addr).collect();
 
     // All spoke nodes seed with hub only; hub seeds with all spokes.
-    let nodes: Vec<TestNode> = transports
+    let nodes: Vec<Node> = transports
         .into_iter()
         .enumerate()
         .map(|(i, t)| {
@@ -602,7 +376,7 @@ async fn test_star_topology_five_nodes() {
             } else {
                 vec![hub_addr]
             };
-            TestNode::new(t, cfg.clone(), &peers)
+            Node::new(t, cfg.clone(), &peers)
         })
         .collect();
 
@@ -613,7 +387,7 @@ async fn test_star_topology_five_nodes() {
     for node in nodes {
         let (tx, rx) = oneshot::channel();
         senders.push(tx);
-        handles.push(tokio::spawn(run_test_node(node, rx)));
+        handles.push(tokio::spawn(run_node(node, rx)));
     }
 
     // Allow ample time for spoke→hub→spoke propagation.
@@ -623,7 +397,7 @@ async fn test_star_topology_five_nodes() {
         let _ = tx.send(());
     }
 
-    let final_nodes: Vec<TestNode> = futures::future::join_all(handles)
+    let final_nodes: Vec<Node> = futures::future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.unwrap())
@@ -656,8 +430,8 @@ async fn test_placeholder_cleaned_up_on_first_message() {
     let addr_a = ta.local_addr;
 
     // Node A has no bootstrap peers; node B bootstraps with A's address.
-    let na = TestNode::new(ta, cfg.clone(), &[]);
-    let nb = TestNode::new(tb, cfg.clone(), &[addr_a]);
+    let na = Node::new(ta, cfg.clone(), &[]);
+    let nb = Node::new(tb, cfg.clone(), &[addr_a]);
     let id_a = na.id;
 
     // Before any gossip, B's table must contain the placeholder for A's address.
@@ -670,8 +444,8 @@ async fn test_placeholder_cleaned_up_on_first_message() {
     let (tx_a, rx_a) = oneshot::channel::<()>();
     let (tx_b, rx_b) = oneshot::channel::<()>();
 
-    let ha = tokio::spawn(run_test_node(na, rx_a));
-    let hb = tokio::spawn(run_test_node(nb, rx_b));
+    let ha = tokio::spawn(run_node(na, rx_a));
+    let hb = tokio::spawn(run_node(nb, rx_b));
 
     // Allow several gossip rounds (gossip_interval_ms = 50 ms in fast config).
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -713,9 +487,9 @@ async fn test_placeholder_not_propagated_via_gossip() {
     let addr_b = tb.local_addr;
     let addr_c = tc.local_addr;
 
-    let na = TestNode::new(ta, cfg.clone(), &[addr_b, addr_c]);
-    let nb = TestNode::new(tb, cfg.clone(), &[addr_a]);
-    let nc = TestNode::new(tc, cfg.clone(), &[addr_b]);
+    let na = Node::new(ta, cfg.clone(), &[addr_b, addr_c]);
+    let nb = Node::new(tb, cfg.clone(), &[addr_a]);
+    let nc = Node::new(tc, cfg.clone(), &[addr_b]);
     let id_a = na.id;
     let id_b = nb.id;
     let id_c = nc.id;
@@ -731,9 +505,9 @@ async fn test_placeholder_not_propagated_via_gossip() {
     let (txb, rxb) = oneshot::channel::<()>();
     let (txc, rxc) = oneshot::channel::<()>();
 
-    let ha = tokio::spawn(run_test_node(na, rxa));
-    let hb = tokio::spawn(run_test_node(nb, rxb));
-    let hc = tokio::spawn(run_test_node(nc, rxc));
+    let ha = tokio::spawn(run_node(na, rxa));
+    let hb = tokio::spawn(run_node(nb, rxb));
+    let hc = tokio::spawn(run_node(nc, rxc));
 
     // Allow convergence.
     tokio::time::sleep(Duration::from_millis(1_200)).await;
@@ -802,14 +576,14 @@ async fn test_no_duplicate_entries_after_gossip() {
     let addr_b = tb.local_addr;
 
     // Both nodes bootstrap with each other — each starts with one placeholder.
-    let na = TestNode::new(ta, cfg.clone(), &[addr_b]);
-    let nb = TestNode::new(tb, cfg.clone(), &[addr_a]);
+    let na = Node::new(ta, cfg.clone(), &[addr_b]);
+    let nb = Node::new(tb, cfg.clone(), &[addr_a]);
 
     let (tx_a, rx_a) = oneshot::channel::<()>();
     let (tx_b, rx_b) = oneshot::channel::<()>();
 
-    let ha = tokio::spawn(run_test_node(na, rx_a));
-    let hb = tokio::spawn(run_test_node(nb, rx_b));
+    let ha = tokio::spawn(run_node(na, rx_a));
+    let hb = tokio::spawn(run_node(nb, rx_b));
 
     tokio::time::sleep(Duration::from_millis(400)).await;
 
@@ -849,16 +623,16 @@ async fn test_encrypted_two_nodes_converge() {
     assert!(t1.is_encrypted());
     assert!(t2.is_encrypted());
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
     let id1 = n1.id;
     let id2 = n2.id;
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -892,9 +666,9 @@ async fn test_encrypted_ring_converges() {
     let addr2 = t2.local_addr;
     let addr3 = t3.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr3]);
-    let n3 = TestNode::new(t3, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1]);
     let id1 = n1.id;
     let id3 = n3.id;
 
@@ -902,9 +676,9 @@ async fn test_encrypted_ring_converges() {
     let (tx2, rx2) = oneshot::channel();
     let (tx3, rx3) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
-    let h3 = tokio::spawn(run_test_node(n3, rx3));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
 
     tokio::time::sleep(Duration::from_millis(1_200)).await;
 
@@ -941,16 +715,16 @@ async fn test_wrong_key_node_rejected() {
     let addr1 = t1.local_addr;
     let addr2 = t2.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
     let id1 = n1.id;
     let id2 = n2.id;
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     // Allow ample time — if decryption is working, they'd converge by now.
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -984,16 +758,16 @@ async fn test_plaintext_node_rejected_by_encrypted_cluster() {
     let addr1 = t1.local_addr;
     let addr2 = t2.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
     let id1 = n1.id;
     let id2 = n2.id;
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     tokio::time::sleep(Duration::from_millis(800)).await;
 
@@ -1035,7 +809,7 @@ async fn test_multi_target_gossip_converges() {
     }
     let addrs: Vec<_> = transports.iter().map(|t| t.local_addr).collect();
 
-    let nodes: Vec<TestNode> = transports
+    let nodes: Vec<Node> = transports
         .into_iter()
         .enumerate()
         .map(|(i, t)| {
@@ -1044,7 +818,7 @@ async fn test_multi_target_gossip_converges() {
             } else {
                 vec![hub_addr]
             };
-            TestNode::new(t, cfg.clone(), &peers)
+            Node::new(t, cfg.clone(), &peers)
         })
         .collect();
 
@@ -1055,7 +829,7 @@ async fn test_multi_target_gossip_converges() {
     for node in nodes {
         let (tx, rx) = oneshot::channel();
         senders.push(tx);
-        handles.push(tokio::spawn(run_test_node(node, rx)));
+        handles.push(tokio::spawn(run_node(node, rx)));
     }
 
     tokio::time::sleep(Duration::from_millis(1_500)).await;
@@ -1064,7 +838,7 @@ async fn test_multi_target_gossip_converges() {
         let _ = tx.send(());
     }
 
-    let final_nodes: Vec<TestNode> = futures::future::join_all(handles)
+    let final_nodes: Vec<Node> = futures::future::join_all(handles)
         .await
         .into_iter()
         .map(|r| r.unwrap())
@@ -1097,14 +871,14 @@ async fn test_metrics_collected_after_convergence() {
     let addr1 = t1.local_addr;
     let addr2 = t2.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     // Let nodes gossip and probe for a while.
     tokio::time::sleep(Duration::from_millis(800)).await;
@@ -1148,15 +922,15 @@ async fn test_graceful_leave_marks_dead() {
     let addr1 = t1.local_addr;
     let addr2 = t2.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
     let id1 = n1.id;
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     // Let nodes converge first.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -1200,9 +974,9 @@ async fn test_leave_does_not_affect_remaining_nodes() {
     let addr2 = t2.local_addr;
     let addr3 = t3.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2, addr3]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1, addr3]);
-    let n3 = TestNode::new(t3, cfg.clone(), &[addr1, addr2]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2, addr3]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1, addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1, addr2]);
     let id1 = n1.id;
     let id2 = n2.id;
     let id3 = n3.id;
@@ -1211,9 +985,9 @@ async fn test_leave_does_not_affect_remaining_nodes() {
     let (tx2, rx2) = oneshot::channel();
     let (tx3, rx3) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
-    let h3 = tokio::spawn(run_test_node(n3, rx3));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
 
     // Converge.
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -1271,26 +1045,21 @@ async fn test_leave_uses_request_ack() {
     let addr1 = t1.local_addr;
     let addr2 = t2.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
     let id1 = n1.id;
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     // Converge.
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    let acks_before = {
-        // We can't inspect node2 while it's running, but we can check after.
-        // Just let the leave happen.
-        let _ = tx1.send(());
-        h1.await.unwrap()
-    };
-    let _ = acks_before; // node1 is done
+    let _ = tx1.send(());
+    h1.await.unwrap();
 
     // Give node2 time to process the LEAVE and send ACK.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1329,15 +1098,15 @@ async fn test_request_ack_retries_on_timeout() {
     let addr1 = t1.local_addr;
     let addr2 = t2.local_addr;
 
-    let n1 = TestNode::new(t1, cfg.clone(), &[addr2]);
-    let n2 = TestNode::new(t2, cfg.clone(), &[addr1]);
+    let n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
     let id2 = n2.id;
 
     let (tx1, rx1) = oneshot::channel();
     let (tx2, rx2) = oneshot::channel();
 
-    let h1 = tokio::spawn(run_test_node(n1, rx1));
-    let h2 = tokio::spawn(run_test_node(n2, rx2));
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
 
     // Converge.
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -1346,19 +1115,13 @@ async fn test_request_ack_retries_on_timeout() {
     let _ = tx2.send(());
     let _node2 = h2.await.unwrap();
 
-    // Now manually send a REQUEST_ACK gossip from node1 to dead node2.
-    // We can't easily do this while the event loop runs, so instead we'll
-    // just verify that the PendingAcks machinery works by checking that
-    // node1 eventually records exhausted retries after we shut it down
-    // with enough time for the retries to fire.
+    // Wait for node1 to detect the failure.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let _ = tx1.send(());
     let node1 = h1.await.unwrap();
 
     // Node1 should have seen probe timeouts for the dead node2.
-    // The failure detection retries are separate from REQUEST_ACK retries,
-    // but the mechanism works the same way.
     assert!(
         node1.metrics.probe_direct_timeouts > 0 || node1.metrics.probe_failures > 0,
         "node1 should detect node2 as unresponsive"
