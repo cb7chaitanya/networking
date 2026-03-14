@@ -1,0 +1,141 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Cluster Membership",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "swim_members_alive", "legendFormat": "{{instance}} alive", "refId": "A" },
+        { "expr": "swim_members_suspect", "legendFormat": "{{instance}} suspect", "refId": "B" },
+        { "expr": "swim_members_dead", "legendFormat": "{{instance}} dead", "refId": "C" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "title": "Gossip Throughput (rate/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "rate(swim_gossip_sent_total[30s])", "legendFormat": "{{instance}} sent/s", "refId": "A" },
+        { "expr": "rate(swim_gossip_recv_total[30s])", "legendFormat": "{{instance}} recv/s", "refId": "B" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "title": "Probe Activity (rate/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "rate(swim_pings_sent_total[30s])", "legendFormat": "{{instance}} ping/s", "refId": "A" },
+        { "expr": "rate(swim_acks_recv_total[30s])", "legendFormat": "{{instance}} ack/s", "refId": "B" },
+        { "expr": "rate(swim_ping_reqs_sent_total[30s])", "legendFormat": "{{instance}} ping_req/s", "refId": "C" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "title": "Failure Detection",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "rate(swim_probe_direct_timeouts_total[30s])", "legendFormat": "{{instance}} timeouts/s", "refId": "A" },
+        { "expr": "rate(swim_probe_failures_total[30s])", "legendFormat": "{{instance}} failures/s", "refId": "B" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "title": "Merge Outcomes (rate/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "ops" },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "rate(swim_merges_new_total[30s])", "legendFormat": "{{instance}} new/s", "refId": "A" },
+        { "expr": "rate(swim_merges_updated_total[30s])", "legendFormat": "{{instance}} updated/s", "refId": "B" },
+        { "expr": "rate(swim_merges_stale_total[30s])", "legendFormat": "{{instance}} stale/s", "refId": "C" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "title": "Reliable Delivery & Anti-Entropy",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "rate(swim_anti_entropy_sent_total[30s])", "legendFormat": "{{instance}} anti-entropy/s", "refId": "A" },
+        { "expr": "rate(swim_reliable_retries_total[30s])", "legendFormat": "{{instance}} retries/s", "refId": "B" },
+        { "expr": "rate(swim_reliable_exhausted_total[30s])", "legendFormat": "{{instance}} exhausted/s", "refId": "C" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "title": "Gossip Rounds (total)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "swim_gossip_rounds_total", "legendFormat": "{{instance}}", "refId": "A" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "title": "Total Messages Sent",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 24 },
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": []
+      },
+      "targets": [
+        { "expr": "swim_gossip_sent_total + swim_pings_sent_total + swim_acks_sent_total + swim_ping_reqs_sent_total", "legendFormat": "{{instance}}", "refId": "A" }
+      ],
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" }
+    }
+  ],
+  "schemaVersion": 39,
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-5m", "to": "now" },
+  "title": "SWIM Gossip Protocol",
+  "uid": "swim-gossip-overview"
+}

@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "swim-gossip"
+    static_configs:
+      # Three local gossip nodes exposing metrics on ports 9100-9102.
+      # host.docker.internal resolves to the host machine from inside Docker.
+      - targets:
+          - "host.docker.internal:9100"
+          - "host.docker.internal:9101"
+          - "host.docker.internal:9102"
+        labels:
+          cluster: "local"
