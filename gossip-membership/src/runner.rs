@@ -131,12 +131,17 @@ pub async fn run_node(
                 );
             }
 
-            // ── Branch 3: gossip round (rate-limited) ─────────────────────────
+            // ── Branch 3: gossip round (rate-limited, adaptive targets) ────────
             _ = gossip_tick.tick() => {
+                let max_targets = gossip::effective_gossip_targets(
+                    node.config.max_gossip_sends,
+                    node.table.entries.len(),
+                    node.config.adaptive_gossip_targets,
+                );
                 let targets = gossip::pick_gossip_targets(
                     &node.table,
                     node.id,
-                    node.config.max_gossip_sends,
+                    max_targets,
                 );
                 if !targets.is_empty() {
                     node.metrics.gossip_rounds += 1;

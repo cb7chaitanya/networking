@@ -120,6 +120,25 @@ pub fn pick_gossip_targets(
     live
 }
 
+/// Compute the effective number of gossip targets per round.
+///
+/// When `adaptive` is `true`, scales with cluster size:
+/// `base * ceil(log2(n)).max(1)`, so larger clusters push gossip to
+/// more peers per round and dissemination still completes in O(log n)
+/// rounds.  The result is further capped at `cluster_size - 1` (can't
+/// gossip to more peers than exist).
+///
+/// When `adaptive` is `false`, returns `base` unchanged.
+pub fn effective_gossip_targets(base: usize, cluster_size: usize, adaptive: bool) -> usize {
+    if !adaptive || cluster_size <= 2 {
+        return base;
+    }
+    let log2_n = (cluster_size as f64).log2().ceil().max(1.0) as usize;
+    let scaled = base.saturating_mul(log2_n);
+    // Can't target more peers than exist (excluding self).
+    scaled.min(cluster_size.saturating_sub(1))
+}
+
 /// Compute the effective gossip fanout (max entries per message).
 ///
 /// When `adaptive` is `true`, scales with cluster size:
@@ -180,6 +199,52 @@ mod tests {
         if status == NodeStatus::Dead {
             t.entries.get_mut(&id).unwrap().status = NodeStatus::Dead;
         }
+    }
+
+    // ── effective_gossip_targets tests ──────────────────────────────────────
+
+    #[test]
+    fn gossip_targets_non_adaptive_returns_base() {
+        assert_eq!(effective_gossip_targets(2, 100, false), 2);
+        assert_eq!(effective_gossip_targets(2, 1, false), 2);
+    }
+
+    #[test]
+    fn gossip_targets_adaptive_small_cluster_returns_base() {
+        assert_eq!(effective_gossip_targets(1, 1, true), 1);
+        assert_eq!(effective_gossip_targets(1, 2, true), 1);
+    }
+
+    #[test]
+    fn gossip_targets_adaptive_scales_with_cluster_size() {
+        // 8 nodes: ceil(log2(8)) = 3 → 1 * 3 = 3
+        assert_eq!(effective_gossip_targets(1, 8, true), 3);
+        // 16 nodes: ceil(log2(16)) = 4 → 1 * 4 = 4
+        assert_eq!(effective_gossip_targets(1, 16, true), 4);
+        // 100 nodes: ceil(log2(100)) = 7 → 1 * 7 = 7
+        assert_eq!(effective_gossip_targets(1, 100, true), 7);
+    }
+
+    #[test]
+    fn gossip_targets_adaptive_with_higher_base() {
+        // base=2, 16 nodes: 2 * 4 = 8
+        assert_eq!(effective_gossip_targets(2, 16, true), 8);
+    }
+
+    #[test]
+    fn gossip_targets_capped_at_cluster_minus_one() {
+        // base=10, 5 nodes: 10 * 3 = 30, but only 4 peers → capped at 4.
+        assert_eq!(effective_gossip_targets(10, 5, true), 4);
+    }
+
+    #[test]
+    fn gossip_targets_base_zero_returns_zero() {
+        assert_eq!(effective_gossip_targets(0, 100, true), 0);
+    }
+
+    #[test]
+    fn gossip_targets_cluster_size_zero() {
+        assert_eq!(effective_gossip_targets(1, 0, true), 1);
     }
 
     // ── effective_fanout tests ────────────────────────────────────────────────
