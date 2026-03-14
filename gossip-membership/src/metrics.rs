@@ -77,6 +77,69 @@ impl Metrics {
         }
     }
 
+    /// Format as Prometheus text exposition format.
+    ///
+    /// Each counter is emitted as a `# TYPE` + value line.  Gauges for
+    /// cluster membership status counts are included when provided.
+    pub fn prometheus(&self, alive: usize, suspect: usize, dead: usize) -> String {
+        let mut out = String::with_capacity(2048);
+        // Helper macro to reduce repetition.
+        macro_rules! counter {
+            ($name:expr, $help:expr, $val:expr) => {
+                out.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
+                out.push_str(concat!("# TYPE ", $name, " counter\n"));
+                out.push_str(&format!(concat!($name, " {}\n"), $val));
+            };
+        }
+        macro_rules! gauge {
+            ($name:expr, $help:expr, $val:expr) => {
+                out.push_str(concat!("# HELP ", $name, " ", $help, "\n"));
+                out.push_str(concat!("# TYPE ", $name, " gauge\n"));
+                out.push_str(&format!(concat!($name, " {}\n"), $val));
+            };
+        }
+
+        counter!("swim_gossip_rounds_total", "Gossip rounds initiated.", self.gossip_rounds);
+        counter!("swim_gossip_sent_total", "Gossip messages sent.", self.gossip_sent);
+        counter!("swim_gossip_recv_total", "Gossip messages received.", self.gossip_recv);
+        counter!("swim_pings_sent_total", "PING messages sent.", self.pings_sent);
+        counter!("swim_pings_recv_total", "PING messages received.", self.pings_recv);
+        counter!("swim_acks_sent_total", "ACK messages sent.", self.acks_sent);
+        counter!("swim_acks_recv_total", "ACK messages received.", self.acks_recv);
+        counter!("swim_ping_reqs_sent_total", "PING_REQ messages sent.", self.ping_reqs_sent);
+        counter!("swim_ping_reqs_recv_total", "PING_REQ messages received.", self.ping_reqs_recv);
+        counter!("swim_probe_direct_timeouts_total", "Direct probes that timed out.", self.probe_direct_timeouts);
+        counter!("swim_probe_failures_total", "Probes that resulted in Suspect.", self.probe_failures);
+        counter!("swim_merges_new_total", "New nodes discovered via merge.", self.merges_new);
+        counter!("swim_merges_updated_total", "Existing entries updated.", self.merges_updated);
+        counter!("swim_merges_stale_total", "Stale entries rejected.", self.merges_stale);
+        counter!("swim_anti_entropy_sent_total", "Anti-entropy full syncs sent.", self.anti_entropy_sent);
+        counter!("swim_reliable_retries_total", "REQUEST_ACK retransmissions.", self.reliable_retries);
+        counter!("swim_reliable_exhausted_total", "REQUEST_ACK retries exhausted.", self.reliable_exhausted);
+
+        gauge!("swim_members_alive", "Number of Alive members.", alive);
+        gauge!("swim_members_suspect", "Number of Suspect members.", suspect);
+        gauge!("swim_members_dead", "Number of Dead members.", dead);
+
+        out
+    }
+
+    /// Format as a JSON object for log-based dashboards.
+    pub fn json(&self, alive: usize, suspect: usize, dead: usize) -> String {
+        format!(
+            r#"{{"gossip_rounds":{},"gossip_sent":{},"gossip_recv":{},"pings_sent":{},"pings_recv":{},"acks_sent":{},"acks_recv":{},"ping_reqs_sent":{},"ping_reqs_recv":{},"probe_direct_timeouts":{},"probe_failures":{},"merges_new":{},"merges_updated":{},"merges_stale":{},"anti_entropy_sent":{},"reliable_retries":{},"reliable_exhausted":{},"alive":{},"suspect":{},"dead":{}}}"#,
+            self.gossip_rounds, self.gossip_sent, self.gossip_recv,
+            self.pings_sent, self.pings_recv,
+            self.acks_sent, self.acks_recv,
+            self.ping_reqs_sent, self.ping_reqs_recv,
+            self.probe_direct_timeouts, self.probe_failures,
+            self.merges_new, self.merges_updated, self.merges_stale,
+            self.anti_entropy_sent,
+            self.reliable_retries, self.reliable_exhausted,
+            alive, suspect, dead,
+        )
+    }
+
     /// Format a one-line summary suitable for `log::info!`.
     pub fn summary(&self, alive: usize, suspect: usize, dead: usize) -> String {
         format!(
@@ -166,6 +229,71 @@ mod tests {
         assert!(s.contains("alive=4"));
         assert!(s.contains("suspect=1"));
         assert!(s.contains("dead=0"));
+    }
+
+    #[test]
+    fn prometheus_format_contains_all_metrics() {
+        let m = Metrics {
+            gossip_rounds: 10,
+            gossip_sent: 12,
+            probe_failures: 1,
+            merges_new: 3,
+            anti_entropy_sent: 2,
+            ..Default::default()
+        };
+        let p = m.prometheus(5, 1, 2);
+        // Counters.
+        assert!(p.contains("# TYPE swim_gossip_rounds_total counter"));
+        assert!(p.contains("swim_gossip_rounds_total 10"));
+        assert!(p.contains("swim_gossip_sent_total 12"));
+        assert!(p.contains("swim_probe_failures_total 1"));
+        assert!(p.contains("swim_merges_new_total 3"));
+        assert!(p.contains("swim_anti_entropy_sent_total 2"));
+        // Gauges.
+        assert!(p.contains("# TYPE swim_members_alive gauge"));
+        assert!(p.contains("swim_members_alive 5"));
+        assert!(p.contains("swim_members_suspect 1"));
+        assert!(p.contains("swim_members_dead 2"));
+    }
+
+    #[test]
+    fn prometheus_format_valid_exposition() {
+        let m = Metrics::default();
+        let p = m.prometheus(0, 0, 0);
+        // Every non-empty, non-comment line should match "metric_name value".
+        for line in p.lines() {
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 2, "invalid exposition line: {line}");
+            assert!(parts[0].starts_with("swim_"), "metric should have swim_ prefix: {line}");
+            assert!(parts[1].parse::<u64>().is_ok(), "value should be numeric: {line}");
+        }
+    }
+
+    #[test]
+    fn json_format_valid() {
+        let m = Metrics {
+            gossip_rounds: 5,
+            pings_sent: 3,
+            ..Default::default()
+        };
+        let j = m.json(2, 0, 1);
+        assert!(j.starts_with('{'));
+        assert!(j.ends_with('}'));
+        assert!(j.contains(r#""gossip_rounds":5"#));
+        assert!(j.contains(r#""pings_sent":3"#));
+        assert!(j.contains(r#""alive":2"#));
+        assert!(j.contains(r#""dead":1"#));
+    }
+
+    #[test]
+    fn json_format_all_zeros() {
+        let m = Metrics::default();
+        let j = m.json(0, 0, 0);
+        assert!(j.contains(r#""gossip_rounds":0"#));
+        assert!(j.contains(r#""alive":0"#));
     }
 
     #[test]
