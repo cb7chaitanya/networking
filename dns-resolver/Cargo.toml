@@ -7,4 +7,9 @@ edition = "2021"
 anyhow = "1.0"
 rand = "0.9.2"
 thiserror = "1.0"
+tracing = "0.1"
+tracing-opentelemetry = "0.22"
+opentelemetry = "0.21"
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
