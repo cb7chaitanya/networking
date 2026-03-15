@@ -9,7 +9,7 @@
 ///
 /// All randomness is driven by a deterministic SplitMix64 PRNG seeded at
 /// construction, so simulations are reproducible.
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 
 // ── Deterministic PRNG (SplitMix64) ─────────────────────────────────────────
@@ -50,6 +50,20 @@ pub struct NetSim {
     reorder_window: usize,
     /// Packets held for out-of-order delivery: `(wire_bytes, dest)`.
     reorder_buf: VecDeque<(Vec<u8>, SocketAddr)>,
+    /// Burst packet loss: probability of starting a new burst.
+    burst_start_prob: f64,
+    /// Burst packet loss: average burst length in packets.
+    avg_burst_length: u32,
+    /// Burst packet loss: remaining packets to drop in current burst.
+    burst_remaining: u32,
+    /// Latency spikes: probability of a spike occurring.
+    spike_prob: f64,
+    /// Latency spikes: additional delay in ms when spike occurs.
+    spike_delay_ms: u64,
+    /// Latency spikes: current spike delay state (0 if no spike).
+    current_spike_delay: u64,
+    /// Asymmetric loss: loss rate for specific (from, to) pairs.
+    asymmetric_loss: HashMap<(SocketAddr, SocketAddr), f64>,
 }
 
 impl NetSim {
@@ -62,6 +76,13 @@ impl NetSim {
             reorder_prob: 0.0,
             reorder_window: 0,
             reorder_buf: VecDeque::new(),
+            burst_start_prob: 0.0,
+            avg_burst_length: 0,
+            burst_remaining: 0,
+            spike_prob: 0.0,
+            spike_delay_ms: 0,
+            current_spike_delay: 0,
+            asymmetric_loss: HashMap::new(),
         }
     }
 
@@ -80,6 +101,24 @@ impl NetSim {
     pub fn with_reorder(mut self, probability: f64, window: usize) -> Self {
         self.reorder_prob = probability.clamp(0.0, 1.0);
         self.reorder_window = window;
+        self
+    }
+
+    pub fn with_burst_loss(mut self, start_prob: f64, avg_length: u32) -> Self {
+        self.burst_start_prob = start_prob.clamp(0.0, 1.0);
+        self.avg_burst_length = avg_length;
+        self
+    }
+
+    pub fn with_latency_spikes(mut self, spike_prob: f64, spike_delay_ms: u64) -> Self {
+        self.spike_prob = spike_prob.clamp(0.0, 1.0);
+        self.spike_delay_ms = spike_delay_ms;
+        self
+    }
+
+    pub fn with_asymmetric_loss(mut self, from: SocketAddr, to: SocketAddr, rate: f64) -> Self {
+        self.asymmetric_loss
+            .insert((from, to), rate.clamp(0.0, 1.0));
         self
     }
 
@@ -108,6 +147,29 @@ impl NetSim {
         self.partitions.clear();
     }
 
+    pub fn set_burst_loss(&mut self, start_prob: f64, avg_length: u32) {
+        self.burst_start_prob = start_prob.clamp(0.0, 1.0);
+        self.avg_burst_length = avg_length;
+    }
+
+    pub fn set_latency_spikes(&mut self, spike_prob: f64, spike_delay_ms: u64) {
+        self.spike_prob = spike_prob.clamp(0.0, 1.0);
+        self.spike_delay_ms = spike_delay_ms;
+    }
+
+    pub fn set_asymmetric_loss(&mut self, from: SocketAddr, to: SocketAddr, rate: f64) {
+        self.asymmetric_loss
+            .insert((from, to), rate.clamp(0.0, 1.0));
+    }
+
+    pub fn remove_asymmetric_loss(&mut self, from: SocketAddr, to: SocketAddr) {
+        self.asymmetric_loss.remove(&(from, to));
+    }
+
+    pub fn clear_asymmetric_loss(&mut self) {
+        self.asymmetric_loss.clear();
+    }
+
     // ── Query ────────────────────────────────────────────────────────────
 
     /// Decide whether a packet from `from` to `to` should be delivered.
@@ -118,8 +180,32 @@ impl NetSim {
         if self.is_partitioned(from, to) {
             return false;
         }
+        if self.burst_remaining > 0 {
+            self.burst_remaining -= 1;
+            return false;
+        }
+        if self.burst_start_prob > 0.0 && self.rng.next_f64() < self.burst_start_prob {
+            let burst_len = if self.avg_burst_length > 0 {
+                let r = self.rng.next_f64() * (self.avg_burst_length as f64 * 2.0);
+                r as u32 + self.avg_burst_length
+            } else {
+                1
+            };
+            self.burst_remaining = burst_len.saturating_sub(1);
+            return false;
+        }
         if self.loss_rate > 0.0 && self.rng.next_f64() < self.loss_rate {
             return false;
+        }
+        if let Some(&asym_rate) = self.asymmetric_loss.get(&(from, to)) {
+            if asym_rate > 0.0 && self.rng.next_f64() < asym_rate {
+                return false;
+            }
+        }
+        if self.current_spike_delay > 0 {
+            self.current_spike_delay = 0;
+        } else if self.spike_prob > 0.0 && self.rng.next_f64() < self.spike_prob {
+            self.current_spike_delay = self.spike_delay_ms;
         }
         true
     }
@@ -129,9 +215,43 @@ impl NetSim {
         self.partitions.contains(&Self::canonical(a, b))
     }
 
-    /// Configured delay in milliseconds.
-    pub fn delay_ms(&self) -> u64 {
+    /// Base delay in milliseconds (without spikes).
+    pub fn base_delay_ms(&self) -> u64 {
         self.delay_ms
+    }
+
+    /// Total delay in milliseconds (base + spike if active).
+    pub fn delay_ms(&self) -> u64 {
+        self.delay_ms + self.current_spike_delay
+    }
+
+    /// Returns `true` if currently in a burst loss period.
+    pub fn in_burst(&self) -> bool {
+        self.burst_remaining > 0
+    }
+
+    /// Number of packets remaining to drop in the current burst.
+    pub fn burst_remaining(&self) -> u32 {
+        self.burst_remaining
+    }
+
+    /// Returns `true` if currently in a latency spike.
+    pub fn in_spike(&self) -> bool {
+        self.current_spike_delay > 0
+    }
+
+    /// Trigger/update latency spike state. Should be called when determining delay.
+    pub fn update_spike(&mut self) {
+        if self.current_spike_delay > 0 {
+            self.current_spike_delay = 0;
+        } else if self.spike_prob > 0.0 && self.rng.next_f64() < self.spike_prob {
+            self.current_spike_delay = self.spike_delay_ms;
+        }
+    }
+
+    /// Get the asymmetric loss rate for a specific pair.
+    pub fn asymmetric_loss_rate(&self, from: SocketAddr, to: SocketAddr) -> Option<f64> {
+        self.asymmetric_loss.get(&(from, to)).copied()
     }
 
     /// Decide whether this packet should be stashed for reordering.
@@ -460,5 +580,146 @@ mod tests {
             }
         }
         assert!(delivered > 0 && delivered < 100);
+    }
+
+    // ── Burst Loss ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn burst_loss_disabled_by_default() {
+        let sim = NetSim::new(0);
+        assert!(!sim.in_burst());
+        assert_eq!(sim.burst_remaining(), 0);
+    }
+
+    #[test]
+    fn burst_loss_configured_via_builder() {
+        let sim = NetSim::new(0).with_burst_loss(0.5, 5);
+        assert!(!sim.in_burst());
+    }
+
+    #[test]
+    fn burst_loss_drops_consecutive_packets() {
+        let mut sim = NetSim::new(42).with_loss(1.0).with_burst_loss(1.0, 3);
+        for _ in 0..10 {
+            assert!(!sim.should_deliver(addr(1), addr(2)));
+        }
+        assert!(sim.in_burst() || sim.burst_remaining() > 0);
+    }
+
+    #[test]
+    fn burst_loss_with_zero_probability() {
+        let mut sim = NetSim::new(0).with_burst_loss(0.0, 5);
+        let mut delivered = 0;
+        for _ in 0..100 {
+            if sim.should_deliver(addr(1), addr(2)) {
+                delivered += 1;
+            }
+        }
+        assert_eq!(delivered, 100);
+    }
+
+    // ── Latency Spikes ───────────────────────────────────────────────────
+
+    #[test]
+    fn latency_spikes_disabled_by_default() {
+        let sim = NetSim::new(0);
+        assert!(!sim.in_spike());
+        assert_eq!(sim.delay_ms(), 0);
+    }
+
+    #[test]
+    fn latency_spikes_configured_via_builder() {
+        let sim = NetSim::new(0).with_latency_spikes(0.5, 100);
+        assert!(!sim.in_spike());
+    }
+
+    #[test]
+    fn latency_spikes_increases_delay() {
+        let mut sim = NetSim::new(0).with_latency_spikes(1.0, 100);
+        assert_eq!(sim.delay_ms(), 0);
+        sim.should_deliver(addr(1), addr(2));
+        assert!(sim.in_spike());
+        assert_eq!(sim.delay_ms(), 100);
+    }
+
+    #[test]
+    fn latency_spikes_base_delay_preserved() {
+        let mut sim = NetSim::new(0)
+            .with_delay_ms(50)
+            .with_latency_spikes(1.0, 100);
+        assert_eq!(sim.base_delay_ms(), 50);
+        assert_eq!(sim.delay_ms(), 50);
+        sim.should_deliver(addr(1), addr(2));
+        assert_eq!(sim.delay_ms(), 150);
+    }
+
+    // ── Asymmetric Loss ─────────────────────────────────────────────────
+
+    #[test]
+    fn asymmetric_loss_disabled_by_default() {
+        let sim = NetSim::new(0);
+        assert_eq!(sim.asymmetric_loss_rate(addr(1), addr(2)), None);
+    }
+
+    #[test]
+    fn asymmetric_loss_configured_via_builder() {
+        let sim = NetSim::new(0).with_asymmetric_loss(addr(1), addr(2), 0.5);
+        assert_eq!(sim.asymmetric_loss_rate(addr(1), addr(2)), Some(0.5));
+    }
+
+    #[test]
+    fn asymmetric_loss_takes_precedence() {
+        let mut sim = NetSim::new(0)
+            .with_loss(0.0)
+            .with_asymmetric_loss(addr(1), addr(2), 1.0);
+        for _ in 0..10 {
+            assert!(!sim.should_deliver(addr(1), addr(2)));
+        }
+        assert!(sim.should_deliver(addr(1), addr(3)));
+    }
+
+    #[test]
+    fn asymmetric_loss_different_directions() {
+        let mut sim = NetSim::new(0).with_asymmetric_loss(addr(1), addr(2), 1.0);
+        for _ in 0..10 {
+            assert!(!sim.should_deliver(addr(1), addr(2)));
+        }
+        for _ in 0..10 {
+            assert!(sim.should_deliver(addr(2), addr(1)));
+        }
+    }
+
+    #[test]
+    fn asymmetric_loss_runtime_mutation() {
+        let mut sim = NetSim::new(0);
+        assert!(sim.should_deliver(addr(1), addr(2)));
+        sim.set_asymmetric_loss(addr(1), addr(2), 1.0);
+        assert!(!sim.should_deliver(addr(1), addr(2)));
+        sim.remove_asymmetric_loss(addr(1), addr(2));
+        assert!(sim.should_deliver(addr(1), addr(2)));
+    }
+
+    #[test]
+    fn asymmetric_loss_clear_all() {
+        let mut sim = NetSim::new(0)
+            .with_asymmetric_loss(addr(1), addr(2), 1.0)
+            .with_asymmetric_loss(addr(3), addr(4), 1.0);
+        assert!(!sim.should_deliver(addr(1), addr(2)));
+        assert!(!sim.should_deliver(addr(3), addr(4)));
+        sim.clear_asymmetric_loss();
+        assert!(sim.should_deliver(addr(1), addr(2)));
+        assert!(sim.should_deliver(addr(3), addr(4)));
+    }
+
+    #[test]
+    fn asymmetric_loss_combined_with_burst() {
+        let mut sim = NetSim::new(0)
+            .with_loss(0.0)
+            .with_asymmetric_loss(addr(1), addr(2), 1.0)
+            .with_burst_loss(0.0, 3);
+        assert!(!sim.should_deliver(addr(1), addr(2)));
+        assert!(!sim.should_deliver(addr(1), addr(2)));
+        assert!(!sim.should_deliver(addr(1), addr(2)));
+        assert!(!sim.should_deliver(addr(1), addr(2)));
     }
 }
