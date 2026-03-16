@@ -218,9 +218,11 @@ impl Transport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::{
+        build_gossip, build_ping, kind, status, WireNodeEntry, HEADER_LEN, NODE_ENTRY_V4_LEN,
+        OFF_CHECKSUM, OFF_KIND,
+    };
     use std::net::{IpAddr, Ipv4Addr};
-    use crate::message::{build_ping, build_gossip, kind, WireNodeEntry,
-                         status, HEADER_LEN, OFF_CHECKSUM, OFF_KIND, NODE_ENTRY_V4_LEN};
 
     fn localhost_any() -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
@@ -339,7 +341,10 @@ mod tests {
     #[tokio::test]
     async fn decode_encrypted_valid() {
         let key = ClusterKey::generate();
-        let t = Transport::bind(localhost_any()).await.unwrap().with_key(key.clone());
+        let t = Transport::bind(localhost_any())
+            .await
+            .unwrap()
+            .with_key(key.clone());
         let msg = build_ping(42, 1, 0, vec![]);
         let encoded = msg.encode().unwrap();
         let ciphertext = key.encrypt(&encoded, 42).unwrap();
@@ -351,7 +356,10 @@ mod tests {
     async fn decode_encrypted_wrong_key_fails() {
         let key1 = ClusterKey::generate();
         let key2 = ClusterKey::generate();
-        let t = Transport::bind(localhost_any()).await.unwrap().with_key(key1);
+        let t = Transport::bind(localhost_any())
+            .await
+            .unwrap()
+            .with_key(key1);
         let msg = build_ping(42, 1, 0, vec![]);
         let encoded = msg.encode().unwrap();
         let ciphertext = key2.encrypt(&encoded, 42).unwrap();
@@ -361,7 +369,10 @@ mod tests {
     #[tokio::test]
     async fn decode_encrypted_sender_id_mismatch_fails() {
         let key = ClusterKey::generate();
-        let t = Transport::bind(localhost_any()).await.unwrap().with_key(key.clone());
+        let t = Transport::bind(localhost_any())
+            .await
+            .unwrap()
+            .with_key(key.clone());
         // Encrypt with AAD sender_id=42 but message has sender_id=99.
         let msg = build_ping(99, 1, 0, vec![]);
         let encoded = msg.encode().unwrap();
@@ -376,7 +387,10 @@ mod tests {
     #[tokio::test]
     async fn decode_plaintext_on_encrypted_transport_fails() {
         let key = ClusterKey::generate();
-        let t = Transport::bind(localhost_any()).await.unwrap().with_key(key);
+        let t = Transport::bind(localhost_any())
+            .await
+            .unwrap()
+            .with_key(key);
         let buf = valid_ping_bytes(1);
         assert!(t.decode_datagram(&buf).is_err());
     }
@@ -384,7 +398,10 @@ mod tests {
     #[tokio::test]
     async fn decode_encrypted_corrupted_ciphertext_fails() {
         let key = ClusterKey::generate();
-        let t = Transport::bind(localhost_any()).await.unwrap().with_key(key.clone());
+        let t = Transport::bind(localhost_any())
+            .await
+            .unwrap()
+            .with_key(key.clone());
         let msg = build_ping(42, 1, 0, vec![]);
         let encoded = msg.encode().unwrap();
         let mut ciphertext = key.encrypt(&encoded, 42).unwrap();
@@ -412,8 +429,14 @@ mod tests {
     #[tokio::test]
     async fn send_and_recv_encrypted_roundtrip() {
         let key = ClusterKey::generate();
-        let t1 = Transport::bind(localhost_any()).await.unwrap().with_key(key.clone());
-        let t2 = Transport::bind(localhost_any()).await.unwrap().with_key(key);
+        let t1 = Transport::bind(localhost_any())
+            .await
+            .unwrap()
+            .with_key(key.clone());
+        let t2 = Transport::bind(localhost_any())
+            .await
+            .unwrap()
+            .with_key(key);
         let msg = build_ping(1, 99, 0, vec![]);
         t1.send_to(&msg, t2.local_addr).await.unwrap();
 
@@ -481,10 +504,10 @@ mod tests {
         let raw_socket = t1.clone_socket();
 
         // Send several varieties of bad datagrams.
-        raw_socket.send_to(&[0xFF; 3], t2.local_addr).await.unwrap();   // too short
+        raw_socket.send_to(&[0xFF; 3], t2.local_addr).await.unwrap(); // too short
         let mut bad_cksum = valid_ping_bytes(1);
         bad_cksum[10] ^= 0x01;
-        raw_socket.send_to(&bad_cksum, t2.local_addr).await.unwrap();   // bad checksum
+        raw_socket.send_to(&bad_cksum, t2.local_addr).await.unwrap(); // bad checksum
 
         // Valid message last.
         let good = build_ping(5, 55, 0, vec![]);
@@ -505,7 +528,9 @@ mod tests {
 
     #[tokio::test]
     async fn encrypted_transport_is_encrypted() {
-        let t = Transport::bind(localhost_any()).await.unwrap()
+        let t = Transport::bind(localhost_any())
+            .await
+            .unwrap()
             .with_key(ClusterKey::generate());
         assert!(t.is_encrypted());
     }

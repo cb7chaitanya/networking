@@ -1,6 +1,8 @@
 use crate::cache::DnsCache;
 use crate::dns::{DnsError, DnsPacket, RecordClass, RecordData, RecordType, ResourceRecord};
+use crate::distributed::{self, DistributedCacheHit};
 use crate::network::{extract_ns_and_glue, pick_ns_server, query, ROOT_SERVERS};
+use gossip_membership::app_state::AppStateHandle;
 use std::collections::HashSet;
 use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -38,6 +40,7 @@ pub struct DnsResolver {
     cache: DnsCache,
     metrics: Mutex<ResolverMetrics>,
     backend: Option<Arc<BackendFn>>,
+    distributed_cache: Option<AppStateHandle>,
 }
 
 impl DnsResolver {
@@ -47,6 +50,7 @@ impl DnsResolver {
             cache: DnsCache::new(),
             metrics: Mutex::new(ResolverMetrics::default()),
             backend: None,
+            distributed_cache: None,
         }
     }
 
@@ -56,7 +60,13 @@ impl DnsResolver {
             cache: DnsCache::new(),
             metrics: Mutex::new(ResolverMetrics::default()),
             backend: Some(Arc::from(backend)),
+            distributed_cache: None,
         }
+    }
+
+    pub fn with_distributed_cache(mut self, cache: AppStateHandle) -> Self {
+        self.distributed_cache = Some(cache);
+        self
     }
 
     /// Access metrics
@@ -161,6 +171,22 @@ impl DnsResolver {
             return Ok(cached);
         }
 
+        if let Some(distributed_cache) = &self.distributed_cache {
+            match distributed::lookup(distributed_cache, domain, record_type)? {
+                Some(DistributedCacheHit::Positive(records)) => {
+                    self.metrics.lock().unwrap().cache_hits += 1;
+                    self.cache.put_multiple(records.clone());
+                    return Ok(records);
+                }
+                Some(DistributedCacheHit::Negative { ttl }) => {
+                    self.metrics.lock().unwrap().cache_hits += 1;
+                    self.cache.put_negative(domain, record_type, ttl);
+                    return Err(DnsError::NxDomain);
+                }
+                None => {}
+            }
+        }
+
         // If cache.get returned None, it could be:
         // 1. Cache miss (not in cache)
         // 2. Negative cache hit (domain doesn't exist, cached)
@@ -194,6 +220,20 @@ impl DnsResolver {
         // Cache each group
         for (_, group) in grouped {
             self.cache.put_multiple(group);
+        }
+
+        if let Some(distributed_cache) = &self.distributed_cache {
+            use std::collections::HashMap;
+            let mut grouped: HashMap<(String, RecordType), Vec<ResourceRecord>> = HashMap::new();
+            for record in &records {
+                grouped
+                    .entry((record.name.clone(), record.record_type))
+                    .or_default()
+                    .push(record.clone());
+            }
+            for (_, group) in grouped {
+                distributed::publish_positive(distributed_cache, &group);
+            }
         }
 
         Ok(records)
@@ -231,6 +271,9 @@ impl DnsResolver {
                 self.metrics().unwrap().nxdomain_hits += 1;
                 // Cache negative response (NXDOMAIN) with default TTL
                 self.cache.put_negative(&domain, record_type, 300);
+                if let Some(distributed_cache) = &self.distributed_cache {
+                    distributed::publish_negative(distributed_cache, &domain, record_type, 300);
+                }
 
                 // Try CNAME if requested type doesn't exist (per DNS RFC)
                 match backend(&domain, RecordType::CNAME) {
@@ -238,6 +281,14 @@ impl DnsResolver {
                     Err(DnsError::NxDomain) => {
                         // Also cache negative for CNAME
                         self.cache.put_negative(&domain, RecordType::CNAME, 300);
+                        if let Some(distributed_cache) = &self.distributed_cache {
+                            distributed::publish_negative(
+                                distributed_cache,
+                                &domain,
+                                RecordType::CNAME,
+                                300,
+                            );
+                        }
                         return Err(DnsError::NxDomain);
                     }
                     Err(e) => {
@@ -250,6 +301,9 @@ impl DnsResolver {
                 // Direct NXDOMAIN for CNAME query
                 self.metrics().unwrap().nxdomain_hits += 1;
                 self.cache.put_negative(&domain, record_type, 300);
+                if let Some(distributed_cache) = &self.distributed_cache {
+                    distributed::publish_negative(distributed_cache, &domain, record_type, 300);
+                }
                 return Err(DnsError::NxDomain);
             }
             Err(DnsError::ServFail) => {
@@ -327,6 +381,9 @@ impl DnsResolver {
                     Err(DnsError::NxDomain) => {
                         self.metrics.lock().unwrap().nxdomain_hits += 1;
                         self.cache.put_negative(domain, record_type, 300);
+                        if let Some(distributed_cache) = &self.distributed_cache {
+                            distributed::publish_negative(distributed_cache, domain, record_type, 300);
+                        }
                         return Err(DnsError::NxDomain);
                     }
                     Err(DnsError::ServFail) => {

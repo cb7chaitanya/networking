@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crate::message::{
-    build_anti_entropy_chunk, Message, WireNodeEntry, HEADER_LEN, AE_CHUNK_HEADER,
+    build_anti_entropy_chunk, Message, WireNodeEntry, AE_CHUNK_HEADER, HEADER_LEN,
 };
 use crate::node::NodeId;
 
@@ -116,7 +116,10 @@ impl ChunkAssembler {
         total_chunks: u16,
         entries: Vec<WireNodeEntry>,
     ) -> Option<Vec<WireNodeEntry>> {
-        let key = AssemblyKey { sender_id, table_version };
+        let key = AssemblyKey {
+            sender_id,
+            table_version,
+        };
         let asm = self.assemblies.entry(key).or_insert_with(|| Assembly {
             total_chunks,
             received: HashMap::new(),
@@ -151,9 +154,8 @@ impl ChunkAssembler {
     /// Remove assemblies that have been pending longer than the timeout.
     pub fn expire(&mut self, now: Instant) -> usize {
         let before = self.assemblies.len();
-        self.assemblies.retain(|_, asm| {
-            now.duration_since(asm.created) < self.timeout
-        });
+        self.assemblies
+            .retain(|_, asm| now.duration_since(asm.created) < self.timeout);
         before - self.assemblies.len()
     }
 
@@ -166,8 +168,8 @@ impl ChunkAssembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use crate::message::status;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn v4_entry(id: u64) -> WireNodeEntry {
         WireNodeEntry {
@@ -188,10 +190,7 @@ mod tests {
             heartbeat: id as u32,
             incarnation: 0,
             status: status::ALIVE,
-            addr: SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::LOCALHOST),
-                9000 + id as u16,
-            ),
+            addr: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 9000 + id as u16),
         }
     }
 
@@ -218,7 +217,10 @@ mod tests {
         // 200 entries → should produce ~4-5 chunks.
         let entries: Vec<_> = (0..200).map(v4_entry).collect();
         let chunks = chunk_entries(&entries);
-        assert!(chunks.len() > 1, "200 entries should require multiple chunks");
+        assert!(
+            chunks.len() > 1,
+            "200 entries should require multiple chunks"
+        );
         // Verify all entries present.
         let total: usize = chunks.iter().map(|c| c.len()).sum();
         assert_eq!(total, 200);

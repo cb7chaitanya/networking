@@ -95,13 +95,14 @@ impl PendingAcks {
 
         let exhausted = exhausted_ids.len();
         for id in exhausted_ids {
-            log::warn!(
-                "[reliable] exhausted retries for target {id} — giving up"
-            );
+            log::warn!("[reliable] exhausted retries for target {id} — giving up");
             self.pending.remove(&id);
         }
 
-        RetryResult { retransmits, exhausted }
+        RetryResult {
+            retransmits,
+            exhausted,
+        }
     }
 
     /// Number of pending entries (for testing / metrics).

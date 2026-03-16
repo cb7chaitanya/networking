@@ -1,3 +1,4 @@
+pub mod app_state;
 pub mod anti_entropy;
 pub mod config;
 pub mod crypto;

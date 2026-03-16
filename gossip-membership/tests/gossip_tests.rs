@@ -11,6 +11,9 @@ use tokio::sync::oneshot;
 
 use std::sync::{Arc, Mutex};
 
+use gossip_membership::app_state::{
+    DnsCacheEntry, DnsCacheValue, DnsRecordData, DnsResourceRecord, TcpServiceAdvertisement,
+};
 use gossip_membership::crypto::ClusterKey;
 use gossip_membership::node::{NodeConfig, NodeStatus};
 use gossip_membership::runner::{run_node, Node};
@@ -129,6 +132,110 @@ async fn test_three_nodes_converge() {
     }
 }
 
+#[tokio::test]
+async fn test_dns_cache_entries_gossip_across_cluster() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let mut n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
+
+    n1.publish_dns_entry(DnsCacheEntry::positive(
+        "example.com",
+        1,
+        Duration::from_secs(30),
+        vec![DnsResourceRecord {
+            class: 1,
+            ttl: 30,
+            data: DnsRecordData::A(Ipv4Addr::new(1, 1, 1, 1)),
+        }],
+    ));
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+
+    let _node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+
+    let entry = node2
+        .app_state
+        .dns_entry("example.com", 1)
+        .expect("node2 should receive DNS cache entry via gossip");
+
+    match entry.value {
+        DnsCacheValue::Positive { records } => {
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].data, DnsRecordData::A(Ipv4Addr::new(1, 1, 1, 1)));
+        }
+        DnsCacheValue::Negative => panic!("expected positive DNS entry"),
+    }
+}
+
+#[tokio::test]
+async fn test_tcp_service_discovery_propagates_via_gossip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let t3 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let mut n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1]);
+    let n1_id = n1.id;
+
+    n1.advertise_tcp_service(TcpServiceAdvertisement::new(
+        "gbn",
+        n1.id,
+        addr1,
+        1,
+        Duration::from_secs(30),
+    ));
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let _node1 = h1.await.unwrap();
+    let _node2 = h2.await.unwrap();
+    let node3 = h3.await.unwrap();
+
+    let services = node3.app_state.tcp_nodes("gbn");
+    assert!(
+        services
+            .iter()
+            .any(|entry| entry.node_id == n1_id && entry.addr == addr1),
+        "node3 should learn node1's TCP service via gossip propagation"
+    );
+}
+
 /// A node that is seeded with only one peer (ring topology) should still
 /// discover the third node through gossip propagation.
 #[tokio::test]
@@ -204,15 +311,21 @@ async fn test_dead_rejoin_with_incarnation() {
 
     // Same incarnation, higher heartbeat — must NOT resurrect.
     table.merge_entry(&NodeState::new_alive(2, peer_addr, 20));
-    assert_eq!(table.entries[&2].status, NodeStatus::Dead,
-        "same incarnation must not resurrect Dead");
+    assert_eq!(
+        table.entries[&2].status,
+        NodeStatus::Dead,
+        "same incarnation must not resurrect Dead"
+    );
 
     // Higher incarnation — MUST resurrect (node restarted).
     let mut rejoin = NodeState::new_alive(2, peer_addr, 0);
     rejoin.incarnation = 1;
     table.merge_entry(&rejoin);
-    assert_eq!(table.entries[&2].status, NodeStatus::Alive,
-        "higher incarnation must resurrect Dead node");
+    assert_eq!(
+        table.entries[&2].status,
+        NodeStatus::Alive,
+        "higher incarnation must resurrect Dead node"
+    );
     assert_eq!(table.entries[&2].incarnation, 1);
 }
 
@@ -231,7 +344,7 @@ async fn test_heartbeat_wraps() {
     // We drive tick_heartbeat directly.
     table.tick_heartbeat();
     table.tick_heartbeat(); // wraps to 1 (0 after MAX, then 1)
-    // No panic is the assertion — wrapping_add is used internally.
+                            // No panic is the assertion — wrapping_add is used internally.
     assert!(table.our_heartbeat() < 10); // wrapped
 }
 
@@ -292,7 +405,7 @@ async fn test_failure_detection_suspect() {
 #[tokio::test]
 async fn test_gossip_message_encode_decode() {
     use gossip_membership::message::{
-        build_gossip, Message, MessagePayload, WireNodeEntry, status,
+        build_gossip, status, Message, MessagePayload, WireNodeEntry,
     };
     use std::net::Ipv4Addr;
 
@@ -417,7 +530,10 @@ async fn test_star_topology_five_nodes() {
                 continue;
             }
             assert!(
-                node.table.entries.values().any(|e| e.node_id == expected_id),
+                node.table
+                    .entries
+                    .values()
+                    .any(|e| e.node_id == expected_id),
                 "node[{i}] does not know about node[{j}] (id={expected_id})"
             );
         }
@@ -857,7 +973,10 @@ async fn test_multi_target_gossip_converges() {
                 continue;
             }
             assert!(
-                node.table.entries.values().any(|e| e.node_id == expected_id),
+                node.table
+                    .entries
+                    .values()
+                    .any(|e| e.node_id == expected_id),
                 "multi-target: node[{i}] does not know about node[{j}] (id={expected_id})"
             );
         }
@@ -905,7 +1024,10 @@ async fn test_metrics_collected_after_convergence() {
         assert!(m.pings_recv > 0, "{name}: pings_recv should be > 0");
         assert!(m.acks_sent > 0, "{name}: acks_sent should be > 0");
         assert!(m.acks_recv > 0, "{name}: acks_recv should be > 0");
-        assert!(m.merges_new > 0, "{name}: merges_new should be > 0 (discovered peer)");
+        assert!(
+            m.merges_new > 0,
+            "{name}: merges_new should be > 0 (discovered peer)"
+        );
     }
 
     // Verify summary formatting works.
@@ -1028,11 +1150,19 @@ async fn test_leave_does_not_affect_remaining_nodes() {
 
     // Remaining nodes should still see each other as Alive.
     assert!(
-        node2.table.entries.values().any(|e| e.node_id == id3 && e.status == NodeStatus::Alive),
+        node2
+            .table
+            .entries
+            .values()
+            .any(|e| e.node_id == id3 && e.status == NodeStatus::Alive),
         "node2 should still see node3 as Alive"
     );
     assert!(
-        node3.table.entries.values().any(|e| e.node_id == id2 && e.status == NodeStatus::Alive),
+        node3
+            .table
+            .entries
+            .values()
+            .any(|e| e.node_id == id2 && e.status == NodeStatus::Alive),
         "node3 should still see node2 as Alive"
     );
 }
@@ -1141,7 +1271,10 @@ async fn test_request_ack_retries_on_timeout() {
         .find(|e| e.node_id == id2)
         .map(|e| e.status);
     assert!(
-        matches!(node2_status, Some(NodeStatus::Suspect) | Some(NodeStatus::Dead)),
+        matches!(
+            node2_status,
+            Some(NodeStatus::Suspect) | Some(NodeStatus::Dead)
+        ),
         "node2 should be Suspect or Dead on node1 after silence"
     );
 }
@@ -1383,11 +1516,19 @@ async fn test_full_isolation_detected() {
 
     // node1 and node2 should still see each other as Alive.
     assert!(
-        node1.table.entries.values().any(|e| e.node_id == id2 && e.status == NodeStatus::Alive),
+        node1
+            .table
+            .entries
+            .values()
+            .any(|e| e.node_id == id2 && e.status == NodeStatus::Alive),
         "node1 should still see node2 as Alive"
     );
     assert!(
-        node2.table.entries.values().any(|e| e.node_id == id1 && e.status == NodeStatus::Alive),
+        node2
+            .table
+            .entries
+            .values()
+            .any(|e| e.node_id == id1 && e.status == NodeStatus::Alive),
         "node2 should still see node1 as Alive"
     );
 }
@@ -1556,8 +1697,14 @@ async fn test_anti_entropy_disabled_sends_nothing() {
     let node1 = h1.await.unwrap();
     let node2 = h2.await.unwrap();
 
-    assert_eq!(node1.metrics.anti_entropy_sent, 0, "anti-entropy should be disabled");
-    assert_eq!(node2.metrics.anti_entropy_sent, 0, "anti-entropy should be disabled");
+    assert_eq!(
+        node1.metrics.anti_entropy_sent, 0,
+        "anti-entropy should be disabled"
+    );
+    assert_eq!(
+        node2.metrics.anti_entropy_sent, 0,
+        "anti-entropy should be disabled"
+    );
 }
 
 // ── Cluster partition & recovery tests ──────────────────────────────────────
@@ -1585,7 +1732,9 @@ async fn test_split_brain_and_recovery() {
         .into_iter()
         .enumerate()
         .map(|(i, t)| {
-            let peers: Vec<SocketAddr> = addrs.iter().enumerate()
+            let peers: Vec<SocketAddr> = addrs
+                .iter()
+                .enumerate()
                 .filter(|&(j, _)| j != i)
                 .map(|(_, a)| *a)
                 .collect();
@@ -1637,7 +1786,11 @@ async fn test_split_brain_and_recovery() {
             if i == j {
                 continue;
             }
-            let entry = node.table.entries.values().find(|e| e.node_id == expected_id);
+            let entry = node
+                .table
+                .entries
+                .values()
+                .find(|e| e.node_id == expected_id);
             assert!(
                 entry.is_some(),
                 "node[{i}] does not know about node[{j}] (id={expected_id}) after split-brain recovery"
@@ -1975,13 +2128,24 @@ async fn test_metrics_http_endpoint() {
     .await
     .unwrap();
     let mut resp = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp).await.unwrap();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp)
+        .await
+        .unwrap();
     let body = String::from_utf8_lossy(&resp);
 
     assert!(body.contains("HTTP/1.1 200 OK"), "should return 200");
-    assert!(body.contains("text/plain"), "should be Prometheus content type");
-    assert!(body.contains("swim_gossip_rounds_total"), "should contain Prometheus counter");
-    assert!(body.contains("# TYPE swim_members_alive gauge"), "should contain gauge type");
+    assert!(
+        body.contains("text/plain"),
+        "should be Prometheus content type"
+    );
+    assert!(
+        body.contains("swim_gossip_rounds_total"),
+        "should contain Prometheus counter"
+    );
+    assert!(
+        body.contains("# TYPE swim_members_alive gauge"),
+        "should contain gauge type"
+    );
 
     // Query the JSON endpoint.
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{metrics_port}"))
@@ -1994,11 +2158,19 @@ async fn test_metrics_http_endpoint() {
     .await
     .unwrap();
     let mut resp = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp).await.unwrap();
+    tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp)
+        .await
+        .unwrap();
     let body = String::from_utf8_lossy(&resp);
 
-    assert!(body.contains("application/json"), "should be JSON content type");
-    assert!(body.contains(r#""gossip_rounds":"#), "should contain JSON field");
+    assert!(
+        body.contains("application/json"),
+        "should be JSON content type"
+    );
+    assert!(
+        body.contains(r#""gossip_rounds":"#),
+        "should contain JSON field"
+    );
 
     let _ = tx1.send(());
     let _ = tx2.send(());
@@ -2062,15 +2234,30 @@ async fn test_operational_endpoints() {
     // ── /readyz ──
     let resp = http_get(metrics_port, "/readyz").await;
     assert!(resp.contains("200 OK"), "/readyz should return 200");
-    assert!(resp.contains(r#""alive_nodes":"#), "/readyz should have alive_nodes");
-    assert!(resp.contains(r#""suspect_nodes":"#), "/readyz should have suspect_nodes");
-    assert!(resp.contains(r#""dead_nodes":"#), "/readyz should have dead_nodes");
+    assert!(
+        resp.contains(r#""alive_nodes":"#),
+        "/readyz should have alive_nodes"
+    );
+    assert!(
+        resp.contains(r#""suspect_nodes":"#),
+        "/readyz should have suspect_nodes"
+    );
+    assert!(
+        resp.contains(r#""dead_nodes":"#),
+        "/readyz should have dead_nodes"
+    );
 
     // ── /membership ──
     let resp = http_get(metrics_port, "/membership").await;
     assert!(resp.contains("200 OK"), "/membership should return 200");
-    assert!(resp.contains(r#""nodes":["#), "/membership should have nodes array");
-    assert!(resp.contains(r#""status":"alive""#), "should list alive nodes");
+    assert!(
+        resp.contains(r#""nodes":["#),
+        "/membership should have nodes array"
+    );
+    assert!(
+        resp.contains(r#""status":"alive""#),
+        "should list alive nodes"
+    );
     assert!(resp.contains(r#""id":""#), "should list node ids");
     assert!(resp.contains(r#""addr":""#), "should list node addrs");
 
@@ -2120,7 +2307,9 @@ async fn test_inbound_rate_limiting_drops_flood() {
     let node2 = h2.await.unwrap();
 
     // Drain the counter manually since metrics tick may not have fired.
-    let dropped = node2.transport.rate_limited_count
+    let dropped = node2
+        .transport
+        .rate_limited_count
         .load(std::sync::atomic::Ordering::Relaxed)
         + node2.metrics.rate_limited;
 
@@ -2140,9 +2329,7 @@ async fn test_inbound_rate_limiting_drops_flood() {
 async fn test_convergence_under_reorder() {
     let _ = env_logger::builder().is_test(true).try_init();
     let cfg = NodeConfig::fast();
-    let sim = Arc::new(Mutex::new(
-        NetSim::new(42).with_reorder(0.8, 5),
-    ));
+    let sim = Arc::new(Mutex::new(NetSim::new(42).with_reorder(0.8, 5)));
 
     let t1 = bind_sim(&sim).await;
     let t2 = bind_sim(&sim).await;
@@ -2200,9 +2387,7 @@ async fn test_indirect_probes_under_reorder() {
     cfg.probe_timeout_ms = 150;
     cfg.suspect_timeout_ms = 800;
     cfg.indirect_probe_k = 2;
-    let sim = Arc::new(Mutex::new(
-        NetSim::new(0).with_reorder(0.3, 2),
-    ));
+    let sim = Arc::new(Mutex::new(NetSim::new(0).with_reorder(0.3, 2)));
 
     let t1 = bind_sim(&sim).await;
     let t2 = bind_sim(&sim).await;

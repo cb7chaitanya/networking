@@ -55,19 +55,23 @@ fn arb_status() -> impl Strategy<Value = NodeStatus> {
 }
 
 fn arb_node_state() -> impl Strategy<Value = NodeState> {
-    (1u64..=20, 0u32..=5, 0u32..=50, arb_status())
-        .prop_map(|(id, inc, hb, status)| {
-            let mut s = NodeState::new_alive(id, addr_for(id), hb);
-            s.incarnation = inc;
-            s.status = status;
-            s
-        })
+    (1u64..=20, 0u32..=5, 0u32..=50, arb_status()).prop_map(|(id, inc, hb, status)| {
+        let mut s = NodeState::new_alive(id, addr_for(id), hb);
+        s.incarnation = inc;
+        s.status = status;
+        s
+    })
 }
 
 /// Updates for the same node at the same (inc, hb), varying only status.
 /// Commutativity provably holds for this case.
 fn arb_same_version_updates() -> impl Strategy<Value = Vec<NodeState>> {
-    (1u64..=20, 0u32..=5, 0u32..=50, prop::collection::vec(arb_status(), 2..=8))
+    (
+        1u64..=20,
+        0u32..=5,
+        0u32..=50,
+        prop::collection::vec(arb_status(), 2..=8),
+    )
         .prop_map(|(id, inc, hb, statuses)| {
             statuses
                 .into_iter()

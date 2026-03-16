@@ -17,10 +17,7 @@ use crate::node::NodeId;
 /// matching the ISN-generation pattern from tcp-over-udp's `connection.rs`.
 ///
 /// Returns `None` if no live peers are known.
-pub fn pick_random_peer(
-    table: &MembershipTable,
-    self_id: NodeId,
-) -> Option<(NodeId, SocketAddr)> {
+pub fn pick_random_peer(table: &MembershipTable, self_id: NodeId) -> Option<(NodeId, SocketAddr)> {
     let live: Vec<(NodeId, SocketAddr)> = table
         .entries
         .values()
@@ -181,9 +178,9 @@ pub fn build_gossip_message(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use crate::message::{kind, MessagePayload};
     use crate::node::{NodeState, NodeStatus};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
@@ -421,7 +418,11 @@ mod tests {
     fn targets_capped_at_max() {
         let mut t = MembershipTable::new(1, make_addr(1000));
         for i in 2..=10u64 {
-            t.merge_entry(&NodeState::new_alive(i, make_addr(1000 + i as u16), i as u32));
+            t.merge_entry(&NodeState::new_alive(
+                i,
+                make_addr(1000 + i as u16),
+                i as u32,
+            ));
         }
         let targets = pick_gossip_targets(&t, 1, 3);
         assert_eq!(targets.len(), 3);
@@ -603,7 +604,10 @@ mod tests {
         match &msg.payload {
             MessagePayload::Gossip(entries) => {
                 let dead_entry = entries.iter().find(|e| e.node_id == 2);
-                assert!(dead_entry.is_some(), "Dead entries must be included in gossip");
+                assert!(
+                    dead_entry.is_some(),
+                    "Dead entries must be included in gossip"
+                );
                 assert_eq!(dead_entry.unwrap().status, crate::message::status::DEAD);
             }
             _ => panic!("expected Gossip payload"),

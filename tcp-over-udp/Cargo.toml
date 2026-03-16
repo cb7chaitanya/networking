@@ -16,3 +16,4 @@ tokio = { version = "1", features = ["full"] }
 log = "0.4"
 env_logger = "0.11"
 clap = { version = "4", features = ["derive"] }
+gossip-membership = { path = "../gossip-membership" }

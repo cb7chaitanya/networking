@@ -26,7 +26,10 @@ use gossip_membership::transport::Transport;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 #[derive(Parser, Debug)]
-#[command(name = "gossip-membership", about = "Gossip-based distributed membership protocol")]
+#[command(
+    name = "gossip-membership",
+    about = "Gossip-based distributed membership protocol"
+)]
 struct Args {
     /// Path to a TOML configuration file.
     #[arg(long)]
@@ -95,15 +98,16 @@ async fn main() {
     }
 
     // ── Cluster key: CLI flag > file config ──────────────────────────────
-    let key_hex = args.cluster_key.as_deref()
+    let key_hex = args
+        .cluster_key
+        .as_deref()
         .or(file_config.network.cluster_key.as_deref());
 
     let cluster_key: Option<ClusterKey> = key_hex.map(|hex| {
-        let bytes = crypto::key_from_hex(hex)
-            .unwrap_or_else(|| {
-                eprintln!("error: cluster key must be exactly 64 hex characters");
-                std::process::exit(1);
-            });
+        let bytes = crypto::key_from_hex(hex).unwrap_or_else(|| {
+            eprintln!("error: cluster key must be exactly 64 hex characters");
+            std::process::exit(1);
+        });
         ClusterKey::from_bytes(bytes)
     });
 
@@ -112,7 +116,9 @@ async fn main() {
         .iter()
         .filter(|s| !s.is_empty())
         .filter_map(|s| {
-            s.parse().map_err(|e| log::warn!("bad peer address {s}: {e}")).ok()
+            s.parse()
+                .map_err(|e| log::warn!("bad peer address {s}: {e}"))
+                .ok()
         })
         .collect();
 

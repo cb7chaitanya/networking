@@ -14,9 +14,7 @@ use crate::anti_entropy::ChunkAssembler;
 use crate::failure_detector::FailureDetector;
 use crate::gossip;
 use crate::membership::{wire_to_node_state, MembershipTable};
-use crate::message::{
-    build_ack, build_leave, build_ping, build_ping_req, MessagePayload,
-};
+use crate::message::{build_ack, build_leave, build_ping, build_ping_req, MessagePayload};
 use crate::metrics::Metrics;
 use crate::node::{generate_node_id, NodeConfig, NodeId, NodeState};
 use crate::reliable::PendingAcks;
@@ -40,29 +38,21 @@ impl Node {
     pub fn new(mut transport: Transport, config: NodeConfig, peers: &[SocketAddr]) -> Self {
         // Attach inbound rate limiter if configured.
         if config.inbound_global_capacity > 0 {
-            transport = transport.with_rate_limit(
-                crate::rate_limit::RateLimitConfig {
-                    global_capacity: config.inbound_global_capacity,
-                    global_refill_rate: config.inbound_global_refill_rate,
-                    peer_capacity: config.inbound_peer_capacity,
-                    peer_refill_rate: config.inbound_peer_refill_rate,
-                },
-            );
+            transport = transport.with_rate_limit(crate::rate_limit::RateLimitConfig {
+                global_capacity: config.inbound_global_capacity,
+                global_refill_rate: config.inbound_global_refill_rate,
+                peer_capacity: config.inbound_peer_capacity,
+                peer_refill_rate: config.inbound_peer_refill_rate,
+            });
         }
         let id = generate_node_id(transport.local_addr);
         let mut table = MembershipTable::new(id, transport.local_addr);
         for &peer_addr in peers {
             table.add_bootstrap_peer(peer_addr);
         }
-        let failure_det =
-            FailureDetector::new(Duration::from_millis(config.probe_timeout_ms));
-        let pending_acks =
-            PendingAcks::new(Duration::from_millis(config.reliable_ack_timeout_ms));
-        log::info!(
-            "[node] started id={} addr={}",
-            id,
-            transport.local_addr
-        );
+        let failure_det = FailureDetector::new(Duration::from_millis(config.probe_timeout_ms));
+        let pending_acks = PendingAcks::new(Duration::from_millis(config.reliable_ack_timeout_ms));
+        log::info!("[node] started id={} addr={}", id, transport.local_addr);
         let chunk_assembler = ChunkAssembler::new(Duration::from_secs(5));
         Self {
             id,
@@ -145,23 +135,38 @@ async fn metrics_server(port: u16, shared: Arc<Mutex<MetricsSnapshot>>) {
         let (content_type, body) = if path == "/healthz" {
             ("application/json", r#"{"status":"ok"}"#.to_string())
         } else if path == "/readyz" {
-            ("application/json", format!(
-                r#"{{"alive_nodes":{},"suspect_nodes":{},"dead_nodes":{}}}"#,
-                snap.alive, snap.suspect, snap.dead,
-            ))
-        } else if path == "/membership" {
-            let nodes: Vec<String> = snap.members.iter().map(|m| {
+            (
+                "application/json",
                 format!(
-                    r#"{{"id":"{}","addr":"{}","status":"{}"}}"#,
-                    m.id, m.addr, m.status,
-                )
-            }).collect();
-            ("application/json", format!(r#"{{"nodes":[{}]}}"#, nodes.join(",")))
+                    r#"{{"alive_nodes":{},"suspect_nodes":{},"dead_nodes":{}}}"#,
+                    snap.alive, snap.suspect, snap.dead,
+                ),
+            )
+        } else if path == "/membership" {
+            let nodes: Vec<String> = snap
+                .members
+                .iter()
+                .map(|m| {
+                    format!(
+                        r#"{{"id":"{}","addr":"{}","status":"{}"}}"#,
+                        m.id, m.addr, m.status,
+                    )
+                })
+                .collect();
+            (
+                "application/json",
+                format!(r#"{{"nodes":[{}]}}"#, nodes.join(",")),
+            )
         } else if path.contains("json") {
-            ("application/json", snap.metrics.json(snap.alive, snap.suspect, snap.dead))
+            (
+                "application/json",
+                snap.metrics.json(snap.alive, snap.suspect, snap.dead),
+            )
         } else {
-            ("text/plain; version=0.0.4; charset=utf-8",
-             snap.metrics.prometheus(snap.alive, snap.suspect, snap.dead))
+            (
+                "text/plain; version=0.0.4; charset=utf-8",
+                snap.metrics.prometheus(snap.alive, snap.suspect, snap.dead),
+            )
         };
 
         let response = format!(
@@ -176,10 +181,7 @@ async fn metrics_server(port: u16, shared: Arc<Mutex<MetricsSnapshot>>) {
 // ── Event loop ─────────────────────────────────────────────────────────────────
 /// Run a node until `shutdown_rx` fires. Returns the final `Node` so callers
 /// (e.g. tests) can inspect the membership table and metrics.
-pub async fn run_node(
-    mut node: Node,
-    mut shutdown_rx: oneshot::Receiver<()>,
-) -> Node {
+pub async fn run_node(mut node: Node, mut shutdown_rx: oneshot::Receiver<()>) -> Node {
     // Start metrics HTTP server if configured.
     let metrics_shared = Arc::new(Mutex::new(MetricsSnapshot::default()));
     if node.config.metrics_server_port > 0 {
@@ -475,21 +477,14 @@ pub async fn run_node(
 }
 
 // ── Message handler ────────────────────────────────────────────────────────────
-async fn handle_message(
-    node: &mut Node,
-    msg: crate::message::Message,
-    from_addr: SocketAddr,
-) {
+async fn handle_message(node: &mut Node, msg: crate::message::Message, from_addr: SocketAddr) {
     // If this sender was previously known only as a bootstrap placeholder,
     // remove that stale entry before inserting the real one.
-    node.table.remove_placeholder_for_addr(from_addr, msg.sender_id);
+    node.table
+        .remove_placeholder_for_addr(from_addr, msg.sender_id);
 
     // Any message from a node proves it is alive — record liveness from header.
-    let mut sender_alive = NodeState::new_alive(
-        msg.sender_id,
-        from_addr,
-        msg.sender_heartbeat,
-    );
+    let mut sender_alive = NodeState::new_alive(msg.sender_id, from_addr, msg.sender_heartbeat);
     sender_alive.incarnation = msg.sender_incarnation;
     let outcome = node.table.merge_entry(&sender_alive);
     node.metrics.record_merge(outcome);
@@ -515,7 +510,12 @@ async fn handle_message(
             }
             // Respond with ACK if the sender requested reliable delivery.
             if msg.requests_ack() {
-                let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), vec![]);
+                let ack = build_ack(
+                    node.id,
+                    node.table.our_heartbeat(),
+                    node.table.our_incarnation(),
+                    vec![],
+                );
                 if node.transport.send_to(&ack, from_addr).await.is_ok() {
                     node.metrics.acks_sent += 1;
                 }
@@ -533,7 +533,12 @@ async fn handle_message(
             }
             // Respond immediately with an ACK so the sender clears its probe.
             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-            let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
+            let ack = build_ack(
+                node.id,
+                node.table.our_heartbeat(),
+                node.table.our_incarnation(),
+                piggyback,
+            );
             if let Err(e) = node.transport.send_to(&ack, from_addr).await {
                 log::warn!("[node {}] ACK send failed to {from_addr}: {e}", node.id);
             } else {
@@ -547,11 +552,17 @@ async fn handle_message(
             // Forward a PING to the target on behalf of the requester.
             let target_addr = req.target_addr;
             let piggyback = node.table.gossip_wire_entries(node.config.piggyback_max);
-            let ping = build_ping(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), piggyback);
+            let ping = build_ping(
+                node.id,
+                node.table.our_heartbeat(),
+                node.table.our_incarnation(),
+                piggyback,
+            );
             if let Err(e) = node.transport.send_to(&ping, target_addr).await {
                 log::warn!(
                     "[node {}] indirect PING to {} failed: {e}",
-                    node.id, target_addr
+                    node.id,
+                    target_addr
                 );
             } else {
                 node.metrics.pings_sent += 1;
@@ -592,7 +603,12 @@ async fn handle_message(
             // Respond with ACK before marking dead so the departing node
             // knows we received its LEAVE.
             if msg.requests_ack() {
-                let ack = build_ack(node.id, node.table.our_heartbeat(), node.table.our_incarnation(), vec![]);
+                let ack = build_ack(
+                    node.id,
+                    node.table.our_heartbeat(),
+                    node.table.our_incarnation(),
+                    vec![],
+                );
                 let _ = node.transport.send_to(&ack, from_addr).await;
                 node.metrics.acks_sent += 1;
             }
