@@ -10,12 +10,13 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
+use crate::app_state::AppStateHandle;
 use crate::anti_entropy::ChunkAssembler;
 use crate::failure_detector::FailureDetector;
 use crate::gossip;
 use crate::membership::{wire_to_node_state, MembershipTable};
 use crate::message::{
-    build_ack, build_leave, build_ping, build_ping_req, MessagePayload,
+    build_ack, build_app_gossip, build_leave, build_ping, build_ping_req, MessagePayload,
 };
 use crate::metrics::Metrics;
 use crate::node::{generate_node_id, NodeConfig, NodeId, NodeState};
@@ -28,6 +29,7 @@ pub struct Node {
     pub config: NodeConfig,
     pub transport: Transport,
     pub table: MembershipTable,
+    pub app_state: AppStateHandle,
     pub failure_det: FailureDetector,
     pub metrics: Metrics,
     pub pending_acks: PendingAcks,
@@ -69,12 +71,24 @@ impl Node {
             config,
             transport,
             table,
+            app_state: AppStateHandle::new(),
             failure_det,
             metrics: Metrics::default(),
             pending_acks,
             chunk_assembler,
             ae_version: 0,
         }
+    }
+
+    pub fn publish_dns_entry(&mut self, entry: crate::app_state::DnsCacheEntry) {
+        self.app_state.publish_dns_entry(entry);
+    }
+
+    pub fn advertise_tcp_service(
+        &mut self,
+        advertisement: crate::app_state::TcpServiceAdvertisement,
+    ) {
+        self.app_state.advertise_tcp_service(advertisement);
     }
 }
 
@@ -296,6 +310,31 @@ pub async fn run_node(
                                 "[node {}] gossip send failed to {peer_addr}: {e}",
                                 node.id
                             ),
+                        }
+                    }
+
+                    let app_records = node.app_state.gossip_records(1_024);
+                    if !app_records.is_empty() {
+                        let app_msg = build_app_gossip(
+                            node.id,
+                            node.table.our_heartbeat(),
+                            node.table.our_incarnation(),
+                            app_records,
+                        );
+                        for (peer_id, peer_addr) in &targets {
+                            match node.transport.send_to(&app_msg, *peer_addr).await {
+                                Ok(()) => {
+                                    node.metrics.app_gossip_sent += 1;
+                                    log::debug!(
+                                        "[node {}] app-gossip → peer {} @ {}",
+                                        node.id, peer_id, peer_addr
+                                    );
+                                }
+                                Err(e) => log::warn!(
+                                    "[node {}] app-gossip send failed to {peer_addr}: {e}",
+                                    node.id
+                                ),
+                            }
                         }
                     }
                 }
@@ -626,6 +665,17 @@ async fn handle_message(
                     node.metrics.record_merge(o);
                 }
             }
+        }
+
+        MessagePayload::AppGossip(records) => {
+            node.metrics.app_gossip_recv += 1;
+            node.app_state.merge_records(records);
+            log::debug!(
+                "[node {}] app-gossip from {} ({} records)",
+                node.id,
+                msg.sender_id,
+                records.len()
+            );
         }
     }
 }

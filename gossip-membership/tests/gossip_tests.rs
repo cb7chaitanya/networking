@@ -11,6 +11,9 @@ use tokio::sync::oneshot;
 
 use std::sync::{Arc, Mutex};
 
+use gossip_membership::app_state::{
+    DnsCacheEntry, DnsCacheValue, DnsRecordData, DnsResourceRecord, TcpServiceAdvertisement,
+};
 use gossip_membership::crypto::ClusterKey;
 use gossip_membership::node::{NodeConfig, NodeStatus};
 use gossip_membership::runner::{run_node, Node};
@@ -127,6 +130,110 @@ async fn test_three_nodes_converge() {
             assert!(found, "{name} does not know about node {eid}");
         }
     }
+}
+
+#[tokio::test]
+async fn test_dns_cache_entries_gossip_across_cluster() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+
+    let mut n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr1]);
+
+    n1.publish_dns_entry(DnsCacheEntry::positive(
+        "example.com",
+        1,
+        Duration::from_secs(30),
+        vec![DnsResourceRecord {
+            class: 1,
+            ttl: 30,
+            data: DnsRecordData::A(Ipv4Addr::new(1, 1, 1, 1)),
+        }],
+    ));
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+
+    let _node1 = h1.await.unwrap();
+    let node2 = h2.await.unwrap();
+
+    let entry = node2
+        .app_state
+        .dns_entry("example.com", 1)
+        .expect("node2 should receive DNS cache entry via gossip");
+
+    match entry.value {
+        DnsCacheValue::Positive { records } => {
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].data, DnsRecordData::A(Ipv4Addr::new(1, 1, 1, 1)));
+        }
+        DnsCacheValue::Negative => panic!("expected positive DNS entry"),
+    }
+}
+
+#[tokio::test]
+async fn test_tcp_service_discovery_propagates_via_gossip() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let cfg = NodeConfig::fast();
+
+    let t1 = bind_local().await;
+    let t2 = bind_local().await;
+    let t3 = bind_local().await;
+    let addr1 = t1.local_addr;
+    let addr2 = t2.local_addr;
+    let addr3 = t3.local_addr;
+
+    let mut n1 = Node::new(t1, cfg.clone(), &[addr2]);
+    let n2 = Node::new(t2, cfg.clone(), &[addr3]);
+    let n3 = Node::new(t3, cfg.clone(), &[addr1]);
+    let n1_id = n1.id;
+
+    n1.advertise_tcp_service(TcpServiceAdvertisement::new(
+        "gbn",
+        n1.id,
+        addr1,
+        1,
+        Duration::from_secs(30),
+    ));
+
+    let (tx1, rx1) = oneshot::channel();
+    let (tx2, rx2) = oneshot::channel();
+    let (tx3, rx3) = oneshot::channel();
+
+    let h1 = tokio::spawn(run_node(n1, rx1));
+    let h2 = tokio::spawn(run_node(n2, rx2));
+    let h3 = tokio::spawn(run_node(n3, rx3));
+
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+
+    let _ = tx1.send(());
+    let _ = tx2.send(());
+    let _ = tx3.send(());
+
+    let _node1 = h1.await.unwrap();
+    let _node2 = h2.await.unwrap();
+    let node3 = h3.await.unwrap();
+
+    let services = node3.app_state.tcp_nodes("gbn");
+    assert!(
+        services
+            .iter()
+            .any(|entry| entry.node_id == n1_id && entry.addr == addr1),
+        "node3 should learn node1's TCP service via gossip propagation"
+    );
 }
 
 /// A node that is seeded with only one peer (ring topology) should still

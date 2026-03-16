@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
+use crate::discovery::GossipDiscovery;
 use crate::packet::{flags, Header, Packet, TcpOption, DEFAULT_MSS};
 use crate::receiver::Receiver;
 use crate::sender::Sender;
@@ -88,6 +89,8 @@ pub enum ConnError {
     Reset,
     /// Peer closed the connection (FIN received); no more data.
     Eof,
+    /// Gossip discovery did not return a usable peer.
+    DiscoveryFailed,
 }
 
 impl std::fmt::Display for ConnError {
@@ -99,6 +102,7 @@ impl std::fmt::Display for ConnError {
             Self::BadState => write!(f, "operation invalid in current connection state"),
             Self::Reset => write!(f, "connection reset by peer"),
             Self::Eof => write!(f, "connection closed by peer"),
+            Self::DiscoveryFailed => write!(f, "no peer available from gossip discovery"),
         }
     }
 }
@@ -189,6 +193,15 @@ impl Connection {
     /// Retransmits the SYN up to `MAX_RETRIES` times on timeout.
     pub async fn connect(socket: Socket, peer: SocketAddr) -> Result<Self, ConnError> {
         Self::connect_with_mss(socket, peer, DEFAULT_MSS).await
+    }
+
+    /// Discover a peer via gossip and then perform an active open.
+    pub async fn connect_via_discovery(
+        socket: Socket,
+        discovery: &GossipDiscovery,
+    ) -> Result<Self, ConnError> {
+        let peer = discovery.pick_peer().ok_or(ConnError::DiscoveryFailed)?;
+        Self::connect(socket, peer).await
     }
 
     /// Like [`connect`] but with an explicit local MSS to advertise.

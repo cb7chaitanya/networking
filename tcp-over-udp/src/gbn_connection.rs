@@ -59,6 +59,7 @@ use tokio::time::timeout;
 
 use crate::congestion_control::{CongestionControl, RenoCC};
 use crate::connection::{ConnError, Connection};
+use crate::discovery::GossipDiscovery;
 use crate::gbn_receiver::GbnReceiver;
 use crate::gbn_sender::{AckResult, GbnSender};
 use crate::packet::{flags, Header, Packet, SackBlock, TcpOption};
@@ -205,6 +206,16 @@ impl GbnConnection {
     ) -> Result<Self, ConnError> {
         let conn = Connection::connect(socket, peer).await?;
         Ok(Self::from_connection(conn, window_size))
+    }
+
+    /// Discover a peer via gossip and connect using the standard 3-way handshake.
+    pub async fn connect_via_discovery(
+        socket: Socket,
+        discovery: &GossipDiscovery,
+        window_size: usize,
+    ) -> Result<Self, ConnError> {
+        let peer = discovery.pick_peer().ok_or(ConnError::DiscoveryFailed)?;
+        Self::connect(socket, peer, window_size).await
     }
 
     /// Like [`connect`] but with an explicit receive-buffer capacity.
