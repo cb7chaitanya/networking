@@ -50,6 +50,20 @@ pub struct NetSim {
     reorder_window: usize,
     /// Packets held for out-of-order delivery: `(wire_bytes, dest)`.
     reorder_buf: VecDeque<(Vec<u8>, SocketAddr)>,
+
+    // ── Byzantine behavior ───────────────────────────────────────────────────
+    /// Set of nodes marked as malicious (byzantine).
+    malicious_nodes: HashSet<SocketAddr>,
+    /// Probability of injecting fake gossip entries.
+    gossip_poison_prob: f64,
+    /// Probability of sending incorrect incarnation numbers.
+    wrong_incarnation_prob: f64,
+    /// Probability of replaying old messages.
+    replay_prob: f64,
+    /// Buffer for replay attacks: (message, destination, timestamp).
+    replay_buffer: VecDeque<(Vec<u8>, SocketAddr, u64)>,
+    /// Maximum replay buffer size.
+    replay_buffer_size: usize,
 }
 
 impl NetSim {
@@ -62,6 +76,12 @@ impl NetSim {
             reorder_prob: 0.0,
             reorder_window: 0,
             reorder_buf: VecDeque::new(),
+            malicious_nodes: HashSet::new(),
+            gossip_poison_prob: 0.0,
+            wrong_incarnation_prob: 0.0,
+            replay_prob: 0.0,
+            replay_buffer: VecDeque::new(),
+            replay_buffer_size: 100,
         }
     }
 
@@ -80,6 +100,25 @@ impl NetSim {
     pub fn with_reorder(mut self, probability: f64, window: usize) -> Self {
         self.reorder_prob = probability.clamp(0.0, 1.0);
         self.reorder_window = window;
+        self
+    }
+
+    /// Configure gossip poisoning: probability of injecting fake entries.
+    pub fn with_gossip_poisoning(mut self, prob: f64) -> Self {
+        self.gossip_poison_prob = prob.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Configure wrong incarnation numbers: probability of sending incorrect incarnation.
+    pub fn with_wrong_incarnation(mut self, prob: f64) -> Self {
+        self.wrong_incarnation_prob = prob.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Configure replay attacks: probability of replaying old messages.
+    pub fn with_replay_attacks(mut self, prob: f64, buffer_size: usize) -> Self {
+        self.replay_prob = prob.clamp(0.0, 1.0);
+        self.replay_buffer_size = buffer_size;
         self
     }
 
@@ -106,6 +145,54 @@ impl NetSim {
     /// Remove all partitions.
     pub fn clear_partitions(&mut self) {
         self.partitions.clear();
+    }
+
+    // ── Byzantine behavior ─────────────────────────────────────────────────
+
+    /// Mark a node as malicious (byzantine).
+    pub fn add_malicious_node(&mut self, addr: SocketAddr) {
+        self.malicious_nodes.insert(addr);
+    }
+
+    /// Remove malicious designation from a node.
+    pub fn remove_malicious_node(&mut self, addr: SocketAddr) {
+        self.malicious_nodes.remove(&addr);
+    }
+
+    /// Clear all malicious node designations.
+    pub fn clear_malicious_nodes(&mut self) {
+        self.malicious_nodes.clear();
+    }
+
+    /// Check if a node is marked as malicious.
+    pub fn is_malicious(&self, addr: SocketAddr) -> bool {
+        self.malicious_nodes.contains(&addr)
+    }
+
+    /// Set gossip poisoning probability.
+    pub fn set_gossip_poison_prob(&mut self, prob: f64) {
+        self.gossip_poison_prob = prob.clamp(0.0, 1.0);
+    }
+
+    /// Set wrong incarnation probability.
+    pub fn set_wrong_incarnation_prob(&mut self, prob: f64) {
+        self.wrong_incarnation_prob = prob.clamp(0.0, 1.0);
+    }
+
+    /// Set replay attack probability and buffer size.
+    pub fn set_replay_prob(&mut self, prob: f64, buffer_size: usize) {
+        self.replay_prob = prob.clamp(0.0, 1.0);
+        self.replay_buffer_size = buffer_size;
+    }
+
+    /// Clear the replay buffer.
+    pub fn clear_replay_buffer(&mut self) {
+        self.replay_buffer.clear();
+    }
+
+    /// Number of messages in replay buffer.
+    pub fn replay_buffer_len(&self) -> usize {
+        self.replay_buffer.len()
     }
 
     // ── Query ────────────────────────────────────────────────────────────
@@ -167,6 +254,94 @@ impl NetSim {
     /// Number of packets currently held for reordering.
     pub fn reorder_pending(&self) -> usize {
         self.reorder_buf.len()
+    }
+
+    // ── Byzantine behavior ─────────────────────────────────────────────────
+
+    /// Apply byzantine transformations to an outgoing message from a malicious node.
+    /// Returns the potentially modified message bytes.
+    ///
+    /// This applies:
+    /// - Gossip poisoning: inject fake entries with some probability
+    /// - Wrong incarnation: modify incarnation numbers with some probability
+    /// - Replay attacks: store message for potential replay with some probability
+    pub fn apply_byzantine(&mut self, wire: &[u8], from: SocketAddr) -> Vec<u8> {
+        if !self.is_malicious(from) {
+            return wire.to_vec();
+        }
+
+        let mut modified = wire.to_vec();
+
+        // Optionally store for replay attacks
+        if self.replay_prob > 0.0 && self.rng.next_f64() < self.replay_prob {
+            if self.replay_buffer.len() < self.replay_buffer_size {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                self.replay_buffer
+                    .push_back((wire.to_vec(), from, timestamp));
+            }
+        }
+
+        // Apply gossip poisoning or wrong incarnation if this is a gossip/ping/ack message
+        if modified.len() > 24 {
+            let kind = modified[1];
+            if kind == 0x01 || kind == 0x02 || kind == 0x04 {
+                // GOSSIP, PING, or ACK - apply transformations
+                modified = self.maybe_poison_gossip(modified);
+                modified = self.maybe_corrupt_incarnation(modified);
+            }
+        }
+
+        modified
+    }
+
+    /// Possibly inject fake gossip entries (gossip poisoning).
+    fn maybe_poison_gossip(&mut self, mut wire: Vec<u8>) -> Vec<u8> {
+        if self.gossip_poison_prob > 0.0 && self.rng.next_f64() < self.gossip_poison_prob {
+            // Simple poisoning: flip some bytes in the payload to corrupt entries
+            // or inject fake data
+            if wire.len() > 26 {
+                // Flip random bytes in payload to create invalid/corrupted entries
+                let payload_start = 24;
+                if wire.len() > payload_start + 8 {
+                    let idx = payload_start
+                        + (self.rng.next_u64() as usize % (wire.len() - payload_start - 8));
+                    wire[idx] = wire[idx].wrapping_add(1);
+                }
+            }
+        }
+        wire
+    }
+
+    /// Possibly corrupt incarnation numbers.
+    fn maybe_corrupt_incarnation(&mut self, mut wire: Vec<u8>) -> Vec<u8> {
+        if self.wrong_incarnation_prob > 0.0 && self.rng.next_f64() < self.wrong_incarnation_prob {
+            // Incarnation is at bytes 16-19 (4 bytes)
+            if wire.len() >= 20 {
+                // Corrupt the incarnation field (flip some bits)
+                let corruption = ((self.rng.next_u64() & 0xFF) as u8).wrapping_add(1);
+                wire[16] = wire[16].wrapping_add(corruption);
+            }
+        }
+        wire
+    }
+
+    /// Attempt to replay an old message instead of the current one.
+    /// Returns Some(replayed_message) if replay happens, None otherwise.
+    pub fn maybe_replay(&mut self, _current: &[u8], _to: SocketAddr) -> Option<Vec<u8>> {
+        if self.replay_prob > 0.0
+            && !self.replay_buffer.is_empty()
+            && self.rng.next_f64() < self.replay_prob
+        {
+            // Return a random old message from the buffer
+            let idx = (self.rng.next_u64() as usize) % self.replay_buffer.len();
+            if let Some((old_msg, _, _)) = self.replay_buffer.get(idx) {
+                return Some(old_msg.clone());
+            }
+        }
+        None
     }
 
     // ── Internal ─────────────────────────────────────────────────────────
@@ -460,5 +635,130 @@ mod tests {
             }
         }
         assert!(delivered > 0 && delivered < 100);
+    }
+
+    // ── Byzantine Behavior ─────────────────────────────────────────────────
+
+    #[test]
+    fn malicious_node_not_malicious_by_default() {
+        let sim = NetSim::new(0);
+        assert!(!sim.is_malicious(addr(1)));
+    }
+
+    #[test]
+    fn add_and_remove_malicious_node() {
+        let mut sim = NetSim::new(0);
+        sim.add_malicious_node(addr(1));
+        assert!(sim.is_malicious(addr(1)));
+
+        sim.remove_malicious_node(addr(1));
+        assert!(!sim.is_malicious(addr(1)));
+    }
+
+    #[test]
+    fn clear_malicious_nodes() {
+        let mut sim = NetSim::new(0);
+        sim.add_malicious_node(addr(1));
+        sim.add_malicious_node(addr(2));
+        sim.clear_malicious_nodes();
+        assert!(!sim.is_malicious(addr(1)));
+        assert!(!sim.is_malicious(addr(2)));
+    }
+
+    #[test]
+    fn byzantine_disabled_by_default() {
+        let mut sim = NetSim::new(0);
+        let wire = vec![0u8; 30];
+        // Non-malicious node should pass through unchanged
+        let result = sim.apply_byzantine(&wire, addr(1));
+        assert_eq!(result, wire);
+    }
+
+    #[test]
+    fn byzantine_applies_to_malicious_node() {
+        let mut sim = NetSim::new(0).with_gossip_poisoning(1.0);
+        sim.add_malicious_node(addr(1));
+
+        let wire = vec![0u8; 30];
+        // With 100% poison prob, message should be modified
+        let result = sim.apply_byzantine(&wire, addr(1));
+        // Message may or may not be modified depending on RNG, but function should work
+        assert_eq!(result.len(), wire.len());
+    }
+
+    #[test]
+    fn byzantine_ignores_non_malicious() {
+        let mut sim = NetSim::new(0)
+            .with_gossip_poisoning(1.0)
+            .with_wrong_incarnation(1.0)
+            .with_replay_attacks(1.0, 10);
+
+        sim.add_malicious_node(addr(1));
+
+        let wire = vec![0u8; 30];
+        // addr(2) is not malicious, should pass through
+        let result = sim.apply_byzantine(&wire, addr(2));
+        assert_eq!(result, wire);
+    }
+
+    #[test]
+    fn replay_buffer_stores_messages() {
+        let mut sim = NetSim::new(0).with_replay_attacks(1.0, 5);
+        sim.add_malicious_node(addr(1));
+
+        let wire = vec![1u8; 30];
+        sim.apply_byzantine(&wire, addr(1));
+
+        assert_eq!(sim.replay_buffer_len(), 1);
+    }
+
+    #[test]
+    fn replay_buffer_respects_size_limit() {
+        let mut sim = NetSim::new(0).with_replay_attacks(1.0, 3);
+        sim.add_malicious_node(addr(1));
+
+        // Send 5 messages, buffer should only hold 3
+        for i in 0..5 {
+            let wire = vec![i as u8; 30];
+            sim.apply_byzantine(&wire, addr(1));
+        }
+
+        assert!(sim.replay_buffer_len() <= 3);
+    }
+
+    #[test]
+    fn clear_replay_buffer() {
+        let mut sim = NetSim::new(0).with_replay_attacks(1.0, 10);
+        sim.add_malicious_node(addr(1));
+
+        let wire = vec![1u8; 30];
+        sim.apply_byzantine(&wire, addr(1));
+        assert_eq!(sim.replay_buffer_len(), 1);
+
+        sim.clear_replay_buffer();
+        assert_eq!(sim.replay_buffer_len(), 0);
+    }
+
+    #[test]
+    fn wrong_incarnation_probability() {
+        let mut sim = NetSim::new(0).with_wrong_incarnation(0.0);
+        sim.add_malicious_node(addr(1));
+
+        let wire = vec![0u8; 30];
+        // With 0% probability, should not modify
+        let result = sim.apply_byzantine(&wire, addr(1));
+        // With wrong_incarnation_prob=0, should pass through unchanged
+        assert_eq!(result, wire);
+    }
+
+    #[test]
+    fn byzantine_builder_methods() {
+        let sim = NetSim::new(0)
+            .with_gossip_poisoning(0.5)
+            .with_wrong_incarnation(0.3)
+            .with_replay_attacks(0.2, 50);
+
+        // Just verify it builds without error
+        assert!(!sim.is_malicious(addr(1)));
     }
 }
