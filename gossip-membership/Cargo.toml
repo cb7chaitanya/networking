@@ -2,10 +2,15 @@
 name = "gossip-membership"
 version = "0.1.0"
 edition = "2021"
+default-run = "gossip-membership"
 
 [[bin]]
 name = "gossip-membership"
 path = "src/main.rs"
+
+[[bin]]
+name = "convergence_report"
+path = "src/bin/convergence_report.rs"
 
 [lib]
 name = "gossip_membership"
