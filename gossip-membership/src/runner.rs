@@ -276,13 +276,23 @@ pub async fn run_node(
                         node.table.entries.len(),
                         node.config.adaptive_fanout,
                     );
-                    let msg = gossip::build_gossip_message(
-                        &node.table,
+
+                    // Build gossip message with or without suspicion acceleration
+                    let entries = if node.config.suspicion_acceleration {
+                        node.table.gossip_wire_entries_with_suspicion(
+                            fanout,
+                            node.config.suspicion_weight,
+                        )
+                    } else {
+                        node.table.gossip_wire_entries(fanout)
+                    };
+                    let msg = gossip::build_gossip_message_from_entries(
                         node.id,
                         node.table.our_heartbeat(),
                         node.table.our_incarnation(),
-                        fanout,
+                        entries,
                     );
+
                     for (peer_id, peer_addr) in &targets {
                         match node.transport.send_to(&msg, *peer_addr).await {
                             Ok(()) => {
@@ -296,6 +306,42 @@ pub async fn run_node(
                                 "[node {}] gossip send failed to {peer_addr}: {e}",
                                 node.id
                             ),
+                        }
+                    }
+
+                    // Multi-path suspicion: send to extra targets for suspected nodes
+                    if node.config.suspicion_acceleration && node.config.suspicion_multi_path > 0 {
+                        let suspected = node.table.suspected_nodes();
+                        if !suspected.is_empty() {
+                            // Get extra targets for suspected nodes
+                            let extra_targets = gossip::pick_gossip_targets_excluding(
+                                &node.table,
+                                node.id,
+                                &targets.iter().map(|(id, _)| *id).collect(),
+                                node.config.suspicion_multi_path,
+                            );
+                            if !extra_targets.is_empty() {
+                                // Build piggyback with suspected entries
+                                let suspect_entries = node.table.gossip_wire_entries_with_suspicion(
+                                    node.config.piggyback_max,
+                                    node.config.suspicion_weight,
+                                );
+                                let piggyback_msg = gossip::build_gossip_message_from_entries(
+                                    node.id,
+                                    node.table.our_heartbeat(),
+                                    node.table.our_incarnation(),
+                                    suspect_entries,
+                                );
+                                for (peer_id, peer_addr) in &extra_targets {
+                                    if node.transport.send_to(&piggyback_msg, *peer_addr).await.is_ok() {
+                                        node.metrics.gossip_sent += 1;
+                                        log::debug!(
+                                            "[node {}] suspicion multi-path → peer {} @ {}",
+                                            node.id, peer_id, peer_addr
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }
