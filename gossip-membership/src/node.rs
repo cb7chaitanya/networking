@@ -91,6 +91,12 @@ pub struct NodeConfig {
     pub gossip_interval_ms: u64,
     /// How often to run the failure-detection scan / probe cycle (ms).
     pub probe_interval_ms: u64,
+    /// Enable adaptive probe interval based on latency, failure rate, and cluster size.
+    pub adaptive_probe: bool,
+    /// Minimum adaptive probe interval (ms).
+    pub probe_interval_min_ms: u64,
+    /// Maximum adaptive probe interval (ms).
+    pub probe_interval_max_ms: u64,
     /// Probe timeout: how long to wait for an ACK before escalating (ms).
     pub probe_timeout_ms: u64,
     /// Suspect timeout base: how long a Suspect node stays Suspect before becoming Dead (ms).
@@ -158,6 +164,9 @@ impl Default for NodeConfig {
             heartbeat_interval_ms: 500,
             gossip_interval_ms: 200,
             probe_interval_ms: 1_000,
+            adaptive_probe: false,
+            probe_interval_min_ms: 100,
+            probe_interval_max_ms: 5_000,
             probe_timeout_ms: 500,
             suspect_timeout_ms: 3_000,
             suspect_timeout_multiplier: 0.5,
@@ -189,6 +198,9 @@ impl NodeConfig {
             heartbeat_interval_ms: 50,
             gossip_interval_ms: 50,
             probe_interval_ms: 100,
+            adaptive_probe: false,
+            probe_interval_min_ms: 50,
+            probe_interval_max_ms: 500,
             probe_timeout_ms: 100,
             suspect_timeout_ms: 300,
             suspect_timeout_multiplier: 0.5,
@@ -200,10 +212,10 @@ impl NodeConfig {
             adaptive_gossip_targets: true,
             dead_retention_ms: 1_000,
             piggyback_max: 6,
-            metrics_log_interval_ms: 0, // disabled in tests
-            metrics_server_port: 0, // disabled in tests
+            metrics_log_interval_ms: 0,  // disabled in tests
+            metrics_server_port: 0,      // disabled in tests
             anti_entropy_interval_ms: 0, // disabled by default in tests
-            inbound_global_capacity: 0, // disabled in tests
+            inbound_global_capacity: 0,  // disabled in tests
             inbound_global_refill_rate: 0,
             inbound_peer_capacity: 0,
             inbound_peer_refill_rate: 0,

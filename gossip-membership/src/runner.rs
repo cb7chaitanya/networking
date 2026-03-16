@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 use crate::anti_entropy::ChunkAssembler;
-use crate::failure_detector::FailureDetector;
+use crate::failure_detector::{AdaptiveConfig, FailureDetector};
 use crate::gossip;
 use crate::membership::{wire_to_node_state, MembershipTable};
 use crate::message::{
@@ -54,8 +54,17 @@ impl Node {
         for &peer_addr in peers {
             table.add_bootstrap_peer(peer_addr);
         }
-        let failure_det =
-            FailureDetector::new(Duration::from_millis(config.probe_timeout_ms));
+        let failure_det = {
+            let adaptive_config = AdaptiveConfig {
+                enabled: config.adaptive_probe,
+                base_interval_ms: config.probe_interval_ms,
+                min_interval_ms: config.probe_interval_min_ms,
+                max_interval_ms: config.probe_interval_max_ms,
+                ..Default::default()
+            };
+            FailureDetector::new(Duration::from_millis(config.probe_timeout_ms))
+                .with_adaptive_config(adaptive_config)
+        };
         let pending_acks =
             PendingAcks::new(Duration::from_millis(config.reliable_ack_timeout_ms));
         log::info!(
@@ -194,8 +203,12 @@ pub async fn run_node(
         tokio::time::interval(Duration::from_millis(node.config.gossip_interval_ms));
     let mut hb_tick =
         tokio::time::interval(Duration::from_millis(node.config.heartbeat_interval_ms));
-    let mut probe_tick =
-        tokio::time::interval(Duration::from_millis(node.config.probe_interval_ms));
+
+    // For adaptive probing, we use a recursive sleep approach to support dynamic intervals.
+    // For static probing, we use a fixed interval.
+    let use_adaptive_probe = node.config.adaptive_probe;
+    let mut next_probe_time = Instant::now();
+    let mut probe_interval_ms = node.config.probe_interval_ms;
 
     // Anti-entropy timer (disabled when interval == 0).
     let anti_entropy_ms = node.config.anti_entropy_interval_ms;
@@ -216,7 +229,6 @@ pub async fn run_node(
     // Don't burst on startup — skip missed ticks rather than compressing them.
     gossip_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     hb_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     anti_entropy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -302,7 +314,20 @@ pub async fn run_node(
             }
 
             // ── Branch 4: failure detection scan ─────────────────────────────
-            _ = probe_tick.tick() => {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(next_probe_time)) => {
+                // Calculate adaptive interval if enabled
+                if use_adaptive_probe {
+                    let cluster_size = node.table.entries.len();
+                    probe_interval_ms = node.failure_det.adaptive_interval_ms(cluster_size);
+                    log::trace!(
+                        "[node {}] adaptive probe interval: {}ms (cluster_size={})",
+                        node.id,
+                        probe_interval_ms,
+                        cluster_size
+                    );
+                }
+                next_probe_time = Instant::now() + Duration::from_millis(probe_interval_ms);
+
                 let now = Instant::now();
 
                 // Step 1: check pending probes for timeouts.
@@ -495,7 +520,7 @@ async fn handle_message(
     node.metrics.record_merge(outcome);
 
     // If we had an in-flight probe for this sender, an incoming message resolves it.
-    node.failure_det.record_ack(msg.sender_id);
+    node.failure_det.record_ack(msg.sender_id, Instant::now());
 
     // Clear any pending reliable-delivery entry for this sender.
     node.pending_acks.ack(msg.sender_id);
