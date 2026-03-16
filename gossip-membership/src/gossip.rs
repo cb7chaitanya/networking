@@ -178,12 +178,62 @@ pub fn build_gossip_message(
     build_gossip(sender_id, sender_heartbeat, sender_incarnation, entries)
 }
 
+/// Build a GOSSIP message from pre-selected entries.
+/// Used when entries have already been selected with suspicion weighting.
+pub fn build_gossip_message_from_entries(
+    sender_id: NodeId,
+    sender_heartbeat: u32,
+    sender_incarnation: u32,
+    entries: Vec<crate::message::WireNodeEntry>,
+) -> Message {
+    build_gossip(sender_id, sender_heartbeat, sender_incarnation, entries)
+}
+
+/// Pick gossip targets excluding a set of already-targeted peers.
+/// Used for multi-path suspicion propagation.
+pub fn pick_gossip_targets_excluding(
+    table: &MembershipTable,
+    self_id: NodeId,
+    exclude: &std::collections::HashSet<NodeId>,
+    max_targets: usize,
+) -> Vec<(NodeId, SocketAddr)> {
+    let mut eligible: Vec<(NodeId, SocketAddr)> = table
+        .entries
+        .values()
+        .filter(|e| {
+            e.node_id != self_id
+                && !exclude.contains(&e.node_id)
+                && matches!(
+                    e.status,
+                    crate::node::NodeStatus::Alive | crate::node::NodeStatus::Suspect
+                )
+        })
+        .map(|e| (e.node_id, e.addr))
+        .collect();
+
+    if eligible.is_empty() {
+        return vec![];
+    }
+
+    // Shuffle by rotating a hash-derived offset
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::time::SystemTime;
+    let mut h = DefaultHasher::new();
+    SystemTime::now().hash(&mut h);
+    self_id.hash(&mut h);
+    let offset = (h.finish() as usize) % eligible.len();
+    eligible.rotate_left(offset);
+    eligible.truncate(max_targets);
+    eligible
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use crate::message::{kind, MessagePayload};
     use crate::node::{NodeState, NodeStatus};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
@@ -652,6 +702,115 @@ mod tests {
                 assert!(entries.is_empty());
             }
             _ => panic!("expected Gossip payload"),
+        }
+    }
+
+    // ── Suspicion acceleration tests ─────────────────────────────────────────
+
+    #[test]
+    fn gossip_digest_suspicion_acceleration_boosts_suspected() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        // Add multiple nodes with different suspect counts
+        let mut alive = NodeState::new_alive(2, make_addr(2000), 1);
+        t.merge_entry(&alive);
+
+        let mut suspect = NodeState::new_alive(3, make_addr(3000), 1);
+        suspect.status = NodeStatus::Suspect;
+        suspect.suspect_count = 3;
+        t.merge_entry(&suspect);
+
+        // Get digest with suspicion weight
+        let digest = t.gossip_digest_with_suspicion(10, 2.0);
+        let ids: Vec<_> = digest.iter().map(|e| e.node_id).collect();
+
+        // Suspect node (id=3) should be first due to suspicion boost
+        assert_eq!(ids[0], 3, "Suspected node should be first in digest");
+    }
+
+    #[test]
+    fn gossip_digest_higher_suspect_count_higher_priority() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        // Add nodes with different suspect counts
+        let mut low_suspect = NodeState::new_alive(2, make_addr(2000), 1);
+        low_suspect.status = NodeStatus::Suspect;
+        low_suspect.suspect_count = 1;
+        t.merge_entry(&low_suspect);
+
+        let mut high_suspect = NodeState::new_alive(3, make_addr(3000), 1);
+        high_suspect.status = NodeStatus::Suspect;
+        high_suspect.suspect_count = 5;
+        t.merge_entry(&high_suspect);
+
+        let digest = t.gossip_digest_with_suspicion(10, 2.0);
+        let ids: Vec<_> = digest.iter().map(|e| e.node_id).collect();
+
+        // Higher suspect count should come first
+        assert_eq!(ids[0], 3, "Node with higher suspect_count should be first");
+    }
+
+    #[test]
+    fn gossip_digest_no_suspicion_weight_returns_by_update_time() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        let mut node2 = NodeState::new_alive(2, make_addr(2000), 1);
+        t.merge_entry(&node2);
+
+        // Add slight delay and then add another node
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let mut node3 = NodeState::new_alive(3, make_addr(3000), 1);
+        node3.status = NodeStatus::Suspect;
+        t.merge_entry(&node3);
+
+        // Without suspicion weight, should be sorted by last_update
+        let digest = t.gossip_digest_with_suspicion(10, 0.0);
+        let ids: Vec<_> = digest.iter().map(|e| e.node_id).collect();
+
+        // Most recently updated (node3) should be first
+        assert_eq!(
+            ids[0], 3,
+            "Most recently updated should be first without suspicion"
+        );
+    }
+
+    #[test]
+    fn suspected_nodes_returns_only_suspect_status() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        // Add different status nodes
+        let alive = NodeState::new_alive(2, make_addr(2000), 1);
+        t.merge_entry(&alive);
+
+        let mut suspect = NodeState::new_alive(3, make_addr(3000), 1);
+        suspect.status = NodeStatus::Suspect;
+        t.merge_entry(&suspect);
+
+        let mut dead = NodeState::new_alive(4, make_addr(4000), 1);
+        dead.status = NodeStatus::Dead;
+        t.merge_entry(&dead);
+
+        let suspected = t.suspected_nodes();
+
+        assert_eq!(suspected.len(), 1);
+        assert!(suspected.contains(&3));
+    }
+
+    #[test]
+    fn pick_gossip_targets_excluding_works() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+
+        for i in 2..=5u64 {
+            t.merge_entry(&NodeState::new_alive(i, make_addr(1000 + i as u16), 1));
+        }
+
+        let exclude: std::collections::HashSet<_> = [2, 3].iter().cloned().collect();
+        let targets = pick_gossip_targets_excluding(&t, 1, &exclude, 2);
+
+        // Should get nodes 4 and 5 (excluding 2 and 3)
+        assert_eq!(targets.len(), 2);
+        for (id, _) in &targets {
+            assert!(!exclude.contains(id));
         }
     }
 }
