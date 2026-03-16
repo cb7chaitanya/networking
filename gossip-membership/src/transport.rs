@@ -12,9 +12,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
+use std::net::Ipv4Addr;
 
 use crate::crypto::{ClusterKey, CryptoError};
 use crate::message::{Message, MessageError};
+use crate::pcap::PcapCapture;
 use crate::rate_limit::{InboundRateLimiter, RateLimitConfig};
 use crate::simulator::NetSim;
 
@@ -58,6 +60,7 @@ pub struct Transport {
     key: Option<ClusterKey>,
     sim: Option<Arc<Mutex<NetSim>>>,
     rate_limiter: Option<Mutex<InboundRateLimiter>>,
+    pcap: Option<PcapCapture>,
     /// Count of packets dropped by rate limiting (caller reads this).
     pub rate_limited_count: std::sync::atomic::AtomicU64,
 }
@@ -73,6 +76,7 @@ impl Transport {
             key: None,
             sim: None,
             rate_limiter: None,
+            pcap: None,
             rate_limited_count: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -95,6 +99,12 @@ impl Transport {
         self
     }
 
+    /// Attach a PCAP packet capture for capturing gossip packets.
+    pub fn with_pcap(mut self, path: &str) -> Result<Self, crate::pcap::PcapError> {
+        self.pcap = Some(PcapCapture::new(path)?);
+        Ok(self)
+    }
+
     /// Clone the underlying socket handle (cheap — it's an `Arc`).
     pub fn clone_socket(&self) -> Arc<UdpSocket> {
         self.socket.clone()
@@ -110,7 +120,7 @@ impl Transport {
     /// When a cluster key is configured the encoded bytes are encrypted
     /// with ChaCha20-Poly1305 before being sent.  The sender's node ID
     /// is bound as Additional Authenticated Data (AAD).
-    pub async fn send_to(&self, msg: &Message, dest: SocketAddr) -> Result<(), TransportError> {
+    pub async fn send_to(&mut self, msg: &Message, dest: SocketAddr) -> Result<(), TransportError> {
         // Encode first so we have wire bytes for potential reorder buffering.
         let encoded = msg.encode().map_err(TransportError::Message)?;
         let wire_bytes = match &self.key {
@@ -158,11 +168,37 @@ impl Transport {
                 // Normal path: send the current packet.
                 self.socket.send_to(&wire_bytes, dest).await?;
             }
+            
+            // PCAP capture for sent packet
+            if let Some(ref mut pcap) = self.pcap {
+                let src: Ipv4Addr = match self.local_addr.ip() {
+                    std::net::IpAddr::V4(ip) => ip,
+                    std::net::IpAddr::V6(_) => Ipv4Addr::new(127, 0, 0, 1),
+                };
+                let dst: Ipv4Addr = match dest.ip() {
+                    std::net::IpAddr::V4(ip) => ip,
+                    std::net::IpAddr::V6(_) => Ipv4Addr::new(127, 0, 0, 1),
+                };
+                let _ = pcap.write_packet(&wire_bytes, src, dst);
+            }
             return Ok(());
         }
 
         // No simulator — send directly.
         self.socket.send_to(&wire_bytes, dest).await?;
+        
+        // PCAP capture for sent packet
+        if let Some(ref mut pcap) = self.pcap {
+            let src: Ipv4Addr = match self.local_addr.ip() {
+                std::net::IpAddr::V4(ip) => ip,
+                std::net::IpAddr::V6(_) => Ipv4Addr::new(127, 0, 0, 1),
+            };
+            let dst: Ipv4Addr = match dest.ip() {
+                std::net::IpAddr::V4(ip) => ip,
+                std::net::IpAddr::V6(_) => Ipv4Addr::new(127, 0, 0, 1),
+            };
+            let _ = pcap.write_packet(&wire_bytes, src, dst);
+        }
         Ok(())
     }
 
@@ -171,10 +207,23 @@ impl Transport {
     /// Datagrams that fail decryption, checksum verification, or structural
     /// validation are silently dropped and the loop continues — gossip is
     /// best-effort.
-    pub async fn recv_from(&self) -> Result<(Message, SocketAddr), TransportError> {
+    pub async fn recv_from(&mut self) -> Result<(Message, SocketAddr), TransportError> {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             let (n, from) = self.socket.recv_from(&mut buf).await?;
+
+            // PCAP capture for received packet
+            if let Some(ref mut pcap) = self.pcap {
+                let src: Ipv4Addr = match from.ip() {
+                    std::net::IpAddr::V4(ip) => ip,
+                    std::net::IpAddr::V6(_) => Ipv4Addr::new(127, 0, 0, 1),
+                };
+                let dst: Ipv4Addr = match self.local_addr.ip() {
+                    std::net::IpAddr::V4(ip) => ip,
+                    std::net::IpAddr::V6(_) => Ipv4Addr::new(127, 0, 0, 1),
+                };
+                let _ = pcap.write_packet(&buf[..n], src, dst);
+            }
 
             // Rate-limit check before spending CPU on decode.
             if let Some(rl) = &self.rate_limiter {
@@ -397,8 +446,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_and_recv_plaintext_roundtrip() {
-        let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t1 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let msg = build_ping(1, 42, 3, vec![]);
         t1.send_to(&msg, t2.local_addr).await.unwrap();
 
@@ -412,8 +461,8 @@ mod tests {
     #[tokio::test]
     async fn send_and_recv_encrypted_roundtrip() {
         let key = ClusterKey::generate();
-        let t1 = Transport::bind(localhost_any()).await.unwrap().with_key(key.clone());
-        let t2 = Transport::bind(localhost_any()).await.unwrap().with_key(key);
+        let mut t1 = Transport::bind(localhost_any()).await.unwrap().with_key(key.clone());
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap().with_key(key);
         let msg = build_ping(1, 99, 0, vec![]);
         t1.send_to(&msg, t2.local_addr).await.unwrap();
 
@@ -424,8 +473,8 @@ mod tests {
 
     #[tokio::test]
     async fn recv_drops_corrupted_then_accepts_valid() {
-        let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t1 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let raw_socket = t1.clone_socket();
 
         // Send corrupted bytes first (silently dropped by recv_from).
@@ -445,8 +494,8 @@ mod tests {
 
     #[tokio::test]
     async fn recv_drops_truncated_then_accepts_valid() {
-        let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t1 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let raw_socket = t1.clone_socket();
 
         raw_socket.send_to(&[0u8; 5], t2.local_addr).await.unwrap();
@@ -460,8 +509,8 @@ mod tests {
 
     #[tokio::test]
     async fn recv_drops_garbage_then_accepts_valid() {
-        let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t1 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let raw_socket = t1.clone_socket();
 
         let garbage: Vec<u8> = (0..100).map(|i| (i * 37) as u8).collect();
@@ -476,8 +525,8 @@ mod tests {
 
     #[tokio::test]
     async fn recv_drops_multiple_bad_then_accepts_valid() {
-        let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t1 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let raw_socket = t1.clone_socket();
 
         // Send several varieties of bad datagrams.
