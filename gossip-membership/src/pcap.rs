@@ -74,7 +74,7 @@ impl PcapCapture {
 
     /// Write a packet to the capture file.
     ///
-    /// `data` should be the raw IP packet (including IP header).
+    /// `data` is the payload that will be wrapped in an IPv4 packet.
     pub fn write_packet(
         &mut self,
         data: &[u8],
@@ -219,7 +219,7 @@ fn build_ip_packet(payload: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
     packet.push(0x40); // Flags (Don't Fragment) + Fragment Offset
     packet.push(0x00);
     packet.push(64); // TTL
-    packet.push(17); // Protocol (UDP = 17, but we use raw for gossip)
+    packet.push(254); // Experimental Protocol
     packet.push(0x00); // Header checksum (will calculate)
     packet.push(0x00);
 
@@ -230,13 +230,11 @@ fn build_ip_packet(payload: &[u8], src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
     packet.push(src.octets()[3]);
 
     // Destination IP
-    packet.push(dst.octets()[0]);
-    packet.push(dst.octets()[1]);
-    packet.push(dst.octets()[2]);
-    packet.push(dst.octets()[3]);
+    packet.extend_from_slice(&src.octets());
+    packet.extend_from_slice(&dst.octets());
 
     // Calculate and set checksum
-    let checksum = ip_checksum(&packet);
+    let checksum = ip_checksum(&packet[..20]);
     packet[10] = ((checksum >> 8) & 0xFF) as u8;
     packet[11] = (checksum & 0xFF) as u8;
 
