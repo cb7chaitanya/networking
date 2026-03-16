@@ -20,8 +20,10 @@ futures = "0.3.32"
 chacha20poly1305 = "0.10"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
+serde_json = "1"
 toml = "0.8"
+plotters = "0.3"
+bincode = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

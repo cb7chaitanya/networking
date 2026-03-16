@@ -68,8 +68,7 @@ impl FileConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
         let contents = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-        toml::from_str(&contents)
-            .map_err(|e| format!("failed to parse {}: {e}", path.display()))
+        toml::from_str(&contents).map_err(|e| format!("failed to parse {}: {e}", path.display()))
     }
 
     /// Apply file values onto a `NodeConfig`, overriding only the fields
@@ -77,37 +76,79 @@ impl FileConfig {
     /// `NodeConfig::default()` and then applies CLI overrides on top.
     pub fn apply(&self, cfg: &mut NodeConfig) {
         // ── gossip ──
-        if let Some(v) = self.gossip.fanout { cfg.gossip_fanout = v; }
-        if let Some(v) = self.gossip.adaptive_fanout { cfg.adaptive_fanout = v; }
-        if let Some(v) = self.gossip.max_sends { cfg.max_gossip_sends = v; }
-        if let Some(v) = self.gossip.adaptive_targets { cfg.adaptive_gossip_targets = v; }
-        if let Some(v) = self.gossip.interval_ms { cfg.gossip_interval_ms = v; }
-        if let Some(v) = self.gossip.heartbeat_interval_ms { cfg.heartbeat_interval_ms = v; }
-        if let Some(v) = self.gossip.piggyback_max { cfg.piggyback_max = v; }
-        if let Some(v) = self.gossip.anti_entropy_interval_ms { cfg.anti_entropy_interval_ms = v; }
+        if let Some(v) = self.gossip.fanout {
+            cfg.gossip_fanout = v;
+        }
+        if let Some(v) = self.gossip.adaptive_fanout {
+            cfg.adaptive_fanout = v;
+        }
+        if let Some(v) = self.gossip.max_sends {
+            cfg.max_gossip_sends = v;
+        }
+        if let Some(v) = self.gossip.adaptive_targets {
+            cfg.adaptive_gossip_targets = v;
+        }
+        if let Some(v) = self.gossip.interval_ms {
+            cfg.gossip_interval_ms = v;
+        }
+        if let Some(v) = self.gossip.heartbeat_interval_ms {
+            cfg.heartbeat_interval_ms = v;
+        }
+        if let Some(v) = self.gossip.piggyback_max {
+            cfg.piggyback_max = v;
+        }
+        if let Some(v) = self.gossip.anti_entropy_interval_ms {
+            cfg.anti_entropy_interval_ms = v;
+        }
 
         // ── network ──
         if let Some(v) = self.network.max_inbound_rate {
             cfg.inbound_global_capacity = v;
             cfg.inbound_global_refill_rate = v;
         }
-        if let Some(v) = self.network.inbound_peer_capacity { cfg.inbound_peer_capacity = v; }
-        if let Some(v) = self.network.inbound_peer_refill_rate { cfg.inbound_peer_refill_rate = v; }
-        if let Some(v) = self.network.reliable_ack_timeout_ms { cfg.reliable_ack_timeout_ms = v; }
-        if let Some(v) = self.network.reliable_max_retries { cfg.reliable_max_retries = v; }
+        if let Some(v) = self.network.inbound_peer_capacity {
+            cfg.inbound_peer_capacity = v;
+        }
+        if let Some(v) = self.network.inbound_peer_refill_rate {
+            cfg.inbound_peer_refill_rate = v;
+        }
+        if let Some(v) = self.network.reliable_ack_timeout_ms {
+            cfg.reliable_ack_timeout_ms = v;
+        }
+        if let Some(v) = self.network.reliable_max_retries {
+            cfg.reliable_max_retries = v;
+        }
 
         // ── probes ──
-        if let Some(v) = self.probes.interval_ms { cfg.probe_interval_ms = v; }
-        if let Some(v) = self.probes.timeout_ms { cfg.probe_timeout_ms = v; }
-        if let Some(v) = self.probes.indirect_k { cfg.indirect_probe_k = v; }
-        if let Some(v) = self.probes.suspect_timeout_ms { cfg.suspect_timeout_ms = v; }
-        if let Some(v) = self.probes.suspect_multiplier { cfg.suspect_timeout_multiplier = v; }
-        if let Some(v) = self.probes.suspect_jitter_ms { cfg.suspect_timeout_jitter_ms = v; }
-        if let Some(v) = self.probes.dead_retention_ms { cfg.dead_retention_ms = v; }
+        if let Some(v) = self.probes.interval_ms {
+            cfg.probe_interval_ms = v;
+        }
+        if let Some(v) = self.probes.timeout_ms {
+            cfg.probe_timeout_ms = v;
+        }
+        if let Some(v) = self.probes.indirect_k {
+            cfg.indirect_probe_k = v;
+        }
+        if let Some(v) = self.probes.suspect_timeout_ms {
+            cfg.suspect_timeout_ms = v;
+        }
+        if let Some(v) = self.probes.suspect_multiplier {
+            cfg.suspect_timeout_multiplier = v;
+        }
+        if let Some(v) = self.probes.suspect_jitter_ms {
+            cfg.suspect_timeout_jitter_ms = v;
+        }
+        if let Some(v) = self.probes.dead_retention_ms {
+            cfg.dead_retention_ms = v;
+        }
 
         // ── metrics ──
-        if let Some(v) = self.metrics.log_interval_ms { cfg.metrics_log_interval_ms = v; }
-        if let Some(v) = self.metrics.server_port { cfg.metrics_server_port = v; }
+        if let Some(v) = self.metrics.log_interval_ms {
+            cfg.metrics_log_interval_ms = v;
+        }
+        if let Some(v) = self.metrics.server_port {
+            cfg.metrics_server_port = v;
+        }
     }
 }
 

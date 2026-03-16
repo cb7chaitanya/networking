@@ -36,10 +36,8 @@ impl MembershipTable {
             placeholder_ids: HashSet::new(),
         };
         // Seed our own entry as Alive with heartbeat 0, incarnation 0.
-        t.entries.insert(
-            local_id,
-            NodeState::new_alive(local_id, local_addr, 0),
-        );
+        t.entries
+            .insert(local_id, NodeState::new_alive(local_id, local_addr, 0));
         t
     }
 
@@ -59,9 +57,10 @@ impl MembershipTable {
         let inc = self.local_incarnation;
         let addr = self.local_addr;
         let id = self.local_id;
-        let entry = self.entries.entry(id).or_insert_with(|| {
-            NodeState::new_alive(id, addr, 0)
-        });
+        let entry = self
+            .entries
+            .entry(id)
+            .or_insert_with(|| NodeState::new_alive(id, addr, 0));
         entry.heartbeat = hb;
         entry.incarnation = inc;
         entry.status = NodeStatus::Alive;
@@ -114,7 +113,10 @@ impl MembershipTable {
                     incoming.incarnation,
                     inc,
                 );
-                let e = self.entries.entry(id).or_insert_with(|| NodeState::new_alive(id, addr, 0));
+                let e = self
+                    .entries
+                    .entry(id)
+                    .or_insert_with(|| NodeState::new_alive(id, addr, 0));
                 e.incarnation = inc;
                 e.heartbeat = hb;
                 e.status = NodeStatus::Alive;
@@ -373,7 +375,11 @@ impl MembershipTable {
         // the address. The real entry will be corrected by the first gossip round.
         let placeholder_id = placeholder_id_for(addr);
         if !self.entries.contains_key(&placeholder_id) {
-            log::debug!("[membership] bootstrap peer {} (placeholder id={})", addr, placeholder_id);
+            log::debug!(
+                "[membership] bootstrap peer {} (placeholder id={})",
+                addr,
+                placeholder_id
+            );
             self.entries.insert(
                 placeholder_id,
                 NodeState::new_alive(placeholder_id, addr, 0),
@@ -396,12 +402,19 @@ impl MembershipTable {
         if real_id == placeholder_id {
             return;
         }
-        if self.entries.get(&placeholder_id).map(|e| e.addr == addr).unwrap_or(false) {
+        if self
+            .entries
+            .get(&placeholder_id)
+            .map(|e| e.addr == addr)
+            .unwrap_or(false)
+        {
             self.entries.remove(&placeholder_id);
             self.placeholder_ids.remove(&placeholder_id);
             log::debug!(
                 "[membership] removed placeholder {} for {} (real id={})",
-                placeholder_id, addr, real_id
+                placeholder_id,
+                addr,
+                real_id
             );
         }
     }
@@ -414,7 +427,12 @@ impl MembershipTable {
     fn evict_placeholder_at(&mut self, addr: SocketAddr) {
         let placeholder_id = placeholder_id_for(addr);
         if self.placeholder_ids.contains(&placeholder_id) {
-            if self.entries.get(&placeholder_id).map(|e| e.addr == addr).unwrap_or(false) {
+            if self
+                .entries
+                .get(&placeholder_id)
+                .map(|e| e.addr == addr)
+                .unwrap_or(false)
+            {
                 self.entries.remove(&placeholder_id);
                 self.placeholder_ids.remove(&placeholder_id);
                 log::debug!(
@@ -573,7 +591,11 @@ mod tests {
         rejoin.incarnation = 1;
         t.merge_entry(&rejoin);
 
-        assert_eq!(t.entries[&2].status, NodeStatus::Alive, "higher incarnation must resurrect Dead");
+        assert_eq!(
+            t.entries[&2].status,
+            NodeStatus::Alive,
+            "higher incarnation must resurrect Dead"
+        );
         assert_eq!(t.entries[&2].incarnation, 1);
         assert_eq!(t.entries[&2].heartbeat, 0);
     }
@@ -689,8 +711,8 @@ mod tests {
     #[test]
     fn is_newer_near_boundary() {
         let half = 1u32 << 31; // 2^31
-        // Exactly half the range apart: a.wrapping_sub(b) == 2^31 → NOT newer
-        // (ambiguous region; we treat it as not newer for safety).
+                               // Exactly half the range apart: a.wrapping_sub(b) == 2^31 → NOT newer
+                               // (ambiguous region; we treat it as not newer for safety).
         assert!(!is_newer(half, 0));
         // One less than half: clearly newer.
         assert!(is_newer(half - 1, 0));
@@ -707,7 +729,10 @@ mod tests {
         t.merge_entry(&NodeState::new_alive(2, make_addr(2000), u32::MAX));
         // Wrapped heartbeat (0, then 1) must win over MAX.
         t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 0));
-        assert_eq!(t.entries[&2].heartbeat, 0, "wrapped hb=0 should beat hb=MAX");
+        assert_eq!(
+            t.entries[&2].heartbeat, 0,
+            "wrapped hb=0 should beat hb=MAX"
+        );
         t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 1));
         assert_eq!(t.entries[&2].heartbeat, 1, "wrapped hb=1 should beat hb=0");
     }
@@ -719,15 +744,17 @@ mod tests {
         t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 5));
         // A stale pre-wrap value (e.g. MAX) must not overwrite the newer 5.
         t.merge_entry(&NodeState::new_alive(2, make_addr(2000), u32::MAX));
-        assert_eq!(t.entries[&2].heartbeat, 5, "stale pre-wrap hb=MAX must not overwrite hb=5");
+        assert_eq!(
+            t.entries[&2].heartbeat, 5,
+            "stale pre-wrap hb=MAX must not overwrite hb=5"
+        );
     }
 
     #[test]
     fn gossip_digest_most_recent_first() {
         let mut t = MembershipTable::new(1, make_addr(1000));
         // Age the self entry so it sorts below the peers we are about to insert.
-        t.entries.get_mut(&1).unwrap().last_update =
-            Instant::now() - Duration::from_secs(10);
+        t.entries.get_mut(&1).unwrap().last_update = Instant::now() - Duration::from_secs(10);
         for i in 2..=6u64 {
             let mut s = NodeState::new_alive(i, make_addr(i as u16 * 1000), i as u32);
             // Stagger last_update: node 6 is most recent (400 ms ago).
@@ -755,7 +782,11 @@ mod tests {
         t.merge_entry(&suspect_self);
 
         // Incarnation must have been bumped.
-        assert_eq!(t.our_incarnation(), 1, "incarnation must increment on refutation");
+        assert_eq!(
+            t.our_incarnation(),
+            1,
+            "incarnation must increment on refutation"
+        );
         // Our own entry must be Alive.
         assert_eq!(t.entries[&1].status, NodeStatus::Alive);
         assert_eq!(t.entries[&1].incarnation, 1);
@@ -777,7 +808,11 @@ mod tests {
         t.merge_entry(&stale_suspect);
 
         // Incarnation must not have changed.
-        assert_eq!(t.our_incarnation(), 3, "stale suspicion must not trigger refutation");
+        assert_eq!(
+            t.our_incarnation(),
+            3,
+            "stale suspicion must not trigger refutation"
+        );
         assert_eq!(t.entries[&1].status, NodeStatus::Alive);
     }
 
@@ -791,7 +826,11 @@ mod tests {
         dead_self.incarnation = 0;
         t.merge_entry(&dead_self);
 
-        assert_eq!(t.our_incarnation(), 1, "Dead accusation must trigger incarnation bump");
+        assert_eq!(
+            t.our_incarnation(),
+            1,
+            "Dead accusation must trigger incarnation bump"
+        );
         assert_eq!(t.entries[&1].status, NodeStatus::Alive);
     }
 
@@ -811,7 +850,10 @@ mod tests {
         newer_inc.incarnation = 1;
         t.merge_entry(&newer_inc);
         assert_eq!(t.entries[&2].incarnation, 1, "higher incarnation must win");
-        assert_eq!(t.entries[&2].heartbeat, 0, "heartbeat must update to the winner's value");
+        assert_eq!(
+            t.entries[&2].heartbeat, 0,
+            "heartbeat must update to the winner's value"
+        );
     }
 
     /// Lower incarnation must not overwrite a higher incarnation entry.
@@ -828,8 +870,14 @@ mod tests {
         stale.incarnation = 1;
         t.merge_entry(&stale);
 
-        assert_eq!(t.entries[&2].incarnation, 2, "stale incarnation must be discarded");
-        assert_eq!(t.entries[&2].heartbeat, 5, "heartbeat must not be overwritten");
+        assert_eq!(
+            t.entries[&2].incarnation, 2,
+            "stale incarnation must be discarded"
+        );
+        assert_eq!(
+            t.entries[&2].heartbeat, 5,
+            "heartbeat must not be overwritten"
+        );
     }
 
     /// Same incarnation: higher heartbeat wins (existing per-incarnation rule).
@@ -905,7 +953,11 @@ mod tests {
 
         // Digest must only contain self — placeholder is filtered.
         let digest = t.gossip_digest(50);
-        assert_eq!(digest.len(), 1, "placeholder must not appear in gossip digest");
+        assert_eq!(
+            digest.len(),
+            1,
+            "placeholder must not appear in gossip digest"
+        );
         assert_eq!(digest[0].node_id, 1);
         assert!(!digest.iter().any(|e| e.node_id == pid));
     }
@@ -956,7 +1008,11 @@ mod tests {
         t.merge_entry(&stale);
 
         // Only our own entry should exist for addr 1000.
-        let count = t.entries.values().filter(|e| e.addr == make_addr(1000)).count();
+        let count = t
+            .entries
+            .values()
+            .filter(|e| e.addr == make_addr(1000))
+            .count();
         assert_eq!(count, 1, "only one entry for our own address");
         assert_eq!(t.entries[&1].addr, make_addr(1000));
     }
@@ -975,7 +1031,11 @@ mod tests {
         // Add 15 peers → 16 entries: log2(16) = 4, scale = 3.0.
         // Use port offsets that don't collide with self (port 1000).
         for i in 2..=16u64 {
-            t.merge_entry(&NodeState::new_alive(i, make_addr(2000 + i as u16), i as u32));
+            t.merge_entry(&NodeState::new_alive(
+                i,
+                make_addr(2000 + i as u16),
+                i as u32,
+            ));
         }
         let t16 = t.suspect_timeout(1000, 0.5);
         // Allow 50 ms tolerance for floating-point truncation.
@@ -997,7 +1057,11 @@ mod tests {
     fn suspect_timeout_zero_multiplier() {
         let mut t = MembershipTable::new(1, make_addr(1000));
         for i in 2..=32u64 {
-            t.merge_entry(&NodeState::new_alive(i, make_addr(i as u16 * 100), i as u32));
+            t.merge_entry(&NodeState::new_alive(
+                i,
+                make_addr(i as u16 * 100),
+                i as u32,
+            ));
         }
         let timeout = t.suspect_timeout(500, 0.0);
         assert_eq!(timeout, Duration::from_millis(500));
@@ -1021,7 +1085,10 @@ mod tests {
         let j_a = suspect_jitter(1, 99, 10_000);
         let j_b = suspect_jitter(2, 99, 10_000);
         // With 10 s range, two random offsets are extremely unlikely to match.
-        assert_ne!(j_a, j_b, "different observers should (almost always) get different jitter");
+        assert_ne!(
+            j_a, j_b,
+            "different observers should (almost always) get different jitter"
+        );
     }
 
     /// Zero jitter_ms produces zero duration (no division by zero).
@@ -1044,7 +1111,10 @@ mod tests {
         // With base=1000 ms, multiplier=0.0, jitter=0: effective ≈ 1 s.
         // 5 s > 1 s → should be expired.
         let expired = t.expired_suspects_jittered(1000, 0.0, 0);
-        assert!(expired.contains(&2), "suspect 5 s old must be expired with 1 s timeout");
+        assert!(
+            expired.contains(&2),
+            "suspect 5 s old must be expired with 1 s timeout"
+        );
 
         // With base=10000 ms: effective ≈ 10 s.  5 s < 10 s → not expired.
         let not_expired = t.expired_suspects_jittered(10_000, 0.0, 0);
