@@ -150,6 +150,17 @@ pub struct NodeConfig {
     pub reliable_ack_timeout_ms: u64,
     /// Maximum number of retransmission attempts for REQUEST_ACK messages.
     pub reliable_max_retries: u8,
+    /// Enable adaptive gossip throttling based on queue backpressure.
+    pub backpressure_enabled: bool,
+    /// Queue depth capacity threshold — when pending messages reach this
+    /// level the node is considered fully loaded (pressure = 1.0).
+    pub backpressure_capacity: u64,
+    /// Fanout damping factor (0.0–1.0).  At full pressure the effective
+    /// fanout is reduced by this fraction (0.8 → reduce to 20% of base).
+    pub backpressure_damping: f64,
+    /// Gossip interval stretch factor.  At full pressure the interval is
+    /// multiplied by `1.0 + stretch` (2.0 → triple the interval).
+    pub backpressure_stretch: f64,
 }
 
 impl Default for NodeConfig {
@@ -178,6 +189,10 @@ impl Default for NodeConfig {
             inbound_peer_refill_rate: 50,
             reliable_ack_timeout_ms: 500,
             reliable_max_retries: 3,
+            backpressure_enabled: true,
+            backpressure_capacity: 256,
+            backpressure_damping: 0.8,
+            backpressure_stretch: 2.0,
         }
     }
 }
@@ -209,6 +224,10 @@ impl NodeConfig {
             inbound_peer_refill_rate: 0,
             reliable_ack_timeout_ms: 50,
             reliable_max_retries: 3,
+            backpressure_enabled: false, // disabled in tests by default
+            backpressure_capacity: 256,
+            backpressure_damping: 0.8,
+            backpressure_stretch: 2.0,
         }
     }
 }

@@ -17,6 +17,7 @@ pub struct FileConfig {
     pub network: NetworkSection,
     pub probes: ProbeSection,
     pub metrics: MetricsSection,
+    pub backpressure: BackpressureSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -61,6 +62,15 @@ pub struct ProbeSection {
 pub struct MetricsSection {
     pub log_interval_ms: Option<u64>,
     pub server_port: Option<u16>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct BackpressureSection {
+    pub enabled: Option<bool>,
+    pub capacity: Option<u64>,
+    pub damping: Option<f64>,
+    pub stretch: Option<f64>,
 }
 
 impl FileConfig {
@@ -108,6 +118,12 @@ impl FileConfig {
         // ── metrics ──
         if let Some(v) = self.metrics.log_interval_ms { cfg.metrics_log_interval_ms = v; }
         if let Some(v) = self.metrics.server_port { cfg.metrics_server_port = v; }
+
+        // ── backpressure ──
+        if let Some(v) = self.backpressure.enabled { cfg.backpressure_enabled = v; }
+        if let Some(v) = self.backpressure.capacity { cfg.backpressure_capacity = v; }
+        if let Some(v) = self.backpressure.damping { cfg.backpressure_damping = v; }
+        if let Some(v) = self.backpressure.stretch { cfg.backpressure_stretch = v; }
     }
 }
 

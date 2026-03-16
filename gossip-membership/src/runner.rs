@@ -20,6 +20,7 @@ use crate::message::{
 use crate::metrics::Metrics;
 use crate::node::{generate_node_id, NodeConfig, NodeId, NodeState};
 use crate::reliable::PendingAcks;
+use crate::throttle::{AdaptiveThrottle, QueueDepthMonitor};
 use crate::transport::Transport;
 
 // ── Node ───────────────────────────────────────────────────────────────────────
@@ -34,6 +35,10 @@ pub struct Node {
     pub chunk_assembler: ChunkAssembler,
     /// Monotonic counter for anti-entropy table snapshots.
     ae_version: u64,
+    /// Queue depth monitor for backpressure signalling.
+    pub queue_monitor: QueueDepthMonitor,
+    /// Adaptive gossip throttle driven by queue backpressure.
+    pub throttle: AdaptiveThrottle,
 }
 
 impl Node {
@@ -64,6 +69,11 @@ impl Node {
             transport.local_addr
         );
         let chunk_assembler = ChunkAssembler::new(Duration::from_secs(5));
+        let queue_monitor = QueueDepthMonitor::new(config.backpressure_capacity);
+        let throttle = AdaptiveThrottle::new(
+            config.backpressure_damping,
+            config.backpressure_stretch,
+        );
         Self {
             id,
             config,
@@ -74,6 +84,8 @@ impl Node {
             pending_acks,
             chunk_assembler,
             ae_version: 0,
+            queue_monitor,
+            throttle,
         }
     }
 }
@@ -220,7 +232,34 @@ pub async fn run_node(
     anti_entropy_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     metrics_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    loop {
+    // Create a bounded channel for incoming messages to allow backpressure to build.
+    let capacity = node.config.backpressure_capacity.max(1) as usize;
+    let (msg_tx, mut msg_rx) = tokio::sync::mpsc::channel(capacity);
+
+    // Spawn a dedicated network receiver task.
+    let rx_transport = node.transport.clone();
+    let rx_monitor = node.queue_monitor.clone();
+    let rx_backpressure = node.config.backpressure_enabled;
+
+    tokio::spawn(async move {
+        loop {
+            match rx_transport.recv_from().await {
+                Ok((msg, addr)) => {
+                    if rx_backpressure {
+                        rx_monitor.increment();
+                    }
+                    if msg_tx.send((msg, addr)).await.is_err() {
+                        break; // Receiver dropped, shutting down.
+                    }
+                }
+                Err(e) => {
+                    log::trace!("[node rx] transport recv error: {e}");
+                }
+            }
+        }
+    });
+
+    'main: loop {
         tokio::select! {
             // ── Shutdown signal ────────────────────────────────────────────────
             _ = &mut shutdown_rx => {
@@ -236,14 +275,21 @@ pub async fn run_node(
                         let _ = node.transport.send_to(&leave, e.addr).await;
                     }
                 }
-                break;
+                break 'main;
             }
 
             // ── Branch 1: receive incoming UDP datagram ────────────────────────
-            result = node.transport.recv_from() => {
-                match result {
-                    Ok((msg, from_addr)) => handle_message(&mut node, msg, from_addr).await,
-                    Err(e) => log::warn!("[node {}] recv error: {e}", node.id),
+            result = msg_rx.recv() => {
+                let (msg, from_addr) = match result {
+                    Some(m) => m,
+                    None => break 'main, // channel closed
+                };
+
+                // Track inbound queue depth for backpressure.
+                // It was incremented in the receiver task, so we only decrement after processing.
+                handle_message(&mut node, msg, from_addr).await;
+                if node.config.backpressure_enabled {
+                    node.queue_monitor.decrement();
                 }
             }
 
@@ -259,43 +305,61 @@ pub async fn run_node(
 
             // ── Branch 3: gossip round (rate-limited, adaptive targets) ────────
             _ = gossip_tick.tick() => {
-                let max_targets = gossip::effective_gossip_targets(
-                    node.config.max_gossip_sends,
-                    node.table.entries.len(),
-                    node.config.adaptive_gossip_targets,
-                );
-                let targets = gossip::pick_gossip_targets(
-                    &node.table,
-                    node.id,
-                    max_targets,
-                );
-                if !targets.is_empty() {
-                    node.metrics.gossip_rounds += 1;
-                    let fanout = gossip::effective_fanout(
-                        node.config.gossip_fanout,
-                        node.table.entries.len(),
-                        node.config.adaptive_fanout,
+                // Backpressure: possibly skip this round entirely.
+                if node.config.backpressure_enabled
+                    && node.throttle.should_skip_round(&node.queue_monitor)
+                {
+                    node.metrics.backpressure_shed += 1;
+                    log::debug!(
+                        "[node {}] gossip round skipped (backpressure, pressure={:.2})",
+                        node.id,
+                        node.throttle.pressure(&node.queue_monitor),
                     );
-                    let msg = gossip::build_gossip_message(
+                } else {
+                    let max_targets = gossip::effective_gossip_targets(
+                        node.config.max_gossip_sends,
+                        node.table.entries.len(),
+                        node.config.adaptive_gossip_targets,
+                    );
+                    let targets = gossip::pick_gossip_targets(
                         &node.table,
                         node.id,
-                        node.table.our_heartbeat(),
-                        node.table.our_incarnation(),
-                        fanout,
+                        max_targets,
                     );
-                    for (peer_id, peer_addr) in &targets {
-                        match node.transport.send_to(&msg, *peer_addr).await {
-                            Ok(()) => {
-                                node.metrics.gossip_sent += 1;
-                                log::debug!(
-                                    "[node {}] gossip → peer {} @ {}",
-                                    node.id, peer_id, peer_addr
-                                );
+                    if !targets.is_empty() {
+                        node.metrics.gossip_rounds += 1;
+                        let base_fanout = gossip::effective_fanout(
+                            node.config.gossip_fanout,
+                            node.table.entries.len(),
+                            node.config.adaptive_fanout,
+                        );
+                        // Apply backpressure damping to fanout.
+                        let fanout = if node.config.backpressure_enabled {
+                            node.throttle.effective_fanout(base_fanout, &node.queue_monitor)
+                        } else {
+                            base_fanout
+                        };
+                        let msg = gossip::build_gossip_message(
+                            &node.table,
+                            node.id,
+                            node.table.our_heartbeat(),
+                            node.table.our_incarnation(),
+                            fanout,
+                        );
+                        for (peer_id, peer_addr) in &targets {
+                            match node.transport.send_to(&msg, *peer_addr).await {
+                                Ok(()) => {
+                                    node.metrics.gossip_sent += 1;
+                                    log::debug!(
+                                        "[node {}] gossip → peer {} @ {}",
+                                        node.id, peer_id, peer_addr
+                                    );
+                                }
+                                Err(e) => log::warn!(
+                                    "[node {}] gossip send failed to {peer_addr}: {e}",
+                                    node.id
+                                ),
                             }
-                            Err(e) => log::warn!(
-                                "[node {}] gossip send failed to {peer_addr}: {e}",
-                                node.id
-                            ),
                         }
                     }
                 }
@@ -442,6 +506,11 @@ pub async fn run_node(
                 // Drain rate-limited counter from transport into metrics.
                 node.metrics.rate_limited += node.transport.rate_limited_count
                     .swap(0, std::sync::atomic::Ordering::Relaxed);
+                // Snapshot queue backpressure high-water mark.
+                if node.config.backpressure_enabled {
+                    node.metrics.queue_high_water_mark = node.queue_monitor.high_water_mark();
+                    node.queue_monitor.reset_high_water_mark();
+                }
                 let (alive, suspect, dead) = node.table.status_counts();
                 log::info!(
                     "[metrics] {}",
