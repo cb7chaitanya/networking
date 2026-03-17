@@ -13,8 +13,9 @@ use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
 
+use crate::compression::PeerCompressionMap;
 use crate::crypto::{ClusterKey, CryptoError};
-use crate::message::{Message, MessageError};
+use crate::message::{flags, Message, MessageError};
 use crate::rate_limit::{InboundRateLimiter, RateLimitConfig};
 use crate::simulator::NetSim;
 
@@ -60,11 +61,23 @@ pub struct Transport {
     rate_limiter: Option<Mutex<InboundRateLimiter>>,
     /// Count of packets dropped by rate limiting (caller reads this).
     pub rate_limited_count: std::sync::atomic::AtomicU64,
+    /// Whether this node has compression enabled.
+    compression_enabled: bool,
+    /// Tracks which peers support compression (sent us compressed messages).
+    peer_compression: PeerCompressionMap,
 }
 
 impl Transport {
     /// Bind a UDP socket to `addr` (plaintext mode — no encryption).
     pub async fn bind(addr: SocketAddr) -> Result<Self, TransportError> {
+        Self::bind_with_compression(addr, false).await
+    }
+
+    /// Bind a UDP socket with explicit compression setting.
+    pub async fn bind_with_compression(
+        addr: SocketAddr,
+        compression_enabled: bool,
+    ) -> Result<Self, TransportError> {
         let socket = UdpSocket::bind(addr).await?;
         let local_addr = socket.local_addr()?;
         Ok(Self {
@@ -74,6 +87,8 @@ impl Transport {
             sim: None,
             rate_limiter: None,
             rate_limited_count: std::sync::atomic::AtomicU64::new(0),
+            compression_enabled,
+            peer_compression: PeerCompressionMap::new(),
         })
     }
 
@@ -105,14 +120,31 @@ impl Transport {
         self.key.is_some()
     }
 
+    /// Whether compression is enabled on this transport.
+    pub fn compression_enabled(&self) -> bool {
+        self.compression_enabled
+    }
+
+    /// Access the peer compression capability map.
+    pub fn peer_compression(&self) -> &PeerCompressionMap {
+        &self.peer_compression
+    }
+
+    /// Mutable access to the peer compression capability map.
+    pub fn peer_compression_mut(&mut self) -> &mut PeerCompressionMap {
+        &mut self.peer_compression
+    }
+
     /// Encode `msg` and transmit to `dest`.
     ///
-    /// When a cluster key is configured the encoded bytes are encrypted
-    /// with ChaCha20-Poly1305 before being sent.  The sender's node ID
-    /// is bound as Additional Authenticated Data (AAD).
+    /// If compression is enabled and the peer is known to support it,
+    /// the payload will be LZ4-compressed.  When a cluster key is configured
+    /// the encoded bytes are then encrypted with ChaCha20-Poly1305.
     pub async fn send_to(&self, msg: &Message, dest: SocketAddr) -> Result<(), TransportError> {
-        // Encode first so we have wire bytes for potential reorder buffering.
-        let encoded = msg.encode().map_err(TransportError::Message)?;
+        // Encode (with optional compression) first so we have wire bytes.
+        let use_compression =
+            self.compression_enabled && self.peer_compression.is_capable(&dest);
+        let encoded = msg.encode_opts(use_compression).map_err(TransportError::Message)?;
         let wire_bytes = match &self.key {
             Some(key) => key
                 .encrypt(&encoded, msg.sender_id)
@@ -131,11 +163,9 @@ impl Transport {
                 if !deliver {
                     (false, 0, false, None)
                 } else if s.should_reorder() {
-                    // Stash this packet; send a previously-buffered one instead.
                     let released = s.stash(wire_bytes.clone(), dest);
                     (false, delay, true, released)
                 } else {
-                    // Normal send; also flush one buffered packet.
                     let released = s.flush_one();
                     (true, delay, false, released)
                 }
@@ -149,13 +179,11 @@ impl Transport {
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
 
-            // Send a released (reordered) packet if any.
             if let Some((buf, dst)) = flush {
                 self.socket.send_to(&buf, dst).await?;
             }
 
             if !reorder {
-                // Normal path: send the current packet.
                 self.socket.send_to(&wire_bytes, dest).await?;
             }
             return Ok(());
@@ -171,7 +199,10 @@ impl Transport {
     /// Datagrams that fail decryption, checksum verification, or structural
     /// validation are silently dropped and the loop continues — gossip is
     /// best-effort.
-    pub async fn recv_from(&self) -> Result<(Message, SocketAddr), TransportError> {
+    ///
+    /// If a compressed message is received from a peer, that peer is marked
+    /// as compression-capable for future sends.
+    pub async fn recv_from(&mut self) -> Result<(Message, SocketAddr), TransportError> {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         loop {
             let (n, from) = self.socket.recv_from(&mut buf).await?;
@@ -183,6 +214,14 @@ impl Transport {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     log::trace!("[transport] rate-limited datagram from {from}");
                     continue;
+                }
+            }
+
+            // Peek at flags to track compression capability.
+            if n >= crate::message::HEADER_LEN {
+                let msg_flags = buf[crate::message::OFF_FLAGS];
+                if (msg_flags & flags::COMPRESSED) != 0 {
+                    self.peer_compression.mark_capable(from);
                 }
             }
 
@@ -398,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn send_and_recv_plaintext_roundtrip() {
         let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let msg = build_ping(1, 42, 3, vec![]);
         t1.send_to(&msg, t2.local_addr).await.unwrap();
 
@@ -413,7 +452,7 @@ mod tests {
     async fn send_and_recv_encrypted_roundtrip() {
         let key = ClusterKey::generate();
         let t1 = Transport::bind(localhost_any()).await.unwrap().with_key(key.clone());
-        let t2 = Transport::bind(localhost_any()).await.unwrap().with_key(key);
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap().with_key(key);
         let msg = build_ping(1, 99, 0, vec![]);
         t1.send_to(&msg, t2.local_addr).await.unwrap();
 
@@ -425,7 +464,7 @@ mod tests {
     #[tokio::test]
     async fn recv_drops_corrupted_then_accepts_valid() {
         let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let raw_socket = t1.clone_socket();
 
         // Send corrupted bytes first (silently dropped by recv_from).
@@ -446,7 +485,7 @@ mod tests {
     #[tokio::test]
     async fn recv_drops_truncated_then_accepts_valid() {
         let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let raw_socket = t1.clone_socket();
 
         raw_socket.send_to(&[0u8; 5], t2.local_addr).await.unwrap();
@@ -461,7 +500,7 @@ mod tests {
     #[tokio::test]
     async fn recv_drops_garbage_then_accepts_valid() {
         let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let raw_socket = t1.clone_socket();
 
         let garbage: Vec<u8> = (0..100).map(|i| (i * 37) as u8).collect();
@@ -477,7 +516,7 @@ mod tests {
     #[tokio::test]
     async fn recv_drops_multiple_bad_then_accepts_valid() {
         let t1 = Transport::bind(localhost_any()).await.unwrap();
-        let t2 = Transport::bind(localhost_any()).await.unwrap();
+        let mut t2 = Transport::bind(localhost_any()).await.unwrap();
         let raw_socket = t1.clone_socket();
 
         // Send several varieties of bad datagrams.
