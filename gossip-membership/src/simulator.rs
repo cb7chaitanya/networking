@@ -50,6 +50,41 @@ pub struct NetSim {
     reorder_window: usize,
     /// Packets held for out-of-order delivery: `(wire_bytes, dest)`.
     reorder_buf: VecDeque<(Vec<u8>, SocketAddr)>,
+    // ── DNS Amplification Attack Simulation ─────────────────────────────────
+    /// Enable DNS amplification attack simulation.
+    amplification_enabled: bool,
+    /// Query size in bytes (small, e.g., ~40 bytes for DNS query).
+    amplification_query_size: usize,
+    /// Response size in bytes (large, e.g., ~3000 bytes for DNS response).
+    amplification_response_size: usize,
+    /// Amplification factor (response_size / query_size), computed automatically.
+    amplification_factor: f64,
+    // ── Query Storm Simulation ─────────────────────────────────────────────
+    /// Enable query storm simulation.
+    query_storm_enabled: bool,
+    /// Queries per second to simulate.
+    query_storm_rate: u64,
+    /// Burst size: number of queries to send in a single burst.
+    query_storm_burst: u32,
+    /// Track queries sent in current window.
+    queries_this_burst: u32,
+    // ── Resolver Behavior Metrics ───────────────────────────────────────────
+    /// Total bytes sent (cumulative).
+    bytes_sent: u64,
+    /// Total bytes received (cumulative).
+    bytes_received: u64,
+    /// Total packets sent.
+    packets_sent: u64,
+    /// Total packets received.
+    packets_received: u64,
+    /// Queries dropped due to rate limiting.
+    queries_dropped: u64,
+    /// Peak query rate observed.
+    peak_query_rate: u64,
+    /// Current query rate (queries in last second).
+    current_query_rate: u64,
+    /// Query rate tracking window.
+    query_rate_window: Vec<std::time::Instant>,
 }
 
 impl NetSim {
@@ -62,6 +97,25 @@ impl NetSim {
             reorder_prob: 0.0,
             reorder_window: 0,
             reorder_buf: VecDeque::new(),
+            // DNS Amplification Attack
+            amplification_enabled: false,
+            amplification_query_size: 40,
+            amplification_response_size: 3000,
+            amplification_factor: 1.0,
+            // Query Storm
+            query_storm_enabled: false,
+            query_storm_rate: 0,
+            query_storm_burst: 0,
+            queries_this_burst: 0,
+            // Resolver Metrics
+            bytes_sent: 0,
+            bytes_received: 0,
+            packets_sent: 0,
+            packets_received: 0,
+            queries_dropped: 0,
+            peak_query_rate: 0,
+            current_query_rate: 0,
+            query_rate_window: Vec::new(),
         }
     }
 
@@ -83,6 +137,39 @@ impl NetSim {
         self
     }
 
+    // ── DNS Amplification Attack Builder ───────────────────────────────────
+
+    /// Enable DNS amplification attack simulation with default sizes.
+    /// Default: 40 byte query → 3000 byte response (75x amplification).
+    pub fn with_amplification(mut self) -> Self {
+        self.amplification_enabled = true;
+        self.amplification_query_size = 40;
+        self.amplification_response_size = 3000;
+        self.amplification_factor = 3000.0 / 40.0;
+        self
+    }
+
+    /// Configure amplification attack with custom sizes.
+    /// `query_size` and `response_size` are in bytes.
+    pub fn with_amplification_sizes(mut self, query_size: usize, response_size: usize) -> Self {
+        self.amplification_enabled = true;
+        self.amplification_query_size = query_size.max(1);
+        self.amplification_response_size = response_size.max(1);
+        self.amplification_factor = response_size as f64 / query_size.max(1) as f64;
+        self
+    }
+
+    // ── Query Storm Builder ────────────────────────────────────────────────
+
+    /// Enable query storm simulation with specified rate (queries per second).
+    pub fn with_query_storm(mut self, queries_per_second: u64, burst_size: u32) -> Self {
+        self.query_storm_enabled = true;
+        self.query_storm_rate = queries_per_second;
+        self.query_storm_burst = burst_size;
+        self.queries_this_burst = 0;
+        self
+    }
+
     // ── Runtime mutation ─────────────────────────────────────────────────
 
     pub fn set_loss_rate(&mut self, rate: f64) {
@@ -91,6 +178,98 @@ impl NetSim {
 
     pub fn set_delay_ms(&mut self, ms: u64) {
         self.delay_ms = ms;
+    }
+
+    // ── DNS Amplification Attack Runtime ───────────────────────────────────
+
+    /// Returns true if amplification attack is enabled.
+    pub fn is_amplification_enabled(&self) -> bool {
+        self.amplification_enabled
+    }
+
+    /// Get the amplification factor (response_size / query_size).
+    pub fn amplification_factor(&self) -> f64 {
+        self.amplification_factor
+    }
+
+    /// Simulate sending a query. Returns the effective "cost" in bytes.
+    /// For amplification attack, this tracks the small query being sent.
+    pub fn record_query_sent(&mut self, size_bytes: usize) -> usize {
+        self.packets_sent += 1;
+        self.bytes_sent += size_bytes as u64;
+        size_bytes
+    }
+
+    /// Simulate receiving a response. Returns the effective "cost" in bytes.
+    /// For amplification attack, this tracks the large response being received.
+    pub fn record_response_received(&mut self, size_bytes: usize) -> usize {
+        self.packets_received += 1;
+        self.bytes_received += size_bytes as u64;
+        size_bytes
+    }
+
+    /// Get effective bytes for amplification simulation.
+    /// If amplification is enabled, converts query to response size.
+    pub fn amplification_effective_size(&self, is_response: bool) -> usize {
+        if self.amplification_enabled {
+            if is_response {
+                self.amplification_response_size
+            } else {
+                self.amplification_query_size
+            }
+        } else {
+            40 // default DNS query size
+        }
+    }
+
+    // ── Query Storm Runtime ───────────────────────────────────────────────
+
+    /// Check if a query should be allowed under query storm rate limiting.
+    /// Uses sliding window algorithm for true QPS enforcement.
+    /// Returns true if query should be allowed, false if dropped due to rate limit.
+    pub fn should_allow_query(&mut self) -> bool {
+        if !self.query_storm_enabled {
+            return true;
+        }
+
+        let now = std::time::Instant::now();
+        let window_duration = std::time::Duration::from_secs(1);
+
+        // Remove queries older than the sliding window (1 second)
+        self.query_rate_window
+            .retain(|t| now.duration_since(*t) < window_duration);
+
+        // Check if we're within rate limit
+        if self.query_rate_window.len() < self.query_storm_rate as usize {
+            self.query_rate_window.push(now);
+            self.queries_this_burst += 1;
+
+            // Track peak rate
+            let current_rate = self.query_rate_window.len() as u64;
+            if current_rate > self.peak_query_rate {
+                self.peak_query_rate = current_rate;
+            }
+
+            true
+        } else {
+            self.queries_dropped += 1;
+            false
+        }
+    }
+
+    /// Get current query rate (queries per second) - sliding window count.
+    pub fn current_query_rate(&self) -> u64 {
+        self.query_rate_window.len() as u64
+    }
+
+    /// Get peak query rate observed.
+    pub fn peak_query_rate(&self) -> u64 {
+        self.peak_query_rate
+    }
+
+    /// Get number of queries dropped due to rate limiting.
+    pub fn queries_dropped(&self) -> u64 {
+        self.queries_dropped
     }
 
     /// Block all traffic between `a` and `b` (bidirectional).
@@ -132,6 +311,66 @@ impl NetSim {
     /// Configured delay in milliseconds.
     pub fn delay_ms(&self) -> u64 {
         self.delay_ms
+    }
+
+    // ── Resolver Behavior Metrics ─────────────────────────────────────────
+
+    /// Total bytes sent (cumulative).
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent
+    }
+
+    /// Total bytes received (cumulative).
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received
+    }
+
+    /// Total packets sent.
+    pub fn packets_sent(&self) -> u64 {
+        self.packets_sent
+    }
+
+    /// Total packets received.
+    pub fn packets_received(&self) -> u64 {
+        self.packets_received
+    }
+
+    /// Get amplification ratio (bytes_received / bytes_sent).
+    /// Useful for measuring amplification attack impact.
+    pub fn amplification_ratio(&self) -> f64 {
+        if self.bytes_sent > 0 {
+            self.bytes_received as f64 / self.bytes_sent as f64
+        } else {
+            1.0
+        }
+    }
+
+    /// Reset all metrics.
+    pub fn reset_metrics(&mut self) {
+        self.bytes_sent = 0;
+        self.bytes_received = 0;
+        self.packets_sent = 0;
+        self.packets_received = 0;
+        self.queries_dropped = 0;
+        self.peak_query_rate = 0;
+        self.current_query_rate = 0;
+        self.query_rate_window.clear();
+        self.queries_this_burst = 0;
+    }
+
+    /// Check if query storm is enabled.
+    pub fn is_query_storm_enabled(&self) -> bool {
+        self.query_storm_enabled
+    }
+
+    /// Get query storm rate (queries per second).
+    pub fn query_storm_rate(&self) -> u64 {
+        self.query_storm_rate
+    }
+
+    /// Get query storm burst size.
+    pub fn query_storm_burst(&self) -> u32 {
+        self.query_storm_burst
     }
 
     /// Decide whether this packet should be stashed for reordering.
@@ -460,5 +699,221 @@ mod tests {
             }
         }
         assert!(delivered > 0 && delivered < 100);
+    }
+
+    // ── DNS Amplification Attack Tests ─────────────────────────────────────
+
+    #[test]
+    fn amplification_disabled_by_default() {
+        let sim = NetSim::new(0);
+        assert!(!sim.is_amplification_enabled());
+    }
+
+    #[test]
+    fn amplification_enabled_builder() {
+        let sim = NetSim::new(0).with_amplification();
+        assert!(sim.is_amplification_enabled());
+        assert!((sim.amplification_factor() - 75.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn amplification_custom_sizes() {
+        let sim = NetSim::new(0).with_amplification_sizes(50, 5000);
+        assert!(sim.is_amplification_enabled());
+        assert!((sim.amplification_factor() - 100.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn amplification_effective_size_query() {
+        let sim = NetSim::new(0).with_amplification();
+        assert_eq!(sim.amplification_effective_size(false), 40);
+    }
+
+    #[test]
+    fn amplification_effective_size_response() {
+        let sim = NetSim::new(0).with_amplification();
+        assert_eq!(sim.amplification_effective_size(true), 3000);
+    }
+
+    #[test]
+    fn amplification_records_metrics() {
+        let mut sim = NetSim::new(0).with_amplification();
+
+        // Record small query sent
+        sim.record_query_sent(40);
+        assert_eq!(sim.bytes_sent(), 40);
+        assert_eq!(sim.packets_sent(), 1);
+
+        // Record large response received
+        sim.record_response_received(3000);
+        assert_eq!(sim.bytes_received(), 3000);
+        assert_eq!(sim.packets_received(), 1);
+
+        // Amplification ratio should be 75x
+        assert!((sim.amplification_ratio() - 75.0).abs() < 0.1);
+    }
+
+    // ── Query Storm Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn query_storm_disabled_by_default() {
+        let sim = NetSim::new(0);
+        assert!(!sim.is_query_storm_enabled());
+    }
+
+    #[test]
+    fn query_storm_enabled_builder() {
+        let sim = NetSim::new(0).with_query_storm(1000, 100);
+        assert!(sim.is_query_storm_enabled());
+        assert_eq!(sim.query_storm_rate(), 1000);
+        assert_eq!(sim.query_storm_burst(), 100);
+    }
+
+    #[test]
+    fn query_storm_allows_queries_within_burst() {
+        // 10 QPS limit (sliding window)
+        let mut sim = NetSim::new(0).with_query_storm(10, 100);
+
+        // First 10 queries should be allowed
+        for _ in 0..10 {
+            assert!(sim.should_allow_query());
+        }
+
+        // 11th query should be dropped (over 10 QPS)
+        assert!(!sim.should_allow_query());
+        assert_eq!(sim.queries_dropped(), 1);
+    }
+
+    #[test]
+    fn query_storm_tracks_peak_rate() {
+        // Now first param is QPS (not burst), second is ignored in sliding window
+        let mut sim = NetSim::new(0).with_query_storm(10, 100);
+
+        // Send 5 queries (within 10 QPS limit)
+        for _ in 0..5 {
+            sim.should_allow_query();
+        }
+
+        // Wait for sliding window to clear
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Send more queries - should be allowed again
+        for _ in 0..3 {
+            sim.should_allow_query();
+        }
+
+        // Peak should be at least 5
+        assert!(sim.peak_query_rate() >= 5);
+    }
+
+    #[test]
+    fn query_storm_respects_rate_limit() {
+        // 10 QPS limit (sliding window)
+        let mut sim = NetSim::new(0).with_query_storm(10, 100);
+
+        // First 10 queries should be allowed
+        for _ in 0..10 {
+            assert!(sim.should_allow_query());
+        }
+
+        // 11th query should be dropped
+        assert!(!sim.should_allow_query());
+        assert_eq!(sim.queries_dropped(), 1);
+    }
+
+    #[test]
+    fn query_storm_sliding_window_allows_after_time() {
+        // 5 QPS limit
+        let mut sim = NetSim::new(0).with_query_storm(5, 100);
+
+        // Use up the 5 QPS
+        for _ in 0..5 {
+            assert!(sim.should_allow_query());
+        }
+
+        // This should be dropped
+        assert!(!sim.should_allow_query());
+
+        // Wait for window to slide
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Should be allowed again
+        assert!(sim.should_allow_query());
+    }
+
+    #[test]
+    fn query_storm_true_qps_enforcement() {
+        // Strict 20 QPS limit
+        let mut sim = NetSim::new(0).with_query_storm(20, 100);
+
+        let mut allowed = 0;
+
+        // Send 50 queries rapidly
+        for _ in 0..50 {
+            if sim.should_allow_query() {
+                allowed += 1;
+            }
+        }
+
+        // Should allow ~20 (the QPS limit), not 50
+        assert!(allowed <= 25, "Expected ~20 allowed, got {}", allowed);
+        assert!(sim.queries_dropped() > 0, "Some queries should be dropped");
+    }
+
+    // ── Resolver Metrics Tests ───────────────────────────────────────────
+
+    #[test]
+    fn metrics_zero_by_default() {
+        let sim = NetSim::new(0);
+        assert_eq!(sim.bytes_sent(), 0);
+        assert_eq!(sim.bytes_received(), 0);
+        assert_eq!(sim.packets_sent(), 0);
+        assert_eq!(sim.packets_received(), 0);
+        assert_eq!(sim.queries_dropped(), 0);
+    }
+
+    #[test]
+    fn metrics_accumulate() {
+        let mut sim = NetSim::new(0);
+
+        sim.record_query_sent(100);
+        sim.record_query_sent(200);
+        sim.record_response_received(1000);
+
+        assert_eq!(sim.bytes_sent(), 300);
+        assert_eq!(sim.bytes_received(), 1000);
+        assert_eq!(sim.packets_sent(), 2);
+        assert_eq!(sim.packets_received(), 1);
+    }
+
+    #[test]
+    fn metrics_reset() {
+        let mut sim = NetSim::new(0);
+
+        sim.record_query_sent(100);
+        sim.record_response_received(1000);
+        sim.should_allow_query();
+
+        sim.reset_metrics();
+
+        assert_eq!(sim.bytes_sent(), 0);
+        assert_eq!(sim.bytes_received(), 0);
+        assert_eq!(sim.queries_dropped(), 0);
+    }
+
+    #[test]
+    fn amplification_ratio_calculation() {
+        let mut sim = NetSim::new(0);
+
+        // 1 byte sent, 100 bytes received = 100x amplification
+        sim.record_query_sent(1);
+        sim.record_response_received(100);
+        assert!((sim.amplification_ratio() - 100.0).abs() < 0.1);
+
+        sim.reset_metrics();
+
+        // No sent bytes = ratio of 1.0
+        sim.record_response_received(100);
+        assert!((sim.amplification_ratio() - 1.0).abs() < 0.1);
     }
 }
