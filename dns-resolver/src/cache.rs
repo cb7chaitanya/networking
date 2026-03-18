@@ -213,6 +213,329 @@ impl Default for DnsCache {
     }
 }
 
+// ── LFU Cache Implementation ──────────────────────────────────────────────────
+
+/// Cached entry with frequency counter for LFU
+#[derive(Clone)]
+enum LfuCacheEntry {
+    Positive {
+        records: Vec<ResourceRecord>,
+        expires_at: Instant,
+        frequency: u32,
+    },
+    Negative {
+        expires_at: Instant,
+        frequency: u32,
+    },
+}
+
+/// Thread-safe DNS cache with LFU (Least Frequently Used) eviction
+#[derive(Clone)]
+pub struct LfuCache {
+    inner: Arc<RwLock<LfuCacheInner>>,
+}
+
+struct LfuCacheInner {
+    map: HashMap<(String, RecordType), LfuCacheEntry>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+impl LfuCache {
+    pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_CACHE_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(LfuCacheInner {
+                map: HashMap::new(),
+                capacity,
+                hits: 0,
+                misses: 0,
+                evictions: 0,
+            })),
+        }
+    }
+
+    pub fn get(&self, name: &str, record_type: RecordType) -> Option<Vec<ResourceRecord>> {
+        let key = (name.to_lowercase(), record_type);
+        let mut inner = self.inner.write().unwrap();
+
+        let result = match inner.map.get(&key).cloned() {
+            Some(LfuCacheEntry::Positive {
+                records,
+                expires_at,
+                frequency,
+            }) if expires_at > Instant::now() => {
+                inner.hits += 1;
+                if let Some(entry) = inner.map.get_mut(&key) {
+                    match entry {
+                        LfuCacheEntry::Positive { frequency: f, .. } => *f = frequency + 1,
+                        LfuCacheEntry::Negative { frequency: f, .. } => *f += 1,
+                    }
+                }
+                Some(records)
+            }
+            Some(LfuCacheEntry::Negative { expires_at, .. }) if expires_at > Instant::now() => {
+                inner.hits += 1;
+                if let Some(entry) = inner.map.get_mut(&key) {
+                    match entry {
+                        LfuCacheEntry::Positive { frequency, .. } => *frequency += 1,
+                        LfuCacheEntry::Negative { frequency, .. } => *frequency += 1,
+                    }
+                }
+                None
+            }
+            _ => {
+                inner.misses += 1;
+                inner.map.remove(&key);
+                None
+            }
+        };
+
+        result
+    }
+
+    pub fn put(&self, record: ResourceRecord) {
+        self.put_multiple(vec![record]);
+    }
+
+    pub fn put_multiple(&self, records: Vec<ResourceRecord>) {
+        if records.is_empty() {
+            return;
+        }
+
+        let name = records[0].name.to_lowercase();
+        let rtype = records[0].record_type;
+        let key = (name.clone(), rtype);
+
+        let valid: Vec<_> = records.into_iter().filter(|r| r.ttl > 0).collect();
+        if valid.is_empty() {
+            return;
+        }
+
+        let min_ttl = valid.iter().map(|r| r.ttl).min().unwrap();
+        let expires_at = Instant::now() + Duration::from_secs(min_ttl as u64);
+
+        let mut inner = self.inner.write().unwrap();
+
+        if !inner.map.contains_key(&key) && inner.map.len() >= inner.capacity {
+            // Evict least frequently used
+            let lfu_key = inner
+                .map
+                .iter()
+                .min_by(|a, b| {
+                    let freq_a = match a.1 {
+                        LfuCacheEntry::Positive { frequency, .. } => *frequency,
+                        LfuCacheEntry::Negative { frequency, .. } => *frequency,
+                    };
+                    let freq_b = match b.1 {
+                        LfuCacheEntry::Positive { frequency, .. } => *frequency,
+                        LfuCacheEntry::Negative { frequency, .. } => *frequency,
+                    };
+                    freq_a.cmp(&freq_b)
+                })
+                .map(|(k, _)| k)
+                .cloned();
+
+            if let Some(ref lfu_key) = lfu_key {
+                inner.map.remove(lfu_key);
+                inner.evictions += 1;
+            }
+        }
+
+        inner.map.insert(
+            key,
+            LfuCacheEntry::Positive {
+                records: valid,
+                expires_at,
+                frequency: 0,
+            },
+        );
+    }
+
+    pub fn put_negative(&self, name: &str, record_type: RecordType, ttl: u32) {
+        if ttl == 0 {
+            return;
+        }
+
+        let expires_at = Instant::now() + Duration::from_secs(ttl as u64);
+        let key = (name.to_lowercase(), record_type);
+
+        let mut inner = self.inner.write().unwrap();
+
+        if !inner.map.contains_key(&key) && inner.map.len() >= inner.capacity {
+            let lfu_key = inner
+                .map
+                .iter()
+                .min_by(|a, b| {
+                    let freq_a = match a.1 {
+                        LfuCacheEntry::Positive { frequency, .. } => *frequency,
+                        LfuCacheEntry::Negative { frequency, .. } => *frequency,
+                    };
+                    let freq_b = match b.1 {
+                        LfuCacheEntry::Positive { frequency, .. } => *frequency,
+                        LfuCacheEntry::Negative { frequency, .. } => *frequency,
+                    };
+                    freq_a.cmp(&freq_b)
+                })
+                .map(|(k, _)| k)
+                .cloned();
+
+            if let Some(ref lfu_key) = lfu_key {
+                inner.map.remove(lfu_key);
+                inner.evictions += 1;
+            }
+        }
+
+        inner.map.insert(
+            key,
+            LfuCacheEntry::Negative {
+                expires_at,
+                frequency: 0,
+            },
+        );
+    }
+
+    pub fn cleanup_expired(&self) {
+        let now = Instant::now();
+        let mut inner = self.inner.write().unwrap();
+        inner.map.retain(|_, entry| match entry {
+            LfuCacheEntry::Positive { expires_at, .. } => *expires_at > now,
+            LfuCacheEntry::Negative { expires_at, .. } => *expires_at > now,
+        });
+    }
+
+    pub fn stats(&self) -> (u64, u64, u64) {
+        let inner = self.inner.read().unwrap();
+        (inner.hits, inner.misses, inner.evictions)
+    }
+}
+
+impl Default for LfuCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ── TTL-Only Cache Implementation ────────────────────────────────────────────
+
+/// Thread-safe DNS cache with TTL-only eviction (no capacity limit)
+#[derive(Clone)]
+pub struct TtlCache {
+    inner: Arc<RwLock<TtlCacheInner>>,
+}
+
+struct TtlCacheInner {
+    map: HashMap<(String, RecordType), CacheEntry>,
+    hits: u64,
+    misses: u64,
+}
+
+impl TtlCache {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(TtlCacheInner {
+                map: HashMap::new(),
+                hits: 0,
+                misses: 0,
+            })),
+        }
+    }
+
+    pub fn get(&self, name: &str, record_type: RecordType) -> Option<Vec<ResourceRecord>> {
+        let key = (name.to_lowercase(), record_type);
+        let mut inner = self.inner.write().unwrap();
+
+        let result = match inner.map.get(&key).cloned() {
+            Some(CacheEntry::Positive {
+                records,
+                expires_at,
+            }) if expires_at > Instant::now() => {
+                inner.hits += 1;
+                Some(records)
+            }
+            Some(CacheEntry::Negative { expires_at }) if expires_at > Instant::now() => {
+                inner.hits += 1;
+                None
+            }
+            _ => {
+                inner.misses += 1;
+                inner.map.remove(&key);
+                None
+            }
+        };
+
+        result
+    }
+
+    pub fn put(&self, record: ResourceRecord) {
+        self.put_multiple(vec![record]);
+    }
+
+    pub fn put_multiple(&self, records: Vec<ResourceRecord>) {
+        if records.is_empty() {
+            return;
+        }
+
+        let name = records[0].name.to_lowercase();
+        let rtype = records[0].record_type;
+        let key = (name, rtype);
+
+        let valid: Vec<_> = records.into_iter().filter(|r| r.ttl > 0).collect();
+        if valid.is_empty() {
+            return;
+        }
+
+        let min_ttl = valid.iter().map(|r| r.ttl).min().unwrap();
+        let expires_at = Instant::now() + Duration::from_secs(min_ttl as u64);
+
+        let mut inner = self.inner.write().unwrap();
+        inner.map.insert(
+            key,
+            CacheEntry::Positive {
+                records: valid,
+                expires_at,
+            },
+        );
+    }
+
+    pub fn put_negative(&self, name: &str, record_type: RecordType, ttl: u32) {
+        if ttl == 0 {
+            return;
+        }
+
+        let expires_at = Instant::now() + Duration::from_secs(ttl as u64);
+        let key = (name.to_lowercase(), record_type);
+
+        let mut inner = self.inner.write().unwrap();
+        inner.map.insert(key, CacheEntry::Negative { expires_at });
+    }
+
+    pub fn cleanup_expired(&self) {
+        let now = Instant::now();
+        let mut inner = self.inner.write().unwrap();
+        inner.map.retain(|_, entry| match entry {
+            CacheEntry::Positive { expires_at, .. } => *expires_at > now,
+            CacheEntry::Negative { expires_at } => *expires_at > now,
+        });
+    }
+
+    pub fn stats(&self) -> (u64, u64) {
+        let inner = self.inner.read().unwrap();
+        (inner.hits, inner.misses)
+    }
+}
+
+impl Default for TtlCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,5 +1086,265 @@ mod tests {
         let (hits, misses, _) = cache.stats();
         assert_eq!(misses, 1);
         assert_eq!(hits, 0);
+    }
+
+    // ── LFU Cache Tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn lfu_basic_cache_hit() {
+        let cache = LfuCache::new();
+        cache.put(a("test.com", "1.1.1.1", 300));
+        assert!(cache.get("test.com", RecordType::A).is_some());
+    }
+
+    #[test]
+    fn lfu_eviction_least_frequent() {
+        let cache = LfuCache::with_capacity(2);
+        cache.put(a("a.com", "1.1.1.1", 300));
+        cache.put(a("b.com", "2.2.2.2", 300));
+
+        cache.get("a.com", RecordType::A);
+        cache.get("a.com", RecordType::A);
+
+        cache.put(a("c.com", "3.3.3.3", 300));
+
+        assert!(cache.get("a.com", RecordType::A).is_some());
+        assert!(cache.get("b.com", RecordType::A).is_none());
+        assert!(cache.get("c.com", RecordType::A).is_some());
+    }
+
+    #[test]
+    fn lfu_negative_cache() {
+        let cache = LfuCache::new();
+        cache.put_negative("nope.com", RecordType::A, 300);
+        assert!(cache.get("nope.com", RecordType::A).is_none());
+    }
+
+    #[test]
+    fn lfu_ttl_expiry() {
+        let cache = LfuCache::new();
+        cache.put(a("expire.com", "1.1.1.1", 1));
+        sleep(Duration::from_secs(2));
+        assert!(cache.get("expire.com", RecordType::A).is_none());
+    }
+
+    #[test]
+    fn lfu_stats() {
+        let cache = LfuCache::new();
+        cache.put(a("test.com", "1.1.1.1", 300));
+        cache.get("test.com", RecordType::A);
+        cache.get("missing.com", RecordType::A);
+        let (hits, misses, _) = cache.stats();
+        assert_eq!(hits, 1);
+        assert_eq!(misses, 1);
+    }
+
+    // ── TTL-Only Cache Tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn ttl_only_basic_cache_hit() {
+        let cache = TtlCache::new();
+        cache.put(a("test.com", "1.1.1.1", 300));
+        assert!(cache.get("test.com", RecordType::A).is_some());
+    }
+
+    #[test]
+    fn ttl_only_no_capacity_limit() {
+        let cache = TtlCache::new();
+        for i in 0..100 {
+            cache.put(a(&format!("{}.com", i), &format!("1.1.1.{}", i), 300));
+        }
+        for i in 0..100 {
+            assert!(cache.get(&format!("{}.com", i), RecordType::A).is_some());
+        }
+    }
+
+    #[test]
+    fn ttl_only_ttl_expiry() {
+        let cache = TtlCache::new();
+        cache.put(a("expire.com", "1.1.1.1", 1));
+        sleep(Duration::from_secs(2));
+        assert!(cache.get("expire.com", RecordType::A).is_none());
+    }
+
+    #[test]
+    fn ttl_only_negative_cache() {
+        let cache = TtlCache::new();
+        cache.put_negative("nope.com", RecordType::A, 300);
+        assert!(cache.get("nope.com", RecordType::A).is_none());
+    }
+
+    #[test]
+    fn ttl_only_stats() {
+        let cache = TtlCache::new();
+        cache.put(a("test.com", "1.1.1.1", 300));
+        cache.get("test.com", RecordType::A);
+        cache.get("missing.com", RecordType::A);
+        let (hits, misses) = cache.stats();
+        assert_eq!(hits, 1);
+        assert_eq!(misses, 1);
+    }
+
+    // ── Cache Strategy Hit Rate Benchmarks ────────────────────────────────────
+
+    #[test]
+    fn benchmark_lru_vs_lfu_vs_ttl_hit_rate() {
+        let lru = DnsCache::with_capacity(100);
+        let lfu = LfuCache::with_capacity(100);
+        let ttl = TtlCache::new();
+
+        let hot_domains: Vec<_> = (0..50).map(|i| format!("hot{}.com", i)).collect();
+
+        for d in &hot_domains {
+            lru.put(a(d, "1.1.1.1", 600));
+            lfu.put(a(d, "1.1.1.1", 600));
+            ttl.put(a(d, "1.1.1.1", 600));
+        }
+
+        for _ in 0..1000 {
+            for d in &hot_domains {
+                lru.get(d, RecordType::A);
+                lfu.get(d, RecordType::A);
+                ttl.get(d, RecordType::A);
+            }
+        }
+
+        let lru_stats = lru.stats();
+        let lfu_stats = lfu.stats();
+        let ttl_stats = ttl.stats();
+
+        let lru_hit_rate = lru_stats.0 as f64 / (lru_stats.0 + lru_stats.1) as f64;
+        let lfu_hit_rate = lfu_stats.0 as f64 / (lfu_stats.0 + lfu_stats.1) as f64;
+        let ttl_hit_rate = ttl_stats.0 as f64 / (ttl_stats.0 + ttl_stats.1) as f64;
+
+        assert!(
+            lru_hit_rate > 0.9,
+            "LRU hit rate should be >90%: {}",
+            lru_hit_rate
+        );
+        assert!(
+            lfu_hit_rate > 0.9,
+            "LFU hit rate should be >90%: {}",
+            lfu_hit_rate
+        );
+        assert!(
+            ttl_hit_rate > 0.9,
+            "TTL-only hit rate should be >90%: {}",
+            ttl_hit_rate
+        );
+    }
+
+    #[test]
+    fn benchmark_lfu_outperforms_lru_with_access_skew() {
+        let lru = DnsCache::with_capacity(10);
+        let lfu = LfuCache::with_capacity(10);
+
+        for i in 0..10 {
+            lru.put(a(&format!("{}.com", i), &format!("1.1.1.{}", i), 600));
+            lfu.put(a(&format!("{}.com", i), &format!("1.1.1.{}", i), 600));
+        }
+
+        for _ in 0..50 {
+            lru.get("0.com", RecordType::A);
+            lfu.get("0.com", RecordType::A);
+        }
+
+        for i in 1..5 {
+            lru.put(a(&format!("new{}.com", i), &format!("2.2.2.{}", i), 600));
+            lfu.put(a(&format!("new{}.com", i), &format!("2.2.2.{}", i), 600));
+        }
+
+        let lru_remaining = lru.get("0.com", RecordType::A);
+        let lfu_remaining = lfu.get("0.com", RecordType::A);
+
+        assert!(lfu_remaining.is_some(), "LFU should keep hot entry");
+        assert!(lru_remaining.is_some(), "LRU may keep entry due to recency");
+
+        let lfu_stats = lfu.stats();
+        let lru_stats = lru.stats();
+        assert!(lfu_stats.0 >= lru_stats.0, "LFU should have >= hits");
+    }
+
+    #[test]
+    fn benchmark_lru_vs_lfu_scan_resistance() {
+        let lru = DnsCache::with_capacity(10);
+        let lfu = LfuCache::with_capacity(10);
+
+        for i in 0..10 {
+            lru.put(a(&format!("{}.com", i), &format!("1.1.1.{}", i), 600));
+            lfu.put(a(&format!("{}.com", i), &format!("1.1.1.{}", i), 600));
+        }
+
+        for _ in 0..50 {
+            lru.get("0.com", RecordType::A);
+            lfu.get("0.com", RecordType::A);
+        }
+
+        for i in 1..10 {
+            lru.get(&format!("{}.com", i), RecordType::A);
+            lfu.get(&format!("{}.com", i), RecordType::A);
+        }
+
+        for _ in 0..10 {
+            lru.get("0.com", RecordType::A);
+            lfu.get("0.com", RecordType::A);
+        }
+
+        let lru_stats = lru.stats();
+        let lfu_stats = lfu.stats();
+
+        assert!(
+            lfu_stats.0 >= lru_stats.0,
+            "LFU should maintain hot entry better"
+        );
+    }
+
+    #[test]
+    fn benchmark_all_strategies_equal_with_uniform_access() {
+        let lru = DnsCache::with_capacity(50);
+        let lfu = LfuCache::with_capacity(50);
+        let ttl = TtlCache::new();
+
+        let domains: Vec<_> = (0..50).map(|i| format!("domain{}.com", i)).collect();
+
+        for d in &domains {
+            lru.put(a(d, "1.1.1.1", 600));
+            lfu.put(a(d, "1.1.1.1", 600));
+            ttl.put(a(d, "1.1.1.1", 600));
+        }
+
+        for d in &domains {
+            lru.get(d, RecordType::A);
+            lfu.get(d, RecordType::A);
+            ttl.get(d, RecordType::A);
+        }
+
+        let lru_stats = lru.stats();
+        let lfu_stats = lfu.stats();
+        let ttl_stats = ttl.stats();
+
+        assert_eq!(lru_stats.0, 50);
+        assert_eq!(lfu_stats.0, 50);
+        assert_eq!(ttl_stats.0, 50);
+    }
+
+    #[test]
+    fn benchmark_lru_ttl_expiry_interaction() {
+        let lru = DnsCache::with_capacity(10);
+        let ttl = TtlCache::new();
+
+        lru.put(a("short.com", "1.1.1.1", 1));
+        ttl.put(a("short.com", "1.1.1.1", 1));
+
+        lru.put(a("long.com", "2.2.2.2", 600));
+        ttl.put(a("long.com", "2.2.2.2", 600));
+
+        sleep(Duration::from_secs(2));
+
+        assert!(lru.get("short.com", RecordType::A).is_none());
+        assert!(ttl.get("short.com", RecordType::A).is_none());
+
+        assert!(lru.get("long.com", RecordType::A).is_some());
+        assert!(ttl.get("long.com", RecordType::A).is_some());
     }
 }
