@@ -31,6 +31,10 @@ use tcp_over_udp::{
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
+    /// Port for the Prometheus-compatible metrics endpoint (0 = disabled).
+    #[arg(long, default_value_t = 0)]
+    metrics_port: u16,
+
     #[command(subcommand)]
     mode: Mode,
 }
@@ -77,6 +81,10 @@ async fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
+
+    if cli.metrics_port != 0 {
+        tcp_over_udp::metrics::start_server(cli.metrics_port);
+    }
 
     let result = match cli.mode {
         Mode::Server { bind } => run_server(bind).await,
