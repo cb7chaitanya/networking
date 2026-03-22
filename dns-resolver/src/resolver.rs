@@ -1,10 +1,10 @@
-use crate::cache::DnsCache;
+use crate::cache::{CacheEntryInfo, DnsCache};
 use crate::dns::{DnsError, DnsPacket, RecordClass, RecordData, RecordType, ResourceRecord};
 use crate::network::{extract_ns_and_glue, pick_ns_server, query, ROOT_SERVERS};
+use rand::Rng;
 use std::collections::HashSet;
 use std::sync::{Arc, LockResult, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use rand::Rng;
 
 /// ------------------------------------------------------------
 /// Configuration
@@ -79,6 +79,11 @@ impl DnsResolver {
         self.cache.get_ns(domain)
     }
 
+    /// Get all cache entries for visualization
+    pub fn cache_entries(&self) -> Vec<CacheEntryInfo> {
+        self.cache.entries()
+    }
+
     /// Create a DNS query packet for a domain and record type.
     /// Includes minimal EDNS0 (OPT record) so root servers accept the query.
     pub fn create_query_packet(
@@ -126,10 +131,10 @@ impl DnsResolver {
         expected_id: u16,
     ) -> Result<DnsPacket, DnsError> {
         let packet = self.parse_response_packet(data)?;
-        if packet.header.id != expected_id{
+        if packet.header.id != expected_id {
             return Err(DnsError::InvalidPacket(format!(
                 "Transaction ID mismatch : got {}, expected {}",
-                packet.header.id,expected_id
+                packet.header.id, expected_id
             )));
         }
         Ok(packet)
@@ -322,7 +327,7 @@ impl DnsResolver {
                     }
                 };
 
-                let packet = match self.parse_response_packet_with_id(&response_bytes,query_id) {
+                let packet = match self.parse_response_packet_with_id(&response_bytes, query_id) {
                     Ok(p) => p,
                     Err(DnsError::NxDomain) => {
                         self.metrics.lock().unwrap().nxdomain_hits += 1;

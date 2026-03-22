@@ -7,15 +7,27 @@ use std::{
 
 const DEFAULT_CACHE_CAPACITY: usize = 1024;
 
-/// Cached DNS entry (positive or negative)
+#[derive(Debug, Clone)]
+pub struct CacheEntryInfo {
+    pub domain: String,
+    pub record_type: RecordType,
+    pub ttl: u32,
+    pub created_at_secs: u64,
+    pub expires_at_secs: u64,
+    pub is_negative: bool,
+    pub records: Vec<ResourceRecord>,
+}
+
 #[derive(Clone)]
 enum CacheEntry {
     Positive {
         records: Vec<ResourceRecord>,
         expires_at: Instant,
+        created_at: Instant,
     },
     Negative {
         expires_at: Instant,
+        created_at: Instant,
     },
 }
 
@@ -59,14 +71,14 @@ impl DnsCache {
         let key = (name.to_lowercase(), record_type);
         let mut inner = self.inner.write().unwrap();
 
-        // Clone what we need first to avoid borrow conflicts
         let result = match inner.map.get(&key) {
             Some(CacheEntry::Positive {
                 records,
                 expires_at,
+                ..
             }) if *expires_at > Instant::now() => Some(records.clone()),
-            Some(CacheEntry::Negative { expires_at }) if *expires_at > Instant::now() => {
-                Some(Vec::new()) // Negative cache hit
+            Some(CacheEntry::Negative { expires_at, .. }) if *expires_at > Instant::now() => {
+                Some(Vec::new())
             }
             _ => None,
         };
@@ -97,7 +109,6 @@ impl DnsCache {
         self.put_multiple(vec![record]);
     }
 
-    /// Cache homogeneous RRset
     pub fn put_multiple(&self, records: Vec<ResourceRecord>) {
         if records.is_empty() {
             return;
@@ -118,7 +129,8 @@ impl DnsCache {
         }
 
         let min_ttl = valid.iter().map(|r| r.ttl).min().unwrap();
-        let expires_at = Instant::now() + Duration::from_secs(min_ttl as u64);
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(min_ttl as u64);
 
         let mut inner = self.inner.write().unwrap();
         inner.insert(
@@ -126,21 +138,28 @@ impl DnsCache {
             CacheEntry::Positive {
                 records: valid,
                 expires_at,
+                created_at: now,
             },
         );
     }
 
-    /// Cache negative response (NXDOMAIN / NODATA)
     pub fn put_negative(&self, name: &str, record_type: RecordType, ttl: u32) {
         if ttl == 0 {
             return;
         }
 
-        let expires_at = Instant::now() + Duration::from_secs(ttl as u64);
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(ttl as u64);
         let key = (name.to_lowercase(), record_type);
 
         let mut inner = self.inner.write().unwrap();
-        inner.insert(key, CacheEntry::Negative { expires_at });
+        inner.insert(
+            key,
+            CacheEntry::Negative {
+                expires_at,
+                created_at: now,
+            },
+        );
     }
 
     /// NS lookup with parent fallback
@@ -176,14 +195,81 @@ impl DnsCache {
 
         inner.map.retain(|_, entry| match entry {
             CacheEntry::Positive { expires_at, .. } => *expires_at > now,
-            CacheEntry::Negative { expires_at } => *expires_at > now,
+            CacheEntry::Negative { expires_at, .. } => *expires_at > now,
         });
     }
 
-    /// Cache metrics
     pub fn stats(&self) -> (u64, u64, u64) {
         let inner = self.inner.read().unwrap();
         (inner.hits, inner.misses, inner.evictions)
+    }
+
+    pub fn entries(&self) -> Vec<CacheEntryInfo> {
+        let inner = self.inner.read().unwrap();
+        let now = Instant::now();
+        let mut result = Vec::new();
+
+        for ((domain, record_type), entry) in &inner.map {
+            match entry {
+                CacheEntry::Positive {
+                    records,
+                    expires_at,
+                    created_at,
+                } => {
+                    if *expires_at > now {
+                        let ttl = expires_at
+                            .checked_duration_since(*created_at)
+                            .map(|d| d.as_secs() as u32)
+                            .unwrap_or(0);
+                        let age = now
+                            .checked_duration_since(*created_at)
+                            .map(|d| d.as_secs() as u64)
+                            .unwrap_or(0);
+                        let expires_in = now
+                            .checked_duration_since(*expires_at)
+                            .map(|d| d.as_secs() as u64)
+                            .unwrap_or(0);
+
+                        result.push(CacheEntryInfo {
+                            domain: domain.clone(),
+                            record_type: *record_type,
+                            ttl,
+                            created_at_secs: age,
+                            expires_at_secs: expires_in,
+                            is_negative: false,
+                            records: records.clone(),
+                        });
+                    }
+                }
+                CacheEntry::Negative {
+                    expires_at,
+                    created_at,
+                } => {
+                    if *expires_at > now {
+                        let ttl = expires_at
+                            .checked_duration_since(*created_at)
+                            .map(|d| d.as_secs() as u32)
+                            .unwrap_or(0);
+                        let age = now
+                            .checked_duration_since(*created_at)
+                            .map(|d| d.as_secs() as u64)
+                            .unwrap_or(0);
+
+                        result.push(CacheEntryInfo {
+                            domain: domain.clone(),
+                            record_type: *record_type,
+                            ttl,
+                            created_at_secs: age,
+                            expires_at_secs: 0,
+                            is_negative: true,
+                            records: Vec::new(),
+                        });
+                    }
+                }
+            }
+        }
+
+        result
     }
 }
 
@@ -763,5 +849,105 @@ mod tests {
         let (hits, misses, _) = cache.stats();
         assert_eq!(misses, 1);
         assert_eq!(hits, 0);
+    }
+
+    #[test]
+    fn entries_returns_all_active_entries() {
+        let cache = DnsCache::new();
+        cache.put(a("entry1.com", "1.1.1.1", 300));
+        cache.put(a("entry2.com", "2.2.2.2", 300));
+        cache.put(ns("entry3.com", "ns.entry3.com", 300));
+
+        let entries = cache.entries();
+
+        assert_eq!(entries.len(), 3);
+        let domains: Vec<_> = entries.iter().map(|e| e.domain.clone()).collect();
+        assert!(domains.contains(&"entry1.com".to_string()));
+        assert!(domains.contains(&"entry2.com".to_string()));
+        assert!(domains.contains(&"entry3.com".to_string()));
+    }
+
+    #[test]
+    fn entries_excludes_expired_entries() {
+        let cache = DnsCache::new();
+        cache.put(a("fresh.com", "1.1.1.1", 300));
+        cache.put(a("expired.com", "2.2.2.2", 1));
+
+        sleep(Duration::from_secs(2));
+
+        let entries = cache.entries();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].domain, "fresh.com");
+    }
+
+    #[test]
+    fn entries_age_increases_over_time() {
+        let cache = DnsCache::new();
+        cache.put(a("test.com", "1.1.1.1", 300));
+
+        let entries_before = cache.entries();
+        assert_eq!(entries_before.len(), 1);
+        let age_before = entries_before[0].created_at_secs;
+
+        sleep(Duration::from_secs(2));
+
+        let entries_after = cache.entries();
+        assert_eq!(entries_after.len(), 1);
+        let age_after = entries_after[0].created_at_secs;
+
+        assert!(age_after >= age_before + 2);
+    }
+
+    #[test]
+    fn entries_ttl_matches_record_ttl() {
+        let cache = DnsCache::new();
+        cache.put(a("ttl.com", "1.1.1.1", 120));
+
+        let entries = cache.entries();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].ttl, 120);
+    }
+
+    #[test]
+    fn entries_negative_cache_included() {
+        let cache = DnsCache::new();
+        cache.put_negative("neg.com", RecordType::A, 300);
+
+        let entries = cache.entries();
+
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_negative);
+        assert!(entries[0].records.is_empty());
+    }
+
+    #[test]
+    fn entries_records_data_included() {
+        let cache = DnsCache::new();
+        cache.put(a("data.com", "1.2.3.4", 300));
+
+        let entries = cache.entries();
+
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].records.is_empty());
+    }
+
+    #[test]
+    fn entries_record_type_included() {
+        let cache = DnsCache::new();
+        cache.put(ns("test.com", "ns.test.com", 300));
+
+        let entries = cache.entries();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].record_type, RecordType::NS);
+    }
+
+    #[test]
+    fn entries_empty_cache_returns_empty() {
+        let cache = DnsCache::new();
+        let entries = cache.entries();
+        assert!(entries.is_empty());
     }
 }
