@@ -1,0 +1,9 @@
+[package]
+name = "raft-consensus"
+version = "0.1.0"
+edition = "2021"
+description = "Raft consensus algorithm implemented from scratch in Rust"
+
+[dependencies]
+
+[dev-dependencies]
