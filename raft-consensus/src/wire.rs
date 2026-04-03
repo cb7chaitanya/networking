@@ -23,6 +23,12 @@
 //!
 //! Tag 4 — AppendEntriesResponse:
 //!   [4: u8] [term: u64] [success: u8] [match_index: u64]
+//!
+//! Tag 5 — PreVote:
+//!   [5: u8] [term: u64] [candidate_id: u64] [last_log_index: u64] [last_log_term: u64]
+//!
+//! Tag 6 — PreVoteResponse:
+//!   [6: u8] [term: u64] [vote_granted: u8]
 //! ```
 
 use crate::log::LogEntry;
@@ -54,6 +60,8 @@ const TAG_REQUEST_VOTE: u8 = 1;
 const TAG_REQUEST_VOTE_RESPONSE: u8 = 2;
 const TAG_APPEND_ENTRIES: u8 = 3;
 const TAG_APPEND_ENTRIES_RESPONSE: u8 = 4;
+const TAG_PRE_VOTE: u8 = 5;
+const TAG_PRE_VOTE_RESPONSE: u8 = 6;
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Encoder
@@ -66,6 +74,8 @@ pub fn encode(rpc: &Rpc) -> Vec<u8> {
         Rpc::RequestVoteResponse(reply) => encode_request_vote_response(reply),
         Rpc::AppendEntries(args) => encode_append_entries(args),
         Rpc::AppendEntriesResponse(reply) => encode_append_entries_response(reply),
+        Rpc::PreVote(args) => encode_pre_vote(args),
+        Rpc::PreVoteResponse(reply) => encode_pre_vote_response(reply),
     }
 }
 
@@ -118,6 +128,24 @@ fn encode_append_entries_response(reply: &AppendEntriesReply) -> Vec<u8> {
     buf.extend_from_slice(&reply.term.to_be_bytes());
     buf.push(reply.success as u8);
     buf.extend_from_slice(&reply.match_index.to_be_bytes());
+    buf
+}
+
+fn encode_pre_vote(args: &PreVoteArgs) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 4 * 8);
+    buf.push(TAG_PRE_VOTE);
+    buf.extend_from_slice(&args.term.to_be_bytes());
+    buf.extend_from_slice(&args.candidate_id.to_be_bytes());
+    buf.extend_from_slice(&args.last_log_index.to_be_bytes());
+    buf.extend_from_slice(&args.last_log_term.to_be_bytes());
+    buf
+}
+
+fn encode_pre_vote_response(reply: &PreVoteReply) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + 1);
+    buf.push(TAG_PRE_VOTE_RESPONSE);
+    buf.extend_from_slice(&reply.term.to_be_bytes());
+    buf.push(reply.vote_granted as u8);
     buf
 }
 
@@ -189,6 +217,26 @@ pub fn decode(data: &[u8]) -> Result<Rpc, WireError> {
                 term,
                 success,
                 match_index,
+            }))
+        }
+        TAG_PRE_VOTE => {
+            let term = cursor.read_u64()?;
+            let candidate_id = cursor.read_u64()?;
+            let last_log_index = cursor.read_u64()?;
+            let last_log_term = cursor.read_u64()?;
+            Ok(Rpc::PreVote(PreVoteArgs {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            }))
+        }
+        TAG_PRE_VOTE_RESPONSE => {
+            let term = cursor.read_u64()?;
+            let vote_granted = cursor.read_u8()? != 0;
+            Ok(Rpc::PreVoteResponse(PreVoteReply {
+                term,
+                vote_granted,
             }))
         }
         other => Err(WireError::UnknownTag(other)),
