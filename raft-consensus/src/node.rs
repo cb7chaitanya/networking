@@ -1294,6 +1294,12 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     pub fn leader_id(&self) -> Option<NodeId> {
         self.current_leader
     }
+
+    /// Crate-internal access to the storage backend.
+    /// Used by the simulator to snapshot storage before crashing a node.
+    pub(crate) fn storage(&self) -> &S {
+        &self.storage
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
