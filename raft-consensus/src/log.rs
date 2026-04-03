@@ -7,13 +7,38 @@
 //! Indices are **1-based** following the Raft paper. Index 0 is a virtual
 //! sentinel representing "before any entry" — it is never stored.
 
+use serde::{Deserialize, Serialize};
+
 use crate::state::{LogIndex, Term};
 
-// ── Command ──
+// ── LogEntry ──
 
-/// An opaque command to be applied to the replicated state machine.
-/// The Raft layer treats this as an opaque blob; only the application layer
-/// interprets it.
+/// A single entry in the replicated log.
+///
+/// The Raft layer treats the command payload as an **opaque byte vector**.
+/// Only the application layer interprets it. This keeps the consensus engine
+/// decoupled from any particular state machine.
+///
+/// The `index` is NOT part of the entry — it is a positional property assigned
+/// by the log when the entry is appended. This matches the wire format: on the
+/// network, only `(term, data)` is transmitted, and the receiver determines the
+/// index from `prev_log_index + offset`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogEntry {
+    /// The term when the entry was created by the leader.
+    pub term: Term,
+    /// Opaque command bytes. The Raft layer never inspects this — it is passed
+    /// through to the application's state machine on commit.
+    pub data: Vec<u8>,
+}
+
+// ── Command (application-level convenience) ──
+
+/// Application-level command enum with serialization helpers.
+///
+/// This is NOT part of the Raft protocol — it is a convenience for the
+/// key-value state machine we use in testing and simulation. Real applications
+/// would define their own command format and use `LogEntry.data` directly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// No-op entry appended by a newly elected leader to commit entries from
@@ -26,28 +51,86 @@ pub enum Command {
     Delete { key: String },
 }
 
-// ── LogEntry ──
+/// Wire tag bytes for command variants.
+const TAG_NOOP: u8 = 0;
+const TAG_PUT: u8 = 1;
+const TAG_DELETE: u8 = 2;
 
-/// A single entry in the replicated log.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LogEntry {
-    /// The term when the entry was created by the leader.
-    pub term: Term,
-    /// 1-based position in the log.
-    pub index: LogIndex,
-    /// The command to apply to the state machine.
-    pub command: Command,
+impl Command {
+    /// Serialize the command to bytes suitable for `LogEntry.data`.
+    ///
+    /// Format (simple length-prefixed encoding):
+    /// - Noop:   `[0]`
+    /// - Put:    `[1][key_len: u32][key_bytes][value_bytes]`
+    /// - Delete: `[2][key_len: u32][key_bytes]`
+    pub fn encode(&self) -> Vec<u8> {
+        match self {
+            Command::Noop => vec![TAG_NOOP],
+            Command::Put { key, value } => {
+                let key_bytes = key.as_bytes();
+                let mut buf = Vec::with_capacity(1 + 4 + key_bytes.len() + value.len());
+                buf.push(TAG_PUT);
+                buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+                buf.extend_from_slice(key_bytes);
+                buf.extend_from_slice(value);
+                buf
+            }
+            Command::Delete { key } => {
+                let key_bytes = key.as_bytes();
+                let mut buf = Vec::with_capacity(1 + 4 + key_bytes.len());
+                buf.push(TAG_DELETE);
+                buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
+                buf.extend_from_slice(key_bytes);
+                buf
+            }
+        }
+    }
+
+    /// Deserialize a command from bytes. Returns `None` if the data is malformed.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.is_empty() {
+            return None;
+        }
+        match data[0] {
+            TAG_NOOP => Some(Command::Noop),
+            TAG_PUT => {
+                if data.len() < 5 {
+                    return None;
+                }
+                let key_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                if data.len() < 5 + key_len {
+                    return None;
+                }
+                let key = String::from_utf8(data[5..5 + key_len].to_vec()).ok()?;
+                let value = data[5 + key_len..].to_vec();
+                Some(Command::Put { key, value })
+            }
+            TAG_DELETE => {
+                if data.len() < 5 {
+                    return None;
+                }
+                let key_len = u32::from_be_bytes([data[1], data[2], data[3], data[4]]) as usize;
+                if data.len() < 5 + key_len {
+                    return None;
+                }
+                let key = String::from_utf8(data[5..5 + key_len].to_vec()).ok()?;
+                Some(Command::Delete { key })
+            }
+            _ => None,
+        }
+    }
 }
 
 // ── RaftLog trait ──
 
 /// Abstraction over the replicated log storage.
 ///
-/// Callers must ensure indices are valid; out-of-range accesses return `None`
-/// rather than panicking, so the node layer can handle mismatches gracefully.
+/// Indices are 1-based and assigned by the log, not by the caller. The log
+/// is append-only from the perspective of normal operation; truncation only
+/// happens when a follower must discard entries that conflict with the leader.
 pub trait RaftLog {
-    /// Append an entry at the end of the log. The caller must set `entry.index`
-    /// to `self.last_index() + 1`.
+    /// Append an entry at the end of the log. The entry's index is implicitly
+    /// `self.last_index() + 1`.
     fn append(&mut self, entry: LogEntry);
 
     /// Retrieve the entry at `index`, or `None` if out of range.
@@ -59,8 +142,8 @@ pub trait RaftLog {
     /// The term of the last entry in the log, or 0 if the log is empty.
     fn last_term(&self) -> Term;
 
-    /// Return a slice of entries in the range `[from, to]` (inclusive on both ends).
-    /// Returns an empty slice if the range is invalid.
+    /// Return entries in the range `[from, to]` (inclusive on both ends).
+    /// Returns an empty vec if the range is invalid.
     fn slice(&self, from: LogIndex, to: LogIndex) -> Vec<&LogEntry>;
 
     /// Remove all entries from `index` onward (inclusive). Used when a follower
@@ -109,11 +192,6 @@ impl Default for InMemoryLog {
 
 impl RaftLog for InMemoryLog {
     fn append(&mut self, entry: LogEntry) {
-        debug_assert_eq!(
-            entry.index,
-            self.last_index() + 1,
-            "append index must be contiguous"
-        );
         self.entries.push(entry);
     }
 
@@ -157,5 +235,79 @@ impl RaftLog for InMemoryLog {
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_noop_roundtrip() {
+        let cmd = Command::Noop;
+        let bytes = cmd.encode();
+        assert_eq!(Command::decode(&bytes), Some(Command::Noop));
+    }
+
+    #[test]
+    fn command_put_roundtrip() {
+        let cmd = Command::Put {
+            key: "hello".into(),
+            value: vec![1, 2, 3],
+        };
+        let bytes = cmd.encode();
+        assert_eq!(Command::decode(&bytes), Some(cmd));
+    }
+
+    #[test]
+    fn command_delete_roundtrip() {
+        let cmd = Command::Delete {
+            key: "gone".into(),
+        };
+        let bytes = cmd.encode();
+        assert_eq!(Command::decode(&bytes), Some(cmd));
+    }
+
+    #[test]
+    fn command_decode_empty_returns_none() {
+        assert_eq!(Command::decode(&[]), None);
+    }
+
+    #[test]
+    fn command_decode_invalid_tag_returns_none() {
+        assert_eq!(Command::decode(&[255]), None);
+    }
+
+    #[test]
+    fn log_append_and_get() {
+        let mut log = InMemoryLog::new();
+        assert_eq!(log.last_index(), 0);
+        assert_eq!(log.last_term(), 0);
+
+        log.append(LogEntry {
+            term: 1,
+            data: Command::Noop.encode(),
+        });
+        assert_eq!(log.last_index(), 1);
+        assert_eq!(log.last_term(), 1);
+        assert_eq!(log.get(1).unwrap().term, 1);
+        assert!(log.get(0).is_none());
+        assert!(log.get(2).is_none());
+    }
+
+    #[test]
+    fn log_truncate() {
+        let mut log = InMemoryLog::new();
+        for i in 1..=5 {
+            log.append(LogEntry {
+                term: i,
+                data: vec![],
+            });
+        }
+        assert_eq!(log.last_index(), 5);
+
+        log.truncate_from(3);
+        assert_eq!(log.last_index(), 2);
+        assert!(log.get(3).is_none());
     }
 }

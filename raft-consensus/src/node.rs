@@ -96,7 +96,9 @@ impl Timer {
 pub struct ApplyResult {
     pub index: LogIndex,
     pub term: Term,
-    pub command: Command,
+    /// The raw command bytes from the log entry. Use `Command::decode()` to
+    /// interpret as an application-level command.
+    pub data: Vec<u8>,
 }
 
 // ── RaftNode ──
@@ -243,18 +245,20 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     /// ours, we update our term and revert to follower *before* processing the
     /// payload. If the message's term is less than ours, we reject it (stale).
     pub fn step(&mut self, envelope: Envelope) {
+        let msg_term = envelope.term();
+
         // ── Term check: universal rule applied to every inbound message ──
         //
         // "If RPC request or response contains term T > currentTerm:
         //  set currentTerm = T, convert to follower" (§5.1)
-        if envelope.term > self.persistent.current_term {
-            self.update_term(envelope.term);
+        if msg_term > self.persistent.current_term {
+            self.update_term(msg_term);
             // Don't return — still need to process the message.
         }
 
         // Reject messages from old terms. The sender will eventually learn
         // about the newer term from another node.
-        if envelope.term < self.persistent.current_term {
+        if msg_term < self.persistent.current_term {
             self.reject_stale_message(&envelope);
             return;
         }
@@ -282,18 +286,16 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         std::mem::take(&mut self.applied)
     }
 
-    /// Propose a new command. Only the leader can accept proposals; returns
-    /// false if this node is not the leader.
-    pub fn propose(&mut self, command: Command) -> bool {
+    /// Propose a new command (as raw bytes). Only the leader can accept
+    /// proposals; returns false if this node is not the leader.
+    pub fn propose(&mut self, data: Vec<u8>) -> bool {
         if !matches!(self.role, Role::Leader { .. }) {
             return false;
         }
 
-        let index = self.log.last_index() + 1;
         let entry = LogEntry {
             term: self.persistent.current_term,
-            index,
-            command,
+            data,
         };
         self.log.append(entry);
         self.persist_log();
@@ -360,6 +362,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             self.send(
                 peer,
                 Rpc::RequestVote(RequestVoteArgs {
+                    term: self.persistent.current_term,
                     candidate_id: self.id,
                     last_log_index,
                     last_log_term,
@@ -412,8 +415,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // This ensures the leader can commit entries from previous terms.
         let noop = LogEntry {
             term: self.persistent.current_term,
-            index: self.log.last_index() + 1,
-            command: Command::Noop,
+            data: Command::Noop.encode(),
         };
         self.log.append(noop);
         self.persist_log();
@@ -478,6 +480,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.send(
             from,
             Rpc::RequestVoteResponse(RequestVoteReply {
+                term: self.persistent.current_term,
                 vote_granted: grant,
             }),
         );
@@ -561,8 +564,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     /// - If `prev_log_index` is 0, any log state is consistent (leader is
     ///   sending from the beginning).
     /// - Otherwise, we must have an entry at `prev_log_index` with term
-    ///   `prev_log_term`. If not, we reject and tell the leader where the
-    ///   conflict is so it can backtrack efficiently.
+    ///   `prev_log_term`. If not, we reject and hint at where to retry.
     fn handle_append_entries(&mut self, from: NodeId, args: AppendEntriesArgs) {
         // Any valid AppendEntries from the current leader proves it's alive.
         // Reset our election timer so we don't start a spurious election.
@@ -579,13 +581,13 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             match self.log.term_at(args.prev_log_index) {
                 None => {
                     // We don't have an entry at prev_log_index at all.
-                    // Tell leader to back up to our last index.
+                    // Hint: our log only goes up to last_index — retry from there.
                     self.send(
                         from,
                         Rpc::AppendEntriesResponse(AppendEntriesReply {
+                            term: self.persistent.current_term,
                             success: false,
-                            conflict_index: Some(self.log.last_index() + 1),
-                            conflict_term: None,
+                            match_index: self.log.last_index(),
                         }),
                     );
                     return;
@@ -593,20 +595,21 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                 Some(term) if term != args.prev_log_term => {
                     // We have an entry but with a different term — conflict.
                     // Find the first index of the conflicting term so the
-                    // leader can skip back to the start of this term.
+                    // leader can skip back past the entire bad term.
                     let conflict_term = term;
-                    let mut conflict_index = args.prev_log_index;
-                    while conflict_index > 1
-                        && self.log.term_at(conflict_index - 1) == Some(conflict_term)
+                    let mut first_of_conflict = args.prev_log_index;
+                    while first_of_conflict > 1
+                        && self.log.term_at(first_of_conflict - 1) == Some(conflict_term)
                     {
-                        conflict_index -= 1;
+                        first_of_conflict -= 1;
                     }
+                    // Report match_index as the entry just before the conflict.
                     self.send(
                         from,
                         Rpc::AppendEntriesResponse(AppendEntriesReply {
+                            term: self.persistent.current_term,
                             success: false,
-                            conflict_index: Some(conflict_index),
-                            conflict_term: Some(conflict_term),
+                            match_index: first_of_conflict.saturating_sub(1),
                         }),
                     );
                     return;
@@ -618,17 +621,22 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         }
 
         // ── Append entries ──
+        // Entries in AppendEntriesArgs don't carry their own index — the index
+        // is determined positionally: args.entries[i] goes at
+        // prev_log_index + 1 + i.
+        //
         // "If an existing entry conflicts with a new one (same index but
         // different terms), delete the existing entry and all that follow it."
-        for entry in &args.entries {
-            match self.log.term_at(entry.index) {
+        for (i, entry) in args.entries.iter().enumerate() {
+            let index = args.prev_log_index + 1 + i as u64;
+            match self.log.term_at(index) {
                 Some(existing_term) if existing_term == entry.term => {
                     // Already have this entry — skip (idempotent).
                     continue;
                 }
                 Some(_) => {
                     // Conflict: truncate from here and append the rest.
-                    self.log.truncate_from(entry.index);
+                    self.log.truncate_from(index);
                     self.log.append(entry.clone());
                 }
                 None => {
@@ -648,12 +656,14 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             self.apply_committed_entries();
         }
 
+        // Report the last replicated index.
+        let last_new_index = args.prev_log_index + args.entries.len() as u64;
         self.send(
             from,
             Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: self.persistent.current_term,
                 success: true,
-                conflict_index: None,
-                conflict_term: None,
+                match_index: std::cmp::max(last_new_index, self.log.last_index()),
             }),
         );
     }
@@ -663,8 +673,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     /// On success: advance `next_index` and `match_index` for that follower,
     /// then check if we can advance the commit index.
     ///
-    /// On failure: backtrack `next_index` using the conflict hint for faster
-    /// convergence (instead of decrementing by 1 each time).
+    /// On failure: set `next_index = reply.match_index + 1` for faster
+    /// convergence, then retry immediately.
     fn handle_append_entries_response(&mut self, from: NodeId, reply: AppendEntriesReply) {
         let Role::Leader {
             ref mut next_index,
@@ -675,29 +685,22 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         };
 
         if reply.success {
-            // The follower has accepted all entries up to the ones we sent.
-            // Update our tracking state.
-            let new_match = self.log.last_index(); // conservative upper bound
+            // The follower has accepted all entries up to reply.match_index.
             if let Some(mi) = match_index.get_mut(&from) {
-                if new_match > *mi {
-                    *mi = new_match;
+                if reply.match_index > *mi {
+                    *mi = reply.match_index;
                 }
             }
             if let Some(ni) = next_index.get_mut(&from) {
-                *ni = new_match + 1;
+                *ni = reply.match_index + 1;
             }
 
             // Check if we can advance the commit index.
             self.maybe_advance_commit_index();
         } else {
-            // Backtrack using the conflict hint from the follower.
+            // Backtrack using the match_index hint from the follower.
             if let Some(ni) = next_index.get_mut(&from) {
-                if let Some(conflict_idx) = reply.conflict_index {
-                    *ni = conflict_idx;
-                } else {
-                    // No hint — decrement by 1 (slow path).
-                    *ni = ni.saturating_sub(1).max(1);
-                }
+                *ni = reply.match_index + 1;
             }
 
             // Retry immediately with the updated next_index.
@@ -771,9 +774,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
             if let Some(entry) = self.log.get(index) {
                 self.applied.push(ApplyResult {
-                    index: entry.index,
+                    index,
                     term: entry.term,
-                    command: entry.command.clone(),
+                    data: entry.data.clone(),
                 });
             }
         }
@@ -824,6 +827,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.send(
             peer,
             Rpc::AppendEntries(AppendEntriesArgs {
+                term: self.persistent.current_term,
                 leader_id: self.id,
                 prev_log_index,
                 prev_log_term,
@@ -853,6 +857,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                 self.send(
                     envelope.from,
                     Rpc::RequestVoteResponse(RequestVoteReply {
+                        term: self.persistent.current_term,
                         vote_granted: false,
                     }),
                 );
@@ -861,9 +866,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                 self.send(
                     envelope.from,
                     Rpc::AppendEntriesResponse(AppendEntriesReply {
+                        term: self.persistent.current_term,
                         success: false,
-                        conflict_index: None,
-                        conflict_term: None,
+                        match_index: 0,
                     }),
                 );
             }
@@ -881,7 +886,6 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.outbox.push(Envelope {
             from: self.id,
             to,
-            term: self.persistent.current_term,
             payload,
         });
     }
@@ -1023,6 +1027,11 @@ mod tests {
         RaftNode::new(id, peers, default_config())
     }
 
+    /// Helper to create an Envelope with the term extracted from the payload.
+    fn envelope(from: NodeId, to: NodeId, payload: Rpc) -> Envelope {
+        Envelope { from, to, payload }
+    }
+
     // ── Initial state ──
 
     #[test]
@@ -1057,7 +1066,7 @@ mod tests {
         assert_eq!(messages.len(), 2);
         for msg in &messages {
             assert_eq!(msg.from, 1);
-            assert_eq!(msg.term, 1);
+            assert_eq!(msg.term(), 1);
             assert!(matches!(msg.payload, Rpc::RequestVote(_)));
         }
         let targets: HashSet<NodeId> = messages.iter().map(|m| m.to).collect();
@@ -1087,12 +1096,14 @@ mod tests {
         node.drain_messages();
 
         // Receive vote from node 2 — now we have 2/3 = majority.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply { vote_granted: true }),
-        });
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
 
         assert!(node.is_leader());
         assert_eq!(node.current_term(), 1);
@@ -1105,12 +1116,14 @@ mod tests {
         node.drain_messages(); // discard RequestVote messages
 
         // Win election.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply { vote_granted: true }),
-        });
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
 
         let messages = node.drain_messages();
         // Should send AppendEntries (heartbeat) to both peers.
@@ -1126,18 +1139,20 @@ mod tests {
         node.tick(25);
         node.drain_messages();
 
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply { vote_granted: true }),
-        });
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
 
         // Leader should have appended a no-op entry.
         assert_eq!(node.log.last_index(), 1);
         let entry = node.log.get(1).unwrap();
         assert_eq!(entry.term, 1);
-        assert_eq!(entry.command, Command::Noop);
+        assert_eq!(Command::decode(&entry.data), Some(Command::Noop));
     }
 
     // ── Rejected votes ──
@@ -1149,22 +1164,26 @@ mod tests {
         node.drain_messages();
 
         // One vote from peer — total 2/5, not a majority.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply { vote_granted: true }),
-        });
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
 
         assert!(node.is_candidate());
 
         // Another vote — total 3/5, majority!
-        node.step(Envelope {
-            from: 3,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply { vote_granted: true }),
-        });
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
 
         assert!(node.is_leader());
     }
@@ -1175,14 +1194,14 @@ mod tests {
         node.tick(25);
         node.drain_messages();
 
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
                 vote_granted: false,
             }),
-        });
+        ));
 
         assert!(node.is_candidate());
     }
@@ -1196,18 +1215,18 @@ mod tests {
         node.drain_messages();
 
         // Receive a message with a higher term.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 5,
-            payload: Rpc::AppendEntries(AppendEntriesArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 5,
                 leader_id: 2,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
             }),
-        });
+        ));
 
         assert!(node.is_follower());
         assert_eq!(node.current_term(), 5);
@@ -1220,26 +1239,28 @@ mod tests {
         // Become leader.
         node.tick(25);
         node.drain_messages();
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply { vote_granted: true }),
-        });
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
         assert!(node.is_leader());
         node.drain_messages();
 
         // Receive a message from a higher term.
-        node.step(Envelope {
-            from: 3,
-            to: 1,
-            term: 10,
-            payload: Rpc::RequestVote(RequestVoteArgs {
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 10,
                 candidate_id: 3,
                 last_log_index: 1,
                 last_log_term: 1,
             }),
-        });
+        ));
 
         assert!(node.is_follower());
         assert_eq!(node.current_term(), 10);
@@ -1250,21 +1271,22 @@ mod tests {
     #[test]
     fn follower_grants_vote_to_first_candidate() {
         let mut node = three_node_cluster(1);
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVote(RequestVoteArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
                 candidate_id: 2,
                 last_log_index: 0,
                 last_log_term: 0,
             }),
-        });
+        ));
 
         let messages = node.drain_messages();
         assert_eq!(messages.len(), 1);
         if let Rpc::RequestVoteResponse(reply) = &messages[0].payload {
             assert!(reply.vote_granted);
+            assert_eq!(reply.term, 1);
         } else {
             panic!("expected RequestVoteResponse");
         }
@@ -1276,29 +1298,29 @@ mod tests {
         let mut node = three_node_cluster(1);
 
         // Vote for candidate 2.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVote(RequestVoteArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
                 candidate_id: 2,
                 last_log_index: 0,
                 last_log_term: 0,
             }),
-        });
+        ));
         node.drain_messages();
 
         // Candidate 3 asks for a vote in the same term — must be rejected.
-        node.step(Envelope {
-            from: 3,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVote(RequestVoteArgs {
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
                 candidate_id: 3,
                 last_log_index: 0,
                 last_log_term: 0,
             }),
-        });
+        ));
 
         let messages = node.drain_messages();
         assert_eq!(messages.len(), 1);
@@ -1316,21 +1338,20 @@ mod tests {
         // Give node 1 a log entry in term 2.
         node.log.append(LogEntry {
             term: 2,
-            index: 1,
-            command: Command::Noop,
+            data: Command::Noop.encode(),
         });
 
         // Candidate 2 has an empty log (term 0, index 0) — less up-to-date.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 2,
-            payload: Rpc::RequestVote(RequestVoteArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 2,
                 candidate_id: 2,
                 last_log_index: 0,
                 last_log_term: 0,
             }),
-        });
+        ));
 
         let messages = node.drain_messages();
         if let Rpc::RequestVoteResponse(reply) = &messages[0].payload {
@@ -1344,36 +1365,37 @@ mod tests {
     fn stale_term_messages_are_rejected() {
         let mut node = three_node_cluster(1);
         // Advance to term 5.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 5,
-            payload: Rpc::AppendEntries(AppendEntriesArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 5,
                 leader_id: 2,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
             }),
-        });
+        ));
         node.drain_messages();
 
         // Message from term 3 — stale.
-        node.step(Envelope {
-            from: 3,
-            to: 1,
-            term: 3,
-            payload: Rpc::RequestVote(RequestVoteArgs {
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 3,
                 candidate_id: 3,
                 last_log_index: 0,
                 last_log_term: 0,
             }),
-        });
+        ));
 
         let messages = node.drain_messages();
         assert_eq!(messages.len(), 1);
         if let Rpc::RequestVoteResponse(reply) = &messages[0].payload {
             assert!(!reply.vote_granted);
+            assert_eq!(reply.term, 5); // our term is higher
         }
         // Term should still be 5.
         assert_eq!(node.current_term(), 5);
@@ -1401,18 +1423,18 @@ mod tests {
         assert!(node.is_follower());
 
         // Receive heartbeat — resets timer.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::AppendEntries(AppendEntriesArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
                 leader_id: 2,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
             }),
-        });
+        ));
 
         // Tick again — should not trigger election because timer was reset.
         node.tick(9);
@@ -1426,28 +1448,32 @@ mod tests {
         let mut node = three_node_cluster(1);
 
         // Follower rejects.
-        assert!(!node.propose(Command::Put {
+        let put = Command::Put {
             key: "x".into(),
             value: vec![1],
-        }));
+        };
+        assert!(!node.propose(put.encode()));
 
         // Become leader.
         node.tick(25);
         node.drain_messages();
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply { vote_granted: true }),
-        });
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
         node.drain_messages();
         assert!(node.is_leader());
 
         // Leader accepts.
-        assert!(node.propose(Command::Put {
+        let put2 = Command::Put {
             key: "x".into(),
             value: vec![1],
-        }));
+        };
+        assert!(node.propose(put2.encode()));
 
         // Log should have noop (index 1) + put (index 2).
         assert_eq!(node.log.last_index(), 2);
@@ -1463,18 +1489,18 @@ mod tests {
         assert!(node.is_candidate());
 
         // Receive AppendEntries from the legitimate leader of term 1.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::AppendEntries(AppendEntriesArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
                 leader_id: 2,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries: vec![],
                 leader_commit: 0,
             }),
-        });
+        ));
 
         assert!(node.is_follower());
         assert_eq!(node.current_term(), 1);
@@ -1489,34 +1515,34 @@ mod tests {
         let entries = vec![
             LogEntry {
                 term: 1,
-                index: 1,
-                command: Command::Put {
+                data: Command::Put {
                     key: "a".into(),
                     value: vec![1],
-                },
+                }
+                .encode(),
             },
             LogEntry {
                 term: 1,
-                index: 2,
-                command: Command::Put {
+                data: Command::Put {
                     key: "b".into(),
                     value: vec![2],
-                },
+                }
+                .encode(),
             },
         ];
 
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::AppendEntries(AppendEntriesArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
                 leader_id: 2,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries,
                 leader_commit: 0,
             }),
-        });
+        ));
 
         assert_eq!(node.log.last_index(), 2);
         assert_eq!(node.log.get(1).unwrap().term, 1);
@@ -1526,6 +1552,7 @@ mod tests {
         assert_eq!(messages.len(), 1);
         if let Rpc::AppendEntriesResponse(reply) = &messages[0].payload {
             assert!(reply.success);
+            assert_eq!(reply.match_index, 2);
         }
     }
 
@@ -1536,28 +1563,27 @@ mod tests {
         let mut node = three_node_cluster(1);
 
         // Leader sends entries starting at index 5, but follower has no log.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::AppendEntries(AppendEntriesArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
                 leader_id: 2,
                 prev_log_index: 4,
                 prev_log_term: 1,
                 entries: vec![LogEntry {
                     term: 1,
-                    index: 5,
-                    command: Command::Noop,
+                    data: Command::Noop.encode(),
                 }],
                 leader_commit: 0,
             }),
-        });
+        ));
 
         let messages = node.drain_messages();
         if let Rpc::AppendEntriesResponse(reply) = &messages[0].payload {
             assert!(!reply.success);
-            // Conflict hint: follower's last index is 0, so conflict_index = 1.
-            assert_eq!(reply.conflict_index, Some(1));
+            // Follower has no entries, so match_index = 0 (last_index).
+            assert_eq!(reply.match_index, 0);
         }
     }
 
@@ -1571,34 +1597,34 @@ mod tests {
         let entries = vec![
             LogEntry {
                 term: 1,
-                index: 1,
-                command: Command::Put {
+                data: Command::Put {
                     key: "a".into(),
                     value: vec![1],
-                },
+                }
+                .encode(),
             },
             LogEntry {
                 term: 1,
-                index: 2,
-                command: Command::Put {
+                data: Command::Put {
                     key: "b".into(),
                     value: vec![2],
-                },
+                }
+                .encode(),
             },
         ];
 
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::AppendEntries(AppendEntriesArgs {
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
                 leader_id: 2,
                 prev_log_index: 0,
                 prev_log_term: 0,
                 entries,
                 leader_commit: 2, // leader says both are committed
             }),
-        });
+        ));
 
         assert_eq!(node.commit_index(), 2);
         assert_eq!(node.last_applied(), 2);
@@ -1618,40 +1644,41 @@ mod tests {
         // Follower has entries from term 1.
         node.log.append(LogEntry {
             term: 1,
-            index: 1,
-            command: Command::Noop,
+            data: Command::Noop.encode(),
         });
         node.log.append(LogEntry {
             term: 1,
-            index: 2,
-            command: Command::Noop,
+            data: Command::Noop.encode(),
         });
 
         // Leader sends entry at index 2 with term 2 — conflicts with existing.
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 2,
-            payload: Rpc::AppendEntries(AppendEntriesArgs {
+        let put_data = Command::Put {
+            key: "x".into(),
+            value: vec![42],
+        }
+        .encode();
+
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 2,
                 leader_id: 2,
                 prev_log_index: 1,
                 prev_log_term: 1,
                 entries: vec![LogEntry {
                     term: 2,
-                    index: 2,
-                    command: Command::Put {
-                        key: "x".into(),
-                        value: vec![42],
-                    },
+                    data: put_data.clone(),
                 }],
                 leader_commit: 0,
             }),
-        });
+        ));
 
         // Old entry at index 2 (term 1) should be replaced with new (term 2).
         assert_eq!(node.log.last_index(), 2);
         assert_eq!(node.log.get(2).unwrap().term, 2);
-        if let Command::Put { ref key, .. } = node.log.get(2).unwrap().command {
+        let decoded = Command::decode(&node.log.get(2).unwrap().data).unwrap();
+        if let Command::Put { ref key, .. } = decoded {
             assert_eq!(key, "x");
         } else {
             panic!("expected Put command");
@@ -1680,12 +1707,14 @@ mod tests {
         // Become leader.
         node.tick(25);
         node.drain_messages();
-        node.step(Envelope {
-            from: 2,
-            to: 1,
-            term: 1,
-            payload: Rpc::RequestVoteResponse(RequestVoteReply { vote_granted: true }),
-        });
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
         node.drain_messages(); // discard initial heartbeats
 
         // Tick the heartbeat interval.
@@ -1694,6 +1723,103 @@ mod tests {
         assert_eq!(messages.len(), 2); // one per peer
         for msg in &messages {
             assert!(matches!(msg.payload, Rpc::AppendEntries(_)));
+        }
+    }
+
+    // ── Envelope.term() extracts from payload ──
+
+    #[test]
+    fn envelope_term_reads_from_payload() {
+        let env = envelope(
+            1,
+            2,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 42,
+                candidate_id: 1,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        );
+        assert_eq!(env.term(), 42);
+
+        let env2 = envelope(
+            1,
+            2,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 99,
+                success: true,
+                match_index: 5,
+            }),
+        );
+        assert_eq!(env2.term(), 99);
+    }
+
+    // ── match_index in AppendEntriesReply ──
+
+    #[test]
+    fn reply_match_index_reflects_replicated_entries() {
+        let mut node = three_node_cluster(1);
+
+        // Append 3 entries.
+        let entries: Vec<LogEntry> = (1..=3)
+            .map(|_| LogEntry {
+                term: 1,
+                data: vec![0],
+            })
+            .collect();
+
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 0,
+            }),
+        ));
+
+        let messages = node.drain_messages();
+        if let Rpc::AppendEntriesResponse(reply) = &messages[0].payload {
+            assert!(reply.success);
+            assert_eq!(reply.match_index, 3);
+        }
+    }
+
+    #[test]
+    fn reply_match_index_on_term_conflict() {
+        let mut node = three_node_cluster(1);
+
+        // Give follower entries [term=1, term=1, term=2, term=2].
+        for &t in &[1, 1, 2, 2] {
+            node.log.append(LogEntry {
+                term: t,
+                data: vec![],
+            });
+        }
+
+        // Leader says prev_log_index=4 with prev_log_term=3 — mismatch at index 4
+        // (follower has term 2 there). The entire term-2 range is [3,4], so
+        // match_index should be 2 (just before the conflict).
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 3,
+                leader_id: 2,
+                prev_log_index: 4,
+                prev_log_term: 3,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+
+        let messages = node.drain_messages();
+        if let Rpc::AppendEntriesResponse(reply) = &messages[0].payload {
+            assert!(!reply.success);
+            assert_eq!(reply.match_index, 2); // first_of_conflict(3) - 1 = 2
         }
     }
 }
