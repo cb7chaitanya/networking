@@ -150,6 +150,8 @@ pub struct NodeConfig {
     pub reliable_ack_timeout_ms: u64,
     /// Maximum number of retransmission attempts for REQUEST_ACK messages.
     pub reliable_max_retries: u8,
+    /// Enable LZ4 compression for gossip payloads.
+    pub compression_enabled: bool,
 }
 
 impl Default for NodeConfig {
@@ -178,6 +180,7 @@ impl Default for NodeConfig {
             inbound_peer_refill_rate: 50,
             reliable_ack_timeout_ms: 500,
             reliable_max_retries: 3,
+            compression_enabled: true,
         }
     }
 }
@@ -209,6 +212,7 @@ impl NodeConfig {
             inbound_peer_refill_rate: 0,
             reliable_ack_timeout_ms: 50,
             reliable_max_retries: 3,
+            compression_enabled: true,
         }
     }
 }
