@@ -12,3 +12,4 @@ pub mod reliable;
 pub mod runner;
 pub mod simulator;
 pub mod transport;
+pub mod viz;
