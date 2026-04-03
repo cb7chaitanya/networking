@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 use crate::congestion_control::{CongestionControl, LossKind, RenoCC};
 use crate::packet::{flags, Header, Packet, SackBlock};
 use crate::persist_timer::{PersistTimer, PersistTransition};
+use crate::trace;
 
 // Re-export so existing code that imports from gbn_sender continues to compile.
 pub use crate::congestion_control::{
@@ -493,6 +494,7 @@ impl<CC: CongestionControl> GbnSender<CC> {
             entry.tx_count += 1;
             entry.sent_at = Instant::now();
             self.sr_retransmit_count += 1;
+            trace::log_retransmit(&entry.packet);
             Some(entry.packet.clone())
         } else {
             None

@@ -31,6 +31,10 @@ use tcp_over_udp::{
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
+    /// Enable packet trace logging (prints every packet to stderr).
+    #[arg(long)]
+    trace: bool,
+
     #[command(subcommand)]
     mode: Mode,
 }
@@ -77,6 +81,10 @@ async fn main() {
     env_logger::init();
 
     let cli = Cli::parse();
+
+    if cli.trace {
+        tcp_over_udp::trace::enable();
+    }
 
     let result = match cli.mode {
         Mode::Server { bind } => run_server(bind).await,
