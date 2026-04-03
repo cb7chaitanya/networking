@@ -360,6 +360,10 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
         // Immediately try to replicate to all followers.
         self.replicate_to_all();
+
+        // In a single-node cluster (or when the leader alone is a majority),
+        // there are no followers to wait for — commit immediately.
+        self.maybe_advance_commit_index();
         true
     }
 
@@ -495,6 +499,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
         // Send heartbeats to all peers to establish authority.
         self.send_heartbeats();
+
+        // Single-node cluster: commit the noop immediately (no peers to wait for).
+        self.maybe_advance_commit_index();
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -792,7 +799,23 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     //  Commit index advancement (§5.3, §5.4.2)
     // ════════════════════════════════════════════════════════════════════════
 
-    /// Try to advance the commit index.
+    /// Public entry point: attempt to advance the commit index.
+    ///
+    /// Called automatically after each successful AppendEntries response, but
+    /// the simulator or test harness may also call it directly. Only meaningful
+    /// when this node is the leader; a no-op otherwise.
+    ///
+    /// The leader advances `commit_index` to the highest index N where:
+    /// 1. A majority of nodes (including the leader) have replicated entry N.
+    /// 2. `log[N].term == current_term` (§5.4.2 safety rule).
+    ///
+    /// All entries up to the new `commit_index` are applied to the state
+    /// machine in order and returned via `drain_applied()`.
+    pub fn update_commit_index(&mut self) {
+        self.maybe_advance_commit_index();
+    }
+
+    /// Internal: try to advance the commit index.
     ///
     /// The leader may advance `commit_index` to N if:
     /// 1. A majority of `match_index[peer]` values are >= N.
@@ -4227,5 +4250,461 @@ mod tests {
                 "entry {i} data should match leader after convergence"
             );
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Commit index advancement tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn update_commit_index_is_public_api() {
+        let mut leader = elect_leader_node1();
+        leader.propose(vec![1]);
+        leader.drain_messages();
+
+        // Peer 2 acks.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.drain_messages();
+
+        // Already committed via internal call, but calling the public API
+        // again should be a safe no-op.
+        let before = leader.commit_index();
+        leader.update_commit_index();
+        assert_eq!(leader.commit_index(), before);
+    }
+
+    #[test]
+    fn commit_index_never_goes_backward() {
+        let mut leader = elect_leader_node1();
+        leader.propose(vec![1]);
+        leader.propose(vec![2]);
+        leader.drain_messages();
+
+        // Peer 2 acks up to index 3.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 3,
+            }),
+        ));
+        leader.drain_messages();
+        assert_eq!(leader.commit_index(), 3);
+
+        // Even if we somehow call update_commit_index again with stale
+        // match_index state, commit_index must not decrease.
+        // (The scan starts at commit_index+1, so it can't go backward.)
+        leader.update_commit_index();
+        assert_eq!(leader.commit_index(), 3);
+    }
+
+    #[test]
+    fn single_node_commits_immediately() {
+        let mut node = RaftNode::new(1, vec![], default_config());
+        node.start_election();
+        assert!(node.is_leader());
+        node.drain_messages();
+        node.drain_applied();
+
+        // Propose an entry. With no peers, majority is 1/1 (just us).
+        node.propose(vec![42]);
+        node.drain_messages();
+
+        // Should have committed immediately.
+        assert_eq!(node.commit_index(), 2); // noop(1) + entry(2)
+
+        let applied = node.drain_applied();
+        assert_eq!(applied.len(), 1); // entry(2) — noop was applied at election time
+        assert_eq!(applied[0].index, 2);
+        assert_eq!(applied[0].data, vec![42]);
+    }
+
+    #[test]
+    fn five_node_cluster_needs_three_to_commit() {
+        let mut leader = five_node_cluster(1);
+        leader.start_election();
+        // Get enough votes (3/5 majority).
+        for peer in [2, 3] {
+            leader.step(envelope(
+                peer,
+                1,
+                Rpc::RequestVoteResponse(RequestVoteReply {
+                    term: 1,
+                    vote_granted: true,
+                }),
+            ));
+        }
+        assert!(leader.is_leader());
+        leader.drain_messages();
+        leader.drain_applied();
+
+        leader.propose(vec![1]);
+        leader.drain_messages();
+        assert_eq!(leader.commit_index(), 0);
+
+        // 1 peer acks → 2/5 — not enough.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.drain_messages();
+        assert_eq!(leader.commit_index(), 0, "2/5 is not a majority");
+
+        // 2nd peer acks → 3/5 — majority!
+        leader.step(envelope(
+            3,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.drain_messages();
+        assert_eq!(leader.commit_index(), 2, "3/5 is a majority");
+    }
+
+    #[test]
+    fn commit_finds_highest_majority_index() {
+        let mut leader = elect_leader_node1();
+
+        // Leader has noop(1) + 4 entries = 5 total.
+        for i in 0..4u8 {
+            leader.propose(vec![i]);
+        }
+        leader.drain_messages();
+
+        // Peer 2 has replicated up to index 5.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 5,
+            }),
+        ));
+        leader.drain_messages();
+
+        // 2/3 have index 5 → commit jumps straight to 5, not 1-by-1.
+        assert_eq!(leader.commit_index(), 5);
+    }
+
+    #[test]
+    fn last_applied_tracks_commit_index() {
+        let mut leader = elect_leader_node1();
+        leader.propose(vec![1]);
+        leader.drain_messages();
+
+        assert_eq!(leader.last_applied(), 0);
+
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.drain_messages();
+
+        assert_eq!(leader.commit_index(), 2);
+        assert_eq!(leader.last_applied(), 2, "last_applied must equal commit_index");
+    }
+
+    #[test]
+    fn applied_entries_in_strict_index_order() {
+        let mut leader = elect_leader_node1();
+
+        for i in 1..=5u8 {
+            leader.propose(vec![i]);
+        }
+        leader.drain_messages();
+        leader.drain_applied(); // drain noop
+
+        // Peer 2 acks everything.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 6,
+            }),
+        ));
+        leader.drain_messages();
+
+        let applied = leader.drain_applied();
+        // Entries 1-6 applied, but noop at 1 was drained earlier.
+        // So we get entries 2-6.
+        assert!(!applied.is_empty());
+        for window in applied.windows(2) {
+            assert_eq!(
+                window[1].index,
+                window[0].index + 1,
+                "entries must be applied in consecutive order"
+            );
+        }
+    }
+
+    #[test]
+    fn multiple_commit_advances_accumulate() {
+        let mut leader = elect_leader_node1();
+
+        leader.propose(vec![1]);
+        leader.propose(vec![2]);
+        leader.propose(vec![3]);
+        leader.drain_messages();
+
+        // Peer 2 acks up to index 2 first.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.drain_messages();
+        assert_eq!(leader.commit_index(), 2);
+
+        let applied1 = leader.drain_applied();
+        // noop(1) + entry(2)
+        assert_eq!(applied1.len(), 2);
+
+        // Then acks up to index 4.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 4,
+            }),
+        ));
+        leader.drain_messages();
+        assert_eq!(leader.commit_index(), 4);
+
+        let applied2 = leader.drain_applied();
+        // entries 3 and 4 newly applied.
+        assert_eq!(applied2.len(), 2);
+        assert_eq!(applied2[0].index, 3);
+        assert_eq!(applied2[1].index, 4);
+    }
+
+    #[test]
+    fn follower_commit_bounded_by_last_entry() {
+        let mut follower = three_node_cluster(1);
+
+        // Follower receives 2 entries, leader_commit=5.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry { term: 1, data: vec![1] },
+                    LogEntry { term: 1, data: vec![2] },
+                ],
+                leader_commit: 5, // leader knows more is committed
+            }),
+        ));
+        follower.drain_messages();
+
+        // Follower only has 2 entries, so commit_index = min(5, 2) = 2.
+        assert_eq!(follower.commit_index(), 2);
+        assert_eq!(follower.last_applied(), 2);
+    }
+
+    #[test]
+    fn follower_commit_not_reduced_by_lower_leader_commit() {
+        let mut follower = three_node_cluster(1);
+
+        // First: receive entries with leader_commit=2.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry { term: 1, data: vec![1] },
+                    LogEntry { term: 1, data: vec![2] },
+                ],
+                leader_commit: 2,
+            }),
+        ));
+        follower.drain_messages();
+        assert_eq!(follower.commit_index(), 2);
+
+        // Second: heartbeat with leader_commit=1 (stale/reordered).
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 2,
+                prev_log_term: 1,
+                entries: vec![],
+                leader_commit: 1,
+            }),
+        ));
+        follower.drain_messages();
+
+        // commit_index must NOT go backward.
+        assert_eq!(
+            follower.commit_index(),
+            2,
+            "commit_index must never decrease"
+        );
+    }
+
+    #[test]
+    fn noop_enables_committing_inherited_entries() {
+        // Simulate: new leader inherits an uncommitted entry from a prior
+        // term. The noop from the new term makes it committable.
+        let (mut n1, mut n2, mut n3) = leader_and_followers();
+
+        // n1 is leader in term 1 with noop at index 1.
+        // Manually add an entry "from term 0" (simulating inheritance).
+        n1.log.append(LogEntry { term: 0, data: vec![0xAA] });
+        // Now propose a current-term entry (which triggers replication).
+        n1.propose(vec![0xBB]);
+
+        // Deliver all messages.
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // The current-term entry at index 3 can be committed, which
+        // transitively commits the inherited entry at index 2.
+        assert!(n1.commit_index() >= 3);
+
+        let applied = n1.drain_applied();
+        // Should include entries 1, 2, 3 (noop, inherited, new).
+        assert!(applied.iter().any(|a| a.index == 2 && a.data == vec![0xAA]));
+        assert!(applied.iter().any(|a| a.index == 3 && a.data == vec![0xBB]));
+    }
+
+    #[test]
+    fn update_commit_index_noop_on_follower() {
+        let mut follower = three_node_cluster(1);
+
+        // Calling update_commit_index on a follower is a no-op.
+        follower.update_commit_index();
+        assert_eq!(follower.commit_index(), 0);
+    }
+
+    #[test]
+    fn commit_with_mixed_match_indices() {
+        // 5-node cluster. Peers have varying match_index values.
+        let mut leader = five_node_cluster(1);
+        leader.start_election();
+        for peer in [2, 3] {
+            leader.step(envelope(
+                peer,
+                1,
+                Rpc::RequestVoteResponse(RequestVoteReply {
+                    term: 1,
+                    vote_granted: true,
+                }),
+            ));
+        }
+        assert!(leader.is_leader());
+        leader.drain_messages();
+        leader.drain_applied();
+
+        // Leader has noop(1) + 3 entries.
+        for i in 0..3u8 {
+            leader.propose(vec![i]);
+        }
+        leader.drain_messages();
+
+        // Peers at different stages:
+        // peer 2: match_index=4 (fully caught up)
+        // peer 3: match_index=2 (partially caught up)
+        // peer 4: match_index=0 (behind)
+        // peer 5: match_index=0 (behind)
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 4,
+            }),
+        ));
+        leader.drain_messages();
+        leader.step(envelope(
+            3,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.drain_messages();
+
+        // Majority for index 2: leader(4) + peer2(4) + peer3(2) = 3/5 ✓
+        // Majority for index 3: leader(4) + peer2(4) = 2/5 ✗
+        assert_eq!(
+            leader.commit_index(),
+            2,
+            "should commit highest index with majority"
+        );
+    }
+
+    #[test]
+    fn end_to_end_commit_propagation_to_followers() {
+        let (mut n1, mut n2, mut n3) = leader_and_followers();
+
+        // Propose and replicate.
+        n1.propose(vec![42]);
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // Leader committed (majority confirmed).
+        assert!(n1.commit_index() >= 2);
+
+        // Followers don't know about the commit yet — they learn via
+        // the next AppendEntries (heartbeat) that carries leader_commit.
+        let f2_commit_before = n2.commit_index();
+
+        n1.tick(5); // trigger heartbeat
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // Now followers should have advanced.
+        assert!(
+            n2.commit_index() > f2_commit_before,
+            "follower must advance commit_index from heartbeat"
+        );
+        assert_eq!(n2.commit_index(), n1.commit_index());
+        assert_eq!(n3.commit_index(), n1.commit_index());
+
+        // All three nodes applied the same entries.
+        assert_eq!(n1.last_applied(), n1.commit_index());
+        assert_eq!(n2.last_applied(), n2.commit_index());
+        assert_eq!(n3.last_applied(), n3.commit_index());
     }
 }
