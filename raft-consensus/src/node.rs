@@ -363,6 +363,18 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         true
     }
 
+    /// Convenience: propose an application-level `Command`. Encodes to bytes
+    /// and calls `propose()`. Returns the log index of the new entry, or
+    /// `None` if this node is not the leader.
+    pub fn append_entry(&mut self, command: Command) -> Option<LogIndex> {
+        let index = self.log.last_index() + 1;
+        if self.propose(command.encode()) {
+            Some(index)
+        } else {
+            None
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     //  State transitions
     // ════════════════════════════════════════════════════════════════════════
@@ -741,21 +753,34 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
         if reply.success {
             // The follower has accepted all entries up to reply.match_index.
+            //
+            // Guard: only advance, never regress. A stale success from a
+            // previous round could carry a lower match_index than what we've
+            // already confirmed. Ignoring it prevents next_index from going
+            // backward, which would cause unnecessary re-sends.
             if let Some(mi) = match_index.get_mut(&from) {
                 if reply.match_index > *mi {
                     *mi = reply.match_index;
                 }
             }
+            let confirmed = match_index.get(&from).copied().unwrap_or(0);
             if let Some(ni) = next_index.get_mut(&from) {
-                *ni = reply.match_index + 1;
+                let new_ni = confirmed + 1;
+                if new_ni > *ni {
+                    *ni = new_ni;
+                }
             }
 
             // Check if we can advance the commit index.
             self.maybe_advance_commit_index();
         } else {
             // Backtrack using the match_index hint from the follower.
+            // Guard: don't advance next_index on failure — only backtrack.
             if let Some(ni) = next_index.get_mut(&from) {
-                *ni = reply.match_index + 1;
+                let hint = reply.match_index + 1;
+                if hint < *ni {
+                    *ni = hint;
+                }
             }
 
             // Retry immediately with the updated next_index.
@@ -3367,6 +3392,839 @@ mod tests {
             assert!(
                 *match_index.get(&3).unwrap() >= 1,
                 "leader should track peer 3's match_index"
+            );
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Log replication tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Helper: 3-node cluster with node 1 elected leader, all initial
+    /// messages drained. Leader has noop at index 1.
+    fn leader_and_followers() -> (RaftNode, RaftNode, RaftNode) {
+        let config = default_config();
+        let mut n1 = RaftNode::new(1, vec![2, 3], config.clone());
+        let mut n2 = RaftNode::new(2, vec![1, 3], config.clone());
+        let mut n3 = RaftNode::new(3, vec![1, 2], config.clone());
+
+        // Elect node 1.
+        n1.start_election();
+        let votes = n1.drain_messages();
+        for msg in votes {
+            match msg.to {
+                2 => n2.step(msg),
+                3 => n3.step(msg),
+                _ => {}
+            }
+        }
+        let mut responses = n2.drain_messages();
+        responses.extend(n3.drain_messages());
+        for msg in responses {
+            n1.step(msg);
+        }
+        assert!(n1.is_leader());
+
+        // Deliver initial heartbeats (carry the noop).
+        let hbs = n1.drain_messages();
+        for msg in hbs {
+            match msg.to {
+                2 => n2.step(msg),
+                3 => n3.step(msg),
+                _ => {}
+            }
+        }
+        // Deliver heartbeat responses.
+        let mut resps = n2.drain_messages();
+        resps.extend(n3.drain_messages());
+        for msg in resps {
+            n1.step(msg);
+        }
+        n1.drain_messages(); // discard any follow-up
+
+        (n1, n2, n3)
+    }
+
+    /// Deliver all messages between three nodes until no messages remain.
+    /// Returns the number of rounds (max 50 to prevent infinite loops).
+    fn deliver_all(n1: &mut RaftNode, n2: &mut RaftNode, n3: &mut RaftNode) -> usize {
+        let mut rounds = 0;
+        loop {
+            let mut all = n1.drain_messages();
+            all.extend(n2.drain_messages());
+            all.extend(n3.drain_messages());
+            if all.is_empty() || rounds >= 50 {
+                break;
+            }
+            for msg in all {
+                match msg.to {
+                    1 => n1.step(msg),
+                    2 => n2.step(msg),
+                    3 => n3.step(msg),
+                    _ => {}
+                }
+            }
+            rounds += 1;
+        }
+        rounds
+    }
+
+    // ── append_entry() public API ──
+
+    #[test]
+    fn append_entry_returns_index() {
+        let mut leader = elect_leader_node1();
+
+        let idx = leader.append_entry(Command::Put {
+            key: "k".into(),
+            value: vec![1],
+        });
+        // noop at 1, put at 2
+        assert_eq!(idx, Some(2));
+
+        let idx2 = leader.append_entry(Command::Delete { key: "k".into() });
+        assert_eq!(idx2, Some(3));
+    }
+
+    #[test]
+    fn append_entry_fails_on_non_leader() {
+        let mut node = three_node_cluster(1);
+        assert_eq!(node.append_entry(Command::Noop), None);
+    }
+
+    // ── Leader appends and replicates ──
+
+    #[test]
+    fn propose_immediately_replicates_to_all_peers() {
+        let mut leader = elect_leader_node1();
+
+        leader.propose(vec![42]);
+        let messages = leader.drain_messages();
+
+        // Should send AppendEntries to both peers.
+        assert_eq!(messages.len(), 2);
+        for msg in &messages {
+            if let Rpc::AppendEntries(args) = &msg.payload {
+                assert!(!args.entries.is_empty(), "should carry the new entry");
+            }
+        }
+
+        // Leader's log has noop(1) + entry(2).
+        assert_eq!(leader.log.last_index(), 2);
+    }
+
+    #[test]
+    fn multiple_entries_sent_in_single_append_entries() {
+        let mut leader = elect_leader_node1();
+
+        // Propose 3 entries rapidly.
+        leader.propose(vec![1]);
+        leader.drain_messages();
+        leader.propose(vec![2]);
+        leader.drain_messages();
+        leader.propose(vec![3]);
+        let messages = leader.drain_messages();
+
+        // The last propose should send all unreplicated entries.
+        for msg in &messages {
+            if let Rpc::AppendEntries(args) = &msg.payload {
+                // Peers haven't confirmed anything yet, so all entries
+                // from next_index onward should be included.
+                assert!(
+                    args.entries.len() >= 1,
+                    "should batch pending entries"
+                );
+            }
+        }
+
+        // Leader log: noop(1), entry(2), entry(3), entry(4)
+        assert_eq!(leader.log.last_index(), 4);
+    }
+
+    // ── Follower validates prev_log_index/prev_log_term ──
+
+    #[test]
+    fn follower_accepts_when_prev_log_matches() {
+        let mut follower = three_node_cluster(1);
+
+        // Give follower an entry at index 1, term 1.
+        follower.log.append(LogEntry { term: 1, data: vec![0] });
+
+        // Send entry at index 2 with prev_log_index=1, prev_log_term=1 — matches.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![LogEntry { term: 1, data: vec![1] }],
+                leader_commit: 0,
+            }),
+        ));
+
+        let msgs = follower.drain_messages();
+        if let Rpc::AppendEntriesResponse(reply) = &msgs[0].payload {
+            assert!(reply.success);
+            assert_eq!(reply.match_index, 2);
+        }
+        assert_eq!(follower.log.last_index(), 2);
+    }
+
+    #[test]
+    fn follower_rejects_when_prev_log_term_mismatches() {
+        let mut follower = three_node_cluster(1);
+
+        // Follower has entry at index 1 with term 1.
+        follower.log.append(LogEntry { term: 1, data: vec![0] });
+
+        // Leader claims prev_log_index=1, prev_log_term=2 — term mismatch.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 2,
+                leader_id: 2,
+                prev_log_index: 1,
+                prev_log_term: 2,
+                entries: vec![LogEntry { term: 2, data: vec![1] }],
+                leader_commit: 0,
+            }),
+        ));
+
+        let msgs = follower.drain_messages();
+        if let Rpc::AppendEntriesResponse(reply) = &msgs[0].payload {
+            assert!(!reply.success);
+            // match_index hints at where to retry (before conflicting term).
+            assert_eq!(reply.match_index, 0);
+        }
+        // Log should NOT have been modified.
+        assert_eq!(follower.log.last_index(), 1);
+        assert_eq!(follower.log.get(1).unwrap().term, 1);
+    }
+
+    #[test]
+    fn follower_rejects_when_log_too_short() {
+        let mut follower = three_node_cluster(1);
+
+        // Follower has 1 entry. Leader sends with prev_log_index=3.
+        follower.log.append(LogEntry { term: 1, data: vec![0] });
+
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 3,
+                prev_log_term: 1,
+                entries: vec![LogEntry { term: 1, data: vec![1] }],
+                leader_commit: 0,
+            }),
+        ));
+
+        let msgs = follower.drain_messages();
+        if let Rpc::AppendEntriesResponse(reply) = &msgs[0].payload {
+            assert!(!reply.success);
+            // Follower hints its last index so leader can backtrack.
+            assert_eq!(reply.match_index, 1);
+        }
+    }
+
+    // ── Conflict resolution and truncation ──
+
+    #[test]
+    fn follower_truncates_and_replaces_conflicting_suffix() {
+        let mut follower = three_node_cluster(1);
+
+        // Follower has: [term=1] [term=1] [term=1]
+        for _ in 0..3 {
+            follower.log.append(LogEntry { term: 1, data: vec![0] });
+        }
+
+        // Leader says: at index 2, there should be term=2 entries.
+        // This conflicts with follower's index 2 (term 1).
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 2,
+                leader_id: 2,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![
+                    LogEntry { term: 2, data: vec![10] },
+                    LogEntry { term: 2, data: vec![20] },
+                ],
+                leader_commit: 0,
+            }),
+        ));
+
+        // Follower should have truncated index 2-3 and replaced.
+        assert_eq!(follower.log.last_index(), 3);
+        assert_eq!(follower.log.get(1).unwrap().term, 1); // unchanged
+        assert_eq!(follower.log.get(2).unwrap().term, 2); // replaced
+        assert_eq!(follower.log.get(3).unwrap().term, 2); // replaced
+        assert_eq!(follower.log.get(2).unwrap().data, vec![10]);
+        assert_eq!(follower.log.get(3).unwrap().data, vec![20]);
+    }
+
+    #[test]
+    fn follower_idempotent_append_skips_existing_matching_entries() {
+        let mut follower = three_node_cluster(1);
+
+        // Follower already has entries from the leader.
+        follower.log.append(LogEntry { term: 1, data: vec![1] });
+        follower.log.append(LogEntry { term: 1, data: vec![2] });
+
+        // Leader re-sends the same entries (e.g., duplicate delivery).
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry { term: 1, data: vec![1] },
+                    LogEntry { term: 1, data: vec![2] },
+                ],
+                leader_commit: 0,
+            }),
+        ));
+
+        // Log should be unchanged (entries matched, no truncation).
+        assert_eq!(follower.log.last_index(), 2);
+
+        let msgs = follower.drain_messages();
+        if let Rpc::AppendEntriesResponse(reply) = &msgs[0].payload {
+            assert!(reply.success);
+        }
+    }
+
+    #[test]
+    fn follower_appends_beyond_existing_log() {
+        let mut follower = three_node_cluster(1);
+
+        // Follower has 1 entry.
+        follower.log.append(LogEntry { term: 1, data: vec![1] });
+
+        // Leader sends 3 more starting after the existing one.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![
+                    LogEntry { term: 1, data: vec![2] },
+                    LogEntry { term: 1, data: vec![3] },
+                    LogEntry { term: 1, data: vec![4] },
+                ],
+                leader_commit: 0,
+            }),
+        ));
+
+        assert_eq!(follower.log.last_index(), 4);
+        for i in 1..=4 {
+            assert_eq!(follower.log.get(i).unwrap().data, vec![i as u8]);
+        }
+    }
+
+    // ── Leader updates next_index and match_index ──
+
+    #[test]
+    fn leader_advances_next_and_match_on_success() {
+        let mut leader = elect_leader_node1();
+
+        leader.propose(vec![42]);
+        leader.drain_messages();
+
+        // Peer 2 confirms match at index 2.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+
+        if let Role::Leader { ref next_index, ref match_index, .. } = leader.role {
+            assert_eq!(*match_index.get(&2).unwrap(), 2);
+            assert_eq!(*next_index.get(&2).unwrap(), 3);
+        }
+    }
+
+    #[test]
+    fn leader_backtracks_next_index_on_failure() {
+        let mut leader = elect_leader_node1();
+
+        // Give leader more entries.
+        leader.propose(vec![1]);
+        leader.propose(vec![2]);
+        leader.drain_messages();
+
+        // Peer 2 rejects with match_index=0 (log is empty).
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: false,
+                match_index: 0,
+            }),
+        ));
+
+        if let Role::Leader { ref next_index, .. } = leader.role {
+            assert_eq!(*next_index.get(&2).unwrap(), 1, "should backtrack to match_index+1");
+        }
+
+        // The leader should have immediately retried.
+        let retry_msgs = leader.drain_messages();
+        assert!(!retry_msgs.is_empty(), "leader must retry after backtrack");
+        // The retry should target peer 2.
+        assert!(retry_msgs.iter().any(|m| m.to == 2));
+    }
+
+    #[test]
+    fn leader_does_not_regress_next_index_on_stale_success() {
+        let mut leader = elect_leader_node1();
+
+        leader.propose(vec![1]);
+        leader.propose(vec![2]);
+        leader.drain_messages();
+
+        // Peer 2 confirms up to index 3.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 3,
+            }),
+        ));
+        leader.drain_messages();
+
+        // Now a stale success arrives with match_index=1 (from an earlier round).
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }),
+        ));
+
+        // next_index and match_index must NOT regress.
+        if let Role::Leader { ref next_index, ref match_index, .. } = leader.role {
+            assert_eq!(*match_index.get(&2).unwrap(), 3, "match_index must not regress");
+            assert_eq!(*next_index.get(&2).unwrap(), 4, "next_index must not regress");
+        }
+    }
+
+    #[test]
+    fn leader_does_not_advance_next_index_on_stale_failure() {
+        let mut leader = elect_leader_node1();
+
+        // Peer 2 has confirmed match_index=1. next_index should be 2.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }),
+        ));
+        leader.drain_messages();
+
+        if let Role::Leader { ref next_index, .. } = leader.role {
+            assert_eq!(*next_index.get(&2).unwrap(), 2);
+        }
+
+        // Now a stale failure arrives with match_index=5 (bogus/stale).
+        // This should NOT advance next_index past where it is.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: false,
+                match_index: 5,
+            }),
+        ));
+        leader.drain_messages();
+
+        if let Role::Leader { ref next_index, .. } = leader.role {
+            // next_index should stay at 2, not jump to 6.
+            assert_eq!(*next_index.get(&2).unwrap(), 2, "failure must not advance next_index");
+        }
+    }
+
+    // ── Retry replication converges ──
+
+    #[test]
+    fn retry_converges_from_divergent_log() {
+        let mut leader = elect_leader_node1();
+
+        // Leader has: noop(1,t=1), A(2,t=1), B(3,t=1)
+        leader.propose(vec![0xA]);
+        leader.propose(vec![0xB]);
+        leader.drain_messages();
+
+        // Simulate a follower with a divergent log:
+        // [term=99, term=99, term=99] — longer than leader and all wrong terms.
+        let mut follower = three_node_cluster(2);
+        follower.log.append(LogEntry { term: 99, data: vec![0xFF] });
+        follower.log.append(LogEntry { term: 99, data: vec![0xFE] });
+        follower.log.append(LogEntry { term: 99, data: vec![0xFD] });
+
+        // Artificially set leader's next_index for peer 2 to match follower's
+        // last index + 1, as it would be after the initial optimistic setting.
+        if let Role::Leader { ref mut next_index, .. } = leader.role {
+            next_index.insert(2, 4);
+        }
+
+        // Round-trip until convergence (max 10 rounds).
+        for _ in 0..10 {
+            leader.tick(5);
+            let msgs = leader.drain_messages();
+            let ae = match msgs.into_iter().find(|m| m.to == 2) {
+                Some(m) => m,
+                None => break,
+            };
+
+            follower.step(ae);
+            let reply = match follower.drain_messages().into_iter().next() {
+                Some(r) => r,
+                None => break,
+            };
+
+            let was_success = matches!(&reply.payload, Rpc::AppendEntriesResponse(r) if r.success);
+            leader.step(reply);
+            leader.drain_messages(); // drain any retries to avoid double-processing
+
+            if was_success {
+                break;
+            }
+        }
+
+        // After convergence, follower's log should match leader's.
+        assert_eq!(
+            follower.log.last_index(),
+            leader.log.last_index(),
+            "follower log length should match leader"
+        );
+        for i in 1..=leader.log.last_index() {
+            assert_eq!(
+                follower.log.get(i).unwrap().term,
+                leader.log.get(i).unwrap().term,
+                "entry {i} term mismatch after convergence"
+            );
+            assert_eq!(
+                follower.log.get(i).unwrap().data,
+                leader.log.get(i).unwrap().data,
+                "entry {i} data mismatch after convergence"
+            );
+        }
+    }
+
+    // ── Commit advancement (§5.3, §5.4.2) ──
+
+    #[test]
+    fn leader_commits_on_majority_ack() {
+        let mut leader = elect_leader_node1();
+        leader.propose(vec![42]);
+        leader.drain_messages();
+        assert_eq!(leader.commit_index(), 0);
+
+        // Peer 2 acks.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+
+        // 2/3 nodes (leader + peer 2) have index 2 → majority → committed.
+        assert_eq!(leader.commit_index(), 2);
+
+        let applied = leader.drain_applied();
+        // noop(1) + propose(2) applied.
+        assert_eq!(applied.len(), 2);
+    }
+
+    #[test]
+    fn leader_does_not_commit_from_prior_term() {
+        let mut leader = elect_leader_node1();
+
+        // Manually insert an entry from a prior term (simulating a leader
+        // that inherited uncommitted entries from term 0).
+        // Current log: [noop(t=1)]. Add [entry(t=0)] at index 2.
+        // This is artificial but tests the safety rule.
+        leader.log.append(LogEntry { term: 0, data: vec![1] });
+
+        // Even if both peers confirm index 2, we must NOT commit it
+        // because log[2].term=0 != current_term=1.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.step(envelope(
+            3,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.drain_messages();
+
+        // commit_index should be 1 (the noop, which IS from current term),
+        // but NOT 2 (the prior-term entry).
+        assert_eq!(
+            leader.commit_index(),
+            1,
+            "must not commit entries from prior terms (§5.4.2)"
+        );
+    }
+
+    #[test]
+    fn prior_term_entries_committed_transitively() {
+        let mut leader = elect_leader_node1();
+
+        // Log: [noop(t=1)]. Insert prior-term entry, then a current-term entry.
+        leader.log.append(LogEntry { term: 0, data: vec![1] }); // index 2, term 0
+        leader.propose(vec![2]); // index 3, term 1
+        leader.drain_messages();
+
+        // Both peers confirm up to index 3.
+        for peer in [2, 3] {
+            leader.step(envelope(
+                peer,
+                1,
+                Rpc::AppendEntriesResponse(AppendEntriesReply {
+                    term: 1,
+                    success: true,
+                    match_index: 3,
+                }),
+            ));
+        }
+        leader.drain_messages();
+
+        // commit_index should be 3: the current-term entry at index 3 is
+        // committable, which transitively commits the prior-term entry at
+        // index 2 via the Log Matching property.
+        assert_eq!(leader.commit_index(), 3);
+
+        let applied = leader.drain_applied();
+        assert_eq!(applied.len(), 3); // noop + prior-term + current-term
+    }
+
+    // ── End-to-end multi-node replication ──
+
+    #[test]
+    fn end_to_end_propose_replicate_commit_apply() {
+        let (mut n1, mut n2, mut n3) = leader_and_followers();
+
+        // Leader proposes an entry.
+        let idx = n1.append_entry(Command::Put {
+            key: "x".into(),
+            value: vec![42],
+        });
+        assert_eq!(idx, Some(2));
+
+        // Deliver all messages until quiescent.
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // All nodes should have the entry at index 2.
+        assert_eq!(n1.log.last_index(), 2);
+        assert_eq!(n2.log.last_index(), 2);
+        assert_eq!(n3.log.last_index(), 2);
+
+        // Leader should have committed (majority confirmed).
+        assert_eq!(n1.commit_index(), 2);
+
+        // Followers learn commit via next heartbeat.
+        n1.tick(5);
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        assert_eq!(n2.commit_index(), 2);
+        assert_eq!(n3.commit_index(), 2);
+
+        // All nodes applied the same entries.
+        let a1 = n1.drain_applied();
+        let a2 = n2.drain_applied();
+        let a3 = n3.drain_applied();
+
+        // Noop(1) + Put(2) = 2 entries applied.
+        assert_eq!(a1.len(), 2);
+        assert_eq!(a2.len(), 2);
+        assert_eq!(a3.len(), 2);
+
+        // Verify the Put entry.
+        let put_entry = &a1[1];
+        assert_eq!(put_entry.index, 2);
+        let cmd = Command::decode(&put_entry.data).unwrap();
+        assert_eq!(cmd, Command::Put { key: "x".into(), value: vec![42] });
+    }
+
+    #[test]
+    fn end_to_end_multiple_proposals() {
+        let (mut n1, mut n2, mut n3) = leader_and_followers();
+
+        // Propose 5 entries.
+        for i in 0..5u8 {
+            n1.append_entry(Command::Put {
+                key: format!("k{i}"),
+                value: vec![i],
+            });
+        }
+
+        // Deliver everything.
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // noop(1) + 5 puts = 6 entries.
+        assert_eq!(n1.log.last_index(), 6);
+        assert_eq!(n2.log.last_index(), 6);
+        assert_eq!(n3.log.last_index(), 6);
+
+        // Commit propagated.
+        n1.tick(5);
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        assert_eq!(n1.commit_index(), 6);
+        assert_eq!(n2.commit_index(), 6);
+        assert_eq!(n3.commit_index(), 6);
+    }
+
+    #[test]
+    fn end_to_end_lagging_follower_catches_up() {
+        let config = default_config();
+        let mut n1 = RaftNode::new(1, vec![2, 3], config.clone());
+        let mut n2 = RaftNode::new(2, vec![1, 3], config.clone());
+        let mut n3 = RaftNode::new(3, vec![1, 2], config.clone());
+
+        // Elect node 1 with only node 2's vote (node 3 is "partitioned").
+        n1.start_election();
+        let votes = n1.drain_messages();
+        for msg in votes {
+            if msg.to == 2 {
+                n2.step(msg);
+            }
+            // Drop messages to node 3.
+        }
+        let resp = n2.drain_messages();
+        for msg in resp {
+            n1.step(msg);
+        }
+        assert!(n1.is_leader());
+
+        // Deliver initial heartbeat only to node 2.
+        let hbs = n1.drain_messages();
+        for msg in hbs {
+            if msg.to == 2 {
+                n2.step(msg);
+            }
+        }
+        let resps = n2.drain_messages();
+        for msg in resps {
+            n1.step(msg);
+        }
+        n1.drain_messages();
+
+        // Propose 3 entries. Replicate only to node 2.
+        for i in 0..3u8 {
+            n1.propose(vec![i]);
+            let msgs = n1.drain_messages();
+            for msg in msgs {
+                if msg.to == 2 {
+                    n2.step(msg);
+                }
+            }
+            let resps: Vec<_> = n2.drain_messages();
+            for msg in resps {
+                n1.step(msg);
+            }
+            n1.drain_messages();
+        }
+
+        // Node 2 has all entries. Node 3 has nothing.
+        assert_eq!(n1.log.last_index(), 4); // noop + 3
+        assert_eq!(n2.log.last_index(), 4);
+        assert_eq!(n3.log.last_index(), 0);
+
+        // "Heal" the partition: deliver messages to node 3 now.
+        // A heartbeat will carry all entries.
+        n1.tick(5);
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // Node 3 should have caught up.
+        assert_eq!(n3.log.last_index(), 4);
+        for i in 1..=4 {
+            assert_eq!(
+                n3.log.get(i).unwrap().term,
+                n1.log.get(i).unwrap().term,
+                "entry {i} term mismatch on node 3"
+            );
+        }
+    }
+
+    #[test]
+    fn end_to_end_divergent_follower_converges() {
+        let config = default_config();
+        let mut n1 = RaftNode::new(1, vec![2, 3], config.clone());
+        let mut n2 = RaftNode::new(2, vec![1, 3], config.clone());
+        let mut n3 = RaftNode::new(3, vec![1, 2], config.clone());
+
+        // Give node 3 a stale log from a prior term (simulating a crashed
+        // leader that wrote entries nobody else has).
+        n3.log.append(LogEntry { term: 0, data: vec![0xDE] });
+        n3.log.append(LogEntry { term: 0, data: vec![0xAD] });
+
+        // Elect node 1.
+        n1.start_election();
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        assert!(n1.is_leader());
+
+        // Propose an entry and replicate.
+        n1.propose(vec![42]);
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // Heartbeat to propagate commit.
+        n1.tick(5);
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // Node 3's stale entries should have been replaced.
+        assert_eq!(n3.log.last_index(), n1.log.last_index());
+        for i in 1..=n1.log.last_index() {
+            assert_eq!(
+                n3.log.get(i).unwrap().term,
+                n1.log.get(i).unwrap().term,
+                "entry {i} should match leader after convergence"
+            );
+            assert_eq!(
+                n3.log.get(i).unwrap().data,
+                n1.log.get(i).unwrap().data,
+                "entry {i} data should match leader after convergence"
             );
         }
     }
