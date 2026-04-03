@@ -51,6 +51,8 @@ pub enum Rpc {
     RequestVoteResponse(RequestVoteReply),
     AppendEntries(AppendEntriesArgs),
     AppendEntriesResponse(AppendEntriesReply),
+    PreVote(PreVoteArgs),
+    PreVoteResponse(PreVoteReply),
 }
 
 impl Rpc {
@@ -61,6 +63,8 @@ impl Rpc {
             Rpc::RequestVoteResponse(reply) => reply.term,
             Rpc::AppendEntries(args) => args.term,
             Rpc::AppendEntriesResponse(reply) => reply.term,
+            Rpc::PreVote(args) => args.term,
+            Rpc::PreVoteResponse(reply) => reply.term,
         }
     }
 }
@@ -161,4 +165,41 @@ pub struct AppendEntriesReply {
     /// On failure: hint for the leader — highest index the follower can confirm
     /// as matching, enabling fast log backtracking.
     pub match_index: LogIndex,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  PreVote RPC (§9.6 — Raft dissertation, not in the original paper)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Pre-vote request — a speculative election probe.
+///
+/// Before incrementing its term and starting a real election, a candidate
+/// sends PreVote to all peers. If a majority would grant the vote, the
+/// candidate proceeds to a real election. Otherwise it stays as a follower,
+/// avoiding term inflation that disrupts the cluster.
+///
+/// This prevents a partitioned node from bumping its term repeatedly and
+/// forcing the rest of the cluster to step down when it rejoins.
+///
+/// The `term` field is the term the candidate *would* use (current_term + 1),
+/// but the candidate does NOT actually increment its term yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreVoteArgs {
+    /// The term the candidate would campaign in (current_term + 1).
+    pub term: Term,
+    /// The node requesting the pre-vote.
+    pub candidate_id: NodeId,
+    /// Index of the candidate's last log entry.
+    pub last_log_index: LogIndex,
+    /// Term of the candidate's last log entry.
+    pub last_log_term: Term,
+}
+
+/// Response to a PreVote RPC.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreVoteReply {
+    /// The responder's current term.
+    pub term: Term,
+    /// True if the responder would grant a real vote.
+    pub vote_granted: bool,
 }
