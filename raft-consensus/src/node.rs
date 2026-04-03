@@ -44,6 +44,12 @@ pub struct ClusterConfig {
     /// How often the leader sends empty AppendEntries (heartbeats) to prevent
     /// followers from starting elections. Must be much less than election timeout.
     pub heartbeat_interval: u64,
+    /// Enable the pre-vote protocol (§9.6 of the Raft dissertation).
+    ///
+    /// When enabled, a node must win a speculative pre-vote before starting a
+    /// real election. This prevents partitioned nodes from bumping their term
+    /// and disrupting the cluster when they rejoin.
+    pub pre_vote: bool,
 }
 
 impl Default for ClusterConfig {
@@ -52,6 +58,7 @@ impl Default for ClusterConfig {
             election_timeout_min: 150,
             election_timeout_max: 300,
             heartbeat_interval: 50,
+            pre_vote: false,
         }
     }
 }
@@ -148,6 +155,17 @@ pub struct RaftNode<S: Storage = MemoryStorage, L: RaftLog = InMemoryLog> {
     /// Entries that have been committed and applied, ready for the caller.
     applied: Vec<ApplyResult>,
 
+    // ── Leader tracking ──
+    /// Who we believe the current leader is. Set when receiving a valid
+    /// AppendEntries, cleared on term changes. Useful for client redirects.
+    current_leader: Option<NodeId>,
+
+    // ── Pre-vote state ──
+    /// Responses received during a pre-vote phase (before a real election).
+    /// Only populated when `config.pre_vote` is true and we're collecting
+    /// pre-vote responses. Reset when we transition to a real election.
+    pre_vote_responses: HashSet<NodeId>,
+
     // ── RNG state ──
     /// Simple deterministic RNG for election timeout randomization.
     /// We use a basic LCG so the node has zero external dependencies.
@@ -175,6 +193,8 @@ impl RaftNode<MemoryStorage, InMemoryLog> {
             election_timer: Timer::new(election_timeout),
             heartbeat_timer: Timer::new(config.heartbeat_interval),
             config,
+            current_leader: None,
+            pre_vote_responses: HashSet::new(),
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id, // seed from node ID for determinism
@@ -208,6 +228,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             election_timer: Timer::new(election_timeout),
             heartbeat_timer: Timer::new(config.heartbeat_interval),
             config,
+            current_leader: None,
+            pre_vote_responses: HashSet::new(),
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id,
@@ -219,14 +241,14 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     // ════════════════════════════════════════════════════════════════════════
 
     /// Advance timers by `ticks` units. If the election timer fires, the node
-    /// starts an election. If the heartbeat timer fires (leader only), it
-    /// sends heartbeats.
+    /// starts an election (or pre-vote if enabled). If the heartbeat timer
+    /// fires (leader only), it sends heartbeats.
     pub fn tick(&mut self, ticks: u64) {
         match &self.role {
             Role::Follower | Role::Candidate { .. } => {
                 self.election_timer.tick(ticks);
                 if self.election_timer.is_expired() {
-                    self.become_candidate();
+                    self.start_election();
                 }
             }
             Role::Leader { .. } => {
@@ -239,12 +261,46 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         }
     }
 
+    /// Start an election. If pre-vote is enabled, this initiates a pre-vote
+    /// phase first; otherwise it directly transitions to Candidate.
+    ///
+    /// This is the public entry point for triggering elections. The simulator
+    /// or test harness can call this directly instead of waiting for the
+    /// election timer to expire.
+    pub fn start_election(&mut self) {
+        if self.config.pre_vote {
+            self.start_pre_vote();
+        } else {
+            self.become_candidate();
+        }
+    }
+
     /// Process an inbound message. This is the main dispatch function.
     ///
     /// Raft's universal term rule (§5.1): if the message's term is greater than
     /// ours, we update our term and revert to follower *before* processing the
     /// payload. If the message's term is less than ours, we reject it (stale).
     pub fn step(&mut self, envelope: Envelope) {
+        // ── Pre-vote messages bypass the universal term check ──
+        //
+        // PreVote is speculative: it must NOT cause the receiver to update
+        // its term or step down. The candidate hasn't committed to a new
+        // term yet, and the responder shouldn't change state based on a
+        // hypothetical. Handle these before the term machinery.
+        match &envelope.payload {
+            Rpc::PreVote(args) => {
+                let args = args.clone();
+                self.handle_pre_vote(envelope.from, args);
+                return;
+            }
+            Rpc::PreVoteResponse(reply) => {
+                let reply = reply.clone();
+                self.handle_pre_vote_response(envelope.from, reply);
+                return;
+            }
+            _ => {}
+        }
+
         let msg_term = envelope.term();
 
         // ── Term check: universal rule applied to every inbound message ──
@@ -273,6 +329,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             Rpc::AppendEntriesResponse(reply) => {
                 self.handle_append_entries_response(envelope.from, reply)
             }
+            // PreVote variants already handled above.
+            Rpc::PreVote(_) | Rpc::PreVoteResponse(_) => unreachable!(),
         }
     }
 
@@ -408,6 +466,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             match_index,
         };
 
+        // We are the leader now.
+        self.current_leader = Some(self.id);
+
         // Reset heartbeat timer so we send heartbeats immediately.
         self.heartbeat_timer.reset(0);
 
@@ -445,6 +506,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.persistent.current_term = new_term;
         // Haven't voted in this new term yet.
         self.persistent.voted_for = None;
+        // We don't know who the leader is in this new term.
+        self.current_leader = None;
         self.persist_state();
         self.become_follower();
     }
@@ -495,18 +558,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         }
 
         // Check 2: is the candidate's log at least as up-to-date as ours?
-        // "Up-to-date" is defined in §5.4.1:
-        // - If the logs have last entries with different terms, the one with
-        //   the higher term is more up-to-date.
-        // - If the logs end with the same term, the longer log is more
-        //   up-to-date.
-        let our_last_term = self.log.last_term();
-        let our_last_index = self.log.last_index();
-
-        if args.last_log_term != our_last_term {
-            return args.last_log_term > our_last_term;
-        }
-        args.last_log_index >= our_last_index
+        self.is_log_up_to_date(args.last_log_index, args.last_log_term)
     }
 
     /// Handle a vote response from a peer.
@@ -569,6 +621,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // Any valid AppendEntries from the current leader proves it's alive.
         // Reset our election timer so we don't start a spurious election.
         self.reset_election_timer();
+
+        // Track who the current leader is (for client redirects).
+        self.current_leader = Some(args.leader_id);
 
         // If we're a Candidate and receive a valid AppendEntries for our term,
         // the sender is the legitimate leader. Step down.
@@ -872,9 +927,126 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                     }),
                 );
             }
+            // PreVote from a stale term — reject without touching our state.
+            Rpc::PreVote(_) => {
+                self.send(
+                    envelope.from,
+                    Rpc::PreVoteResponse(PreVoteReply {
+                        term: self.persistent.current_term,
+                        vote_granted: false,
+                    }),
+                );
+            }
             // Stale responses are simply dropped — no need to reply to a reply.
-            Rpc::RequestVoteResponse(_) | Rpc::AppendEntriesResponse(_) => {}
+            Rpc::RequestVoteResponse(_)
+            | Rpc::AppendEntriesResponse(_)
+            | Rpc::PreVoteResponse(_) => {}
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Pre-vote protocol (§9.6 — Raft dissertation)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Start a pre-vote phase: ask peers if they *would* vote for us without
+    /// actually incrementing our term. If a majority says yes, proceed to a
+    /// real election.
+    ///
+    /// Pre-vote prevents a partitioned node from repeatedly bumping its term:
+    /// when it rejoins, its artificially high term would force the current
+    /// leader to step down, disrupting the cluster for no good reason.
+    fn start_pre_vote(&mut self) {
+        let next_term = self.persistent.current_term + 1;
+        let last_log_index = self.log.last_index();
+        let last_log_term = self.log.last_term();
+
+        self.pre_vote_responses.clear();
+        self.pre_vote_responses.insert(self.id); // we'd vote for ourselves
+        self.reset_election_timer();
+
+        let peers: Vec<NodeId> = self.peers.clone();
+        for &peer in &peers {
+            self.send(
+                peer,
+                Rpc::PreVote(PreVoteArgs {
+                    term: next_term,
+                    candidate_id: self.id,
+                    last_log_index,
+                    last_log_term,
+                }),
+            );
+        }
+
+        // Single-node cluster: pre-vote immediately succeeds.
+        if self.has_pre_vote_majority() {
+            self.become_candidate();
+        }
+    }
+
+    /// Handle an incoming PreVote request.
+    ///
+    /// A node grants a pre-vote iff:
+    /// 1. The candidate's proposed term is >= our current term.
+    /// 2. The candidate's log is at least as up-to-date as ours.
+    /// 3. Our election timer has NOT recently heard from a valid leader.
+    ///    (If we recently heard from a leader, someone is already leading —
+    ///    no need for a new election.)
+    ///
+    /// Unlike a real RequestVote, a PreVote does NOT cause the recipient to
+    /// step down or update its term. It is purely speculative.
+    fn handle_pre_vote(&mut self, from: NodeId, args: PreVoteArgs) {
+        // Don't grant pre-vote if we recently heard from a leader (timer not expired).
+        // This prevents a partitioned node from winning pre-votes while a healthy
+        // leader exists.
+        let leader_is_alive = self.current_leader.is_some() && !self.election_timer.is_expired();
+
+        let grant = !leader_is_alive
+            && args.term >= self.persistent.current_term
+            && self.is_log_up_to_date(args.last_log_index, args.last_log_term);
+
+        self.send(
+            from,
+            Rpc::PreVoteResponse(PreVoteReply {
+                term: self.persistent.current_term,
+                vote_granted: grant,
+            }),
+        );
+    }
+
+    /// Handle a PreVote response.
+    fn handle_pre_vote_response(&mut self, from: NodeId, reply: PreVoteReply) {
+        // Only followers collecting pre-votes care about these responses.
+        if !matches!(self.role, Role::Follower) {
+            return;
+        }
+
+        if reply.vote_granted {
+            self.pre_vote_responses.insert(from);
+        }
+
+        if self.has_pre_vote_majority() {
+            // Pre-vote passed — now run a real election.
+            self.become_candidate();
+        }
+    }
+
+    /// Check if we have a pre-vote majority.
+    fn has_pre_vote_majority(&self) -> bool {
+        let cluster_size = self.peers.len() + 1;
+        let majority = (cluster_size / 2) + 1;
+        self.pre_vote_responses.len() >= majority
+    }
+
+    /// Check if a candidate's log is at least as up-to-date as ours (§5.4.1).
+    /// Shared by both RequestVote and PreVote.
+    fn is_log_up_to_date(&self, last_log_index: LogIndex, last_log_term: Term) -> bool {
+        let our_last_term = self.log.last_term();
+        let our_last_index = self.log.last_index();
+
+        if last_log_term != our_last_term {
+            return last_log_term > our_last_term;
+        }
+        last_log_index >= our_last_index
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -995,6 +1167,12 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     pub fn cluster_size(&self) -> usize {
         self.peers.len() + 1
     }
+
+    /// Returns who we believe the current leader is, or `None` if unknown.
+    /// Set when receiving a valid AppendEntries, cleared on term changes.
+    pub fn leader_id(&self) -> Option<NodeId> {
+        self.current_leader
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1010,6 +1188,14 @@ mod tests {
             election_timeout_min: 10,
             election_timeout_max: 20,
             heartbeat_interval: 5,
+            pre_vote: false,
+        }
+    }
+
+    fn pre_vote_config() -> ClusterConfig {
+        ClusterConfig {
+            pre_vote: true,
+            ..default_config()
         }
     }
 
@@ -1821,5 +2007,825 @@ mod tests {
             assert!(!reply.success);
             assert_eq!(reply.match_index, 2); // first_of_conflict(3) - 1 = 2
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Leader election: comprehensive edge cases
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn start_election_is_public_and_triggers_candidacy() {
+        let mut node = three_node_cluster(1);
+        assert!(node.is_follower());
+        node.start_election();
+        assert!(node.is_candidate());
+        assert_eq!(node.current_term(), 1);
+    }
+
+    #[test]
+    fn granting_vote_resets_election_timer() {
+        let mut node = three_node_cluster(1);
+
+        // Tick close to timeout.
+        node.tick(9);
+        assert!(node.is_follower());
+
+        // Receive RequestVote and grant it — should reset timer.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
+                candidate_id: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+        node.drain_messages();
+
+        // Tick again — should NOT trigger election since granting the vote
+        // reset the timer.
+        node.tick(9);
+        assert!(node.is_follower(), "granting vote should reset election timer");
+    }
+
+    #[test]
+    fn duplicate_votes_from_same_peer_not_double_counted() {
+        let mut node = five_node_cluster(1);
+        node.tick(25); // become candidate
+        node.drain_messages();
+
+        // Node 2 votes twice (duplicate message delivery).
+        for _ in 0..2 {
+            node.step(envelope(
+                2,
+                1,
+                Rpc::RequestVoteResponse(RequestVoteReply {
+                    term: 1,
+                    vote_granted: true,
+                }),
+            ));
+        }
+
+        // 2 unique votes (self + node 2) out of 5 — not a majority.
+        assert!(node.is_candidate(), "duplicate votes must not be double-counted");
+
+        // Third unique vote wins it.
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
+        assert!(node.is_leader());
+    }
+
+    #[test]
+    fn vote_response_ignored_after_becoming_leader() {
+        let mut node = three_node_cluster(1);
+        node.tick(25);
+        node.drain_messages();
+
+        // Win election with node 2's vote.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
+        assert!(node.is_leader());
+        node.drain_messages();
+
+        // Late vote from node 3 arrives — should be harmlessly ignored.
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
+        assert!(node.is_leader()); // still leader, no crash
+    }
+
+    #[test]
+    fn vote_response_ignored_after_stepping_down() {
+        let mut node = three_node_cluster(1);
+        node.tick(25); // candidate in term 1
+        node.drain_messages();
+
+        // Receive AppendEntries from the real leader — step down.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+        assert!(node.is_follower());
+        node.drain_messages();
+
+        // Late vote arrives — should not make us leader.
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
+        assert!(node.is_follower());
+    }
+
+    #[test]
+    fn candidate_rejects_request_vote_from_other_candidate_same_term() {
+        let mut node = three_node_cluster(1);
+        node.tick(25); // candidate in term 1, voted for self
+        node.drain_messages();
+
+        // Another candidate asks for our vote in the same term.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
+                candidate_id: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+
+        let messages = node.drain_messages();
+        if let Rpc::RequestVoteResponse(reply) = &messages[0].payload {
+            assert!(
+                !reply.vote_granted,
+                "already voted for self, must reject other candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn election_timeout_is_randomized_per_node() {
+        // Different node IDs should produce different initial timeouts.
+        let node_a = RaftNode::new(1, vec![2, 3], default_config());
+        let node_b = RaftNode::new(2, vec![1, 3], default_config());
+
+        // We can't directly read the timeout, but we can observe that one
+        // times out before the other when ticked identically.
+        let mut a = node_a;
+        let mut b = node_b;
+
+        // Tick both by the minimum timeout — at least one should still be
+        // a follower (different timeouts) or both could be candidates
+        // (both within range). The key property: they are deterministic
+        // per node ID.
+        a.tick(10);
+        b.tick(10);
+        // Both should be candidates or exactly one, depending on RNG.
+        // What matters is this doesn't panic and is deterministic.
+        let a_candidate = a.is_candidate();
+        let b_candidate = b.is_candidate();
+
+        // Re-run to verify determinism.
+        let mut a2 = RaftNode::new(1, vec![2, 3], default_config());
+        let mut b2 = RaftNode::new(2, vec![1, 3], default_config());
+        a2.tick(10);
+        b2.tick(10);
+        assert_eq!(a2.is_candidate(), a_candidate, "timeouts must be deterministic");
+        assert_eq!(b2.is_candidate(), b_candidate, "timeouts must be deterministic");
+    }
+
+    #[test]
+    fn leader_does_not_start_election_on_tick() {
+        let mut node = three_node_cluster(1);
+        // Become leader.
+        node.tick(25);
+        node.drain_messages();
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
+        assert!(node.is_leader());
+        node.drain_messages();
+
+        // Tick way past election timeout — leader should NOT start election.
+        node.tick(1000);
+        assert!(node.is_leader(), "leader must not start elections");
+    }
+
+    #[test]
+    fn request_vote_carries_correct_log_state() {
+        let mut node = three_node_cluster(1);
+
+        // Give node 1 some log entries.
+        node.log.append(LogEntry {
+            term: 1,
+            data: vec![1],
+        });
+        node.log.append(LogEntry {
+            term: 3,
+            data: vec![2],
+        });
+
+        node.start_election();
+        let messages = node.drain_messages();
+
+        for msg in &messages {
+            if let Rpc::RequestVote(args) = &msg.payload {
+                assert_eq!(args.last_log_index, 2);
+                assert_eq!(args.last_log_term, 3);
+                assert_eq!(args.candidate_id, 1);
+            } else {
+                panic!("expected RequestVote");
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_with_higher_last_term_wins_despite_shorter_log() {
+        let mut voter = three_node_cluster(1);
+
+        // Voter has 3 entries, all in term 1.
+        for _ in 0..3 {
+            voter.log.append(LogEntry {
+                term: 1,
+                data: vec![],
+            });
+        }
+
+        // Candidate has only 1 entry but in term 2 — more up-to-date.
+        voter.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 2,
+                candidate_id: 2,
+                last_log_index: 1,
+                last_log_term: 2,
+            }),
+        ));
+
+        let messages = voter.drain_messages();
+        if let Rpc::RequestVoteResponse(reply) = &messages[0].payload {
+            assert!(
+                reply.vote_granted,
+                "higher last_log_term should win despite shorter log"
+            );
+        }
+    }
+
+    #[test]
+    fn candidate_with_same_term_but_shorter_log_loses() {
+        let mut voter = three_node_cluster(1);
+
+        // Voter has 3 entries in term 1.
+        for _ in 0..3 {
+            voter.log.append(LogEntry {
+                term: 1,
+                data: vec![],
+            });
+        }
+
+        // Candidate has only 2 entries in term 1 — less up-to-date.
+        voter.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
+                candidate_id: 2,
+                last_log_index: 2,
+                last_log_term: 1,
+            }),
+        ));
+
+        let messages = voter.drain_messages();
+        if let Rpc::RequestVoteResponse(reply) = &messages[0].payload {
+            assert!(
+                !reply.vote_granted,
+                "shorter log at same term should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn follower_can_vote_again_in_new_term() {
+        let mut node = three_node_cluster(1);
+
+        // Vote for candidate 2 in term 1.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
+                candidate_id: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+        assert_eq!(node.voted_for(), Some(2));
+        node.drain_messages();
+
+        // New term (via AppendEntries from leader) clears voted_for.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 2,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+        assert_eq!(node.voted_for(), None);
+        node.drain_messages();
+
+        // Can vote for candidate 3 in term 2.
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 2,
+                candidate_id: 3,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+
+        let messages = node.drain_messages();
+        if let Rpc::RequestVoteResponse(reply) = &messages[0].payload {
+            assert!(reply.vote_granted);
+        }
+        assert_eq!(node.voted_for(), Some(3));
+    }
+
+    #[test]
+    fn re_voting_for_same_candidate_is_idempotent() {
+        let mut node = three_node_cluster(1);
+
+        // Vote for candidate 2 in term 1.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
+                candidate_id: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+        let msgs = node.drain_messages();
+        assert!(matches!(
+            &msgs[0].payload,
+            Rpc::RequestVoteResponse(r) if r.vote_granted
+        ));
+
+        // Same candidate asks again (duplicate delivery) — should still grant.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
+                candidate_id: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+        let msgs = node.drain_messages();
+        if let Rpc::RequestVoteResponse(reply) = &msgs[0].payload {
+            assert!(reply.vote_granted, "re-vote for same candidate should succeed");
+        }
+    }
+
+    #[test]
+    fn candidate_steps_down_on_higher_term_request_vote() {
+        let mut node = three_node_cluster(1);
+        node.tick(25); // candidate in term 1
+        node.drain_messages();
+        assert!(node.is_candidate());
+
+        // Receive RequestVote from a higher term — must step down.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 5,
+                candidate_id: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+
+        assert!(node.is_follower());
+        assert_eq!(node.current_term(), 5);
+        // Should have granted the vote since we stepped down to the new term.
+        assert_eq!(node.voted_for(), Some(2));
+    }
+
+    #[test]
+    fn election_state_is_persisted() {
+        let mut node = three_node_cluster(1);
+        node.tick(25); // become candidate in term 1
+
+        // Verify persistent state reflects the election.
+        assert_eq!(node.persistent.current_term, 1);
+        assert_eq!(node.persistent.voted_for, Some(1));
+    }
+
+    #[test]
+    fn leader_id_tracked_from_append_entries() {
+        let mut node = three_node_cluster(1);
+        assert_eq!(node.leader_id(), None);
+
+        // Receive heartbeat from leader 2.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+        assert_eq!(node.leader_id(), Some(2));
+        node.drain_messages();
+
+        // Term change clears leader_id.
+        node.step(envelope(
+            3,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 5,
+                candidate_id: 3,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+        assert_eq!(node.leader_id(), None);
+    }
+
+    #[test]
+    fn leader_knows_it_is_leader() {
+        let mut node = three_node_cluster(1);
+        node.tick(25);
+        node.drain_messages();
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
+        assert!(node.is_leader());
+        assert_eq!(node.leader_id(), Some(1));
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Multi-node election simulation
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Simulate a full election across 3 nodes by manually delivering messages.
+    #[test]
+    fn three_node_full_election_simulation() {
+        let config = default_config();
+        let mut n1 = RaftNode::new(1, vec![2, 3], config.clone());
+        let mut n2 = RaftNode::new(2, vec![1, 3], config.clone());
+        let mut n3 = RaftNode::new(3, vec![1, 2], config.clone());
+
+        // Node 1 times out first and starts an election.
+        n1.start_election();
+        assert!(n1.is_candidate());
+        assert_eq!(n1.current_term(), 1);
+
+        // Deliver RequestVote messages to n2 and n3.
+        let messages = n1.drain_messages();
+        assert_eq!(messages.len(), 2);
+
+        for msg in messages {
+            match msg.to {
+                2 => n2.step(msg),
+                3 => n3.step(msg),
+                _ => panic!("unexpected target"),
+            }
+        }
+
+        // Both n2 and n3 should have voted for n1.
+        assert_eq!(n2.voted_for(), Some(1));
+        assert_eq!(n3.voted_for(), Some(1));
+
+        // Collect vote responses.
+        let mut responses = Vec::new();
+        responses.extend(n2.drain_messages());
+        responses.extend(n3.drain_messages());
+
+        // Deliver responses back to n1.
+        for msg in responses {
+            n1.step(msg);
+        }
+
+        // n1 should now be leader.
+        assert!(n1.is_leader());
+        assert_eq!(n1.current_term(), 1);
+
+        // n1 sent heartbeats on becoming leader.
+        let heartbeats = n1.drain_messages();
+        assert_eq!(heartbeats.len(), 2);
+
+        // Deliver heartbeats — n2 and n3 should track n1 as leader.
+        for msg in heartbeats {
+            match msg.to {
+                2 => n2.step(msg),
+                3 => n3.step(msg),
+                _ => panic!("unexpected target"),
+            }
+        }
+        assert_eq!(n2.leader_id(), Some(1));
+        assert_eq!(n3.leader_id(), Some(1));
+    }
+
+    /// Simulate a split vote: two candidates in the same term, neither gets majority.
+    #[test]
+    fn split_vote_requires_new_election() {
+        let config = default_config();
+        let mut n1 = RaftNode::new(1, vec![2, 3, 4, 5], config.clone());
+        let mut n2 = RaftNode::new(2, vec![1, 3, 4, 5], config.clone());
+        let mut n3 = RaftNode::new(3, vec![1, 2, 4, 5], config.clone());
+        let mut n4 = RaftNode::new(4, vec![1, 2, 3, 5], config.clone());
+        let mut n5 = RaftNode::new(5, vec![1, 2, 3, 4], config.clone());
+
+        // n1 and n2 both start elections in term 1.
+        n1.start_election();
+        n2.start_election();
+        assert_eq!(n1.current_term(), 1);
+        assert_eq!(n2.current_term(), 1);
+
+        let n1_msgs = n1.drain_messages();
+        let n2_msgs = n2.drain_messages();
+
+        // n3 receives n1's RequestVote first → votes for n1.
+        for msg in &n1_msgs {
+            if msg.to == 3 {
+                n3.step(msg.clone());
+            }
+        }
+        assert_eq!(n3.voted_for(), Some(1));
+
+        // n4 receives n2's RequestVote first → votes for n2.
+        for msg in &n2_msgs {
+            if msg.to == 4 {
+                n4.step(msg.clone());
+            }
+        }
+        assert_eq!(n4.voted_for(), Some(2));
+
+        // n5 receives n1's RequestVote first → votes for n1.
+        for msg in &n1_msgs {
+            if msg.to == 5 {
+                n5.step(msg.clone());
+            }
+        }
+        assert_eq!(n5.voted_for(), Some(1));
+
+        // Now deliver n2's RequestVote to n3 and n5 — should be rejected
+        // (already voted for n1 this term).
+        for msg in &n2_msgs {
+            if msg.to == 3 {
+                n3.step(msg.clone());
+            }
+            if msg.to == 5 {
+                n5.step(msg.clone());
+            }
+        }
+        // n3 and n5 still voted for n1.
+        assert_eq!(n3.voted_for(), Some(1));
+        assert_eq!(n5.voted_for(), Some(1));
+
+        // Deliver all responses to n1.
+        let mut all_responses = Vec::new();
+        all_responses.extend(n3.drain_messages());
+        all_responses.extend(n4.drain_messages());
+        all_responses.extend(n5.drain_messages());
+
+        for msg in &all_responses {
+            if msg.to == 1 {
+                n1.step(msg.clone());
+            }
+        }
+
+        // n1 got votes from self(1) + n3 + n5 = 3/5 → majority → leader!
+        assert!(n1.is_leader());
+
+        // Deliver responses to n2.
+        for msg in &all_responses {
+            if msg.to == 2 {
+                n2.step(msg.clone());
+            }
+        }
+        // n2 got votes from self(2) + n4 = 2/5 → NOT majority → still candidate.
+        assert!(n2.is_candidate());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Pre-vote protocol tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn pre_vote_sends_pre_vote_messages_not_request_vote() {
+        let mut node = RaftNode::new(1, vec![2, 3], pre_vote_config());
+        node.start_election();
+
+        // Should still be follower (pre-vote phase, not candidate yet).
+        assert!(node.is_follower());
+        // Term should NOT have incremented.
+        assert_eq!(node.current_term(), 0);
+
+        let messages = node.drain_messages();
+        assert_eq!(messages.len(), 2);
+        for msg in &messages {
+            assert!(
+                matches!(msg.payload, Rpc::PreVote(_)),
+                "pre-vote should send PreVote, not RequestVote"
+            );
+            if let Rpc::PreVote(args) = &msg.payload {
+                // PreVote carries the *proposed* next term.
+                assert_eq!(args.term, 1);
+            }
+        }
+    }
+
+    #[test]
+    fn pre_vote_majority_triggers_real_election() {
+        let mut node = RaftNode::new(1, vec![2, 3], pre_vote_config());
+        node.start_election();
+        node.drain_messages();
+
+        // Grant pre-vote from node 2 — now we have 2/3 (self + node 2).
+        node.step(envelope(
+            2,
+            1,
+            Rpc::PreVoteResponse(PreVoteReply {
+                term: 0,
+                vote_granted: true,
+            }),
+        ));
+
+        // Should have progressed to a real election.
+        assert!(node.is_candidate());
+        assert_eq!(node.current_term(), 1); // term incremented now
+
+        // Should have sent real RequestVote messages.
+        let messages = node.drain_messages();
+        assert!(messages
+            .iter()
+            .any(|m| matches!(m.payload, Rpc::RequestVote(_))));
+    }
+
+    #[test]
+    fn pre_vote_rejected_does_not_start_election() {
+        let mut node = RaftNode::new(1, vec![2, 3], pre_vote_config());
+        node.start_election();
+        node.drain_messages();
+
+        // Both peers reject the pre-vote.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::PreVoteResponse(PreVoteReply {
+                term: 0,
+                vote_granted: false,
+            }),
+        ));
+        node.step(envelope(
+            3,
+            1,
+            Rpc::PreVoteResponse(PreVoteReply {
+                term: 0,
+                vote_granted: false,
+            }),
+        ));
+
+        // Should still be follower with term unchanged.
+        assert!(node.is_follower());
+        assert_eq!(node.current_term(), 0);
+    }
+
+    #[test]
+    fn pre_vote_does_not_increment_term() {
+        let mut node = RaftNode::new(1, vec![2, 3], pre_vote_config());
+        let term_before = node.current_term();
+        node.start_election();
+        assert_eq!(
+            node.current_term(),
+            term_before,
+            "pre-vote must not increment term"
+        );
+    }
+
+    #[test]
+    fn pre_vote_responder_does_not_change_state() {
+        let mut node = three_node_cluster(1);
+
+        // Advance to term 3.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 3,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+        node.drain_messages();
+        assert_eq!(node.current_term(), 3);
+        assert_eq!(node.leader_id(), Some(2));
+
+        // Receive PreVote from node 3 for term 4.
+        node.step(envelope(
+            3,
+            1,
+            Rpc::PreVote(PreVoteArgs {
+                term: 4,
+                candidate_id: 3,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+
+        // Our state must NOT change — pre-vote is speculative.
+        assert_eq!(node.current_term(), 3, "pre-vote must not change receiver's term");
+        assert!(node.is_follower());
+        assert_eq!(node.voted_for(), None);
+    }
+
+    #[test]
+    fn pre_vote_rejected_if_leader_is_alive() {
+        let mut node = three_node_cluster(1);
+
+        // Receive heartbeat from leader 2 — leader is alive.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+        node.drain_messages();
+
+        // Receive PreVote from node 3 — should be rejected since we
+        // recently heard from a leader.
+        node.step(envelope(
+            3,
+            1,
+            Rpc::PreVote(PreVoteArgs {
+                term: 2,
+                candidate_id: 3,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+
+        let messages = node.drain_messages();
+        if let Rpc::PreVoteResponse(reply) = &messages[0].payload {
+            assert!(
+                !reply.vote_granted,
+                "should reject pre-vote when leader is alive"
+            );
+        }
+    }
+
+    #[test]
+    fn single_node_pre_vote_immediately_becomes_leader() {
+        let mut node = RaftNode::new(1, vec![], pre_vote_config());
+        node.start_election();
+        // Single node: pre-vote majority is 1/1, so it should proceed
+        // directly to candidate and then to leader.
+        assert!(node.is_leader());
+        assert_eq!(node.current_term(), 1);
     }
 }
