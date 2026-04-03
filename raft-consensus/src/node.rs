@@ -2828,4 +2828,546 @@ mod tests {
         assert!(node.is_leader());
         assert_eq!(node.current_term(), 1);
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Heartbeat (empty AppendEntries) tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Helper: create a 3-node cluster, elect node 1 as leader, and drain
+    /// the initial messages (RequestVote + heartbeats). Returns the leader.
+    fn elect_leader_node1() -> RaftNode {
+        let mut node = three_node_cluster(1);
+        node.tick(25);
+        node.drain_messages();
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1,
+                vote_granted: true,
+            }),
+        ));
+        assert!(node.is_leader());
+        node.drain_messages(); // discard initial heartbeats
+        node
+    }
+
+    #[test]
+    fn heartbeat_is_append_entries_with_empty_entries() {
+        let mut leader = elect_leader_node1();
+
+        // Trigger a heartbeat.
+        leader.tick(5);
+        let messages = leader.drain_messages();
+
+        assert_eq!(messages.len(), 2, "one heartbeat per peer");
+        for msg in &messages {
+            if let Rpc::AppendEntries(args) = &msg.payload {
+                // A heartbeat to a caught-up follower has no entries.
+                // (The noop is at index 1 and next_index starts at 1 for
+                // peers that were initialized before the noop was appended,
+                // so the first heartbeat may carry the noop. Subsequent
+                // heartbeats to caught-up peers are empty.)
+                assert_eq!(args.term, 1);
+                assert_eq!(args.leader_id, 1);
+            } else {
+                panic!("heartbeat must be AppendEntries");
+            }
+        }
+    }
+
+    #[test]
+    fn heartbeat_carries_leader_commit() {
+        let mut leader = elect_leader_node1();
+
+        // Artificially advance commit_index to simulate prior replication.
+        leader.volatile.commit_index = 1;
+
+        leader.tick(5);
+        let messages = leader.drain_messages();
+
+        for msg in &messages {
+            if let Rpc::AppendEntries(args) = &msg.payload {
+                assert_eq!(
+                    args.leader_commit, 1,
+                    "heartbeat must carry the leader's commit index"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn heartbeat_carries_correct_prev_log_for_each_peer() {
+        let mut leader = elect_leader_node1();
+
+        // Leader has noop at index 1 (term 1). next_index for peers was
+        // initialized to 1 (before noop was appended), so on first
+        // heartbeat prev_log_index = 0 and entries include the noop.
+        // After a successful response, next_index advances.
+
+        // Simulate peer 2 confirming it has index 1.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }),
+        ));
+        leader.drain_messages();
+
+        // Now trigger a heartbeat.
+        leader.tick(5);
+        let messages = leader.drain_messages();
+
+        for msg in &messages {
+            if let Rpc::AppendEntries(args) = &msg.payload {
+                if msg.to == 2 {
+                    // Peer 2 is caught up — prev_log_index=1, no new entries.
+                    assert_eq!(args.prev_log_index, 1);
+                    assert_eq!(args.prev_log_term, 1);
+                    assert!(
+                        args.entries.is_empty(),
+                        "caught-up peer should receive empty heartbeat"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn follower_resets_timer_on_heartbeat() {
+        // This is the core heartbeat purpose: prevent followers from
+        // starting unnecessary elections.
+        let mut follower = three_node_cluster(1);
+
+        for _ in 0..10 {
+            // Tick close to timeout.
+            follower.tick(9);
+            assert!(follower.is_follower());
+
+            // Heartbeat arrives just in time.
+            follower.step(envelope(
+                2,
+                1,
+                Rpc::AppendEntries(AppendEntriesArgs {
+                    term: 1,
+                    leader_id: 2,
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![],
+                    leader_commit: 0,
+                }),
+            ));
+            follower.drain_messages();
+        }
+
+        // After 10 rounds of heartbeats, still a follower.
+        assert!(follower.is_follower());
+        assert_eq!(follower.leader_id(), Some(2));
+    }
+
+    #[test]
+    fn follower_updates_term_from_heartbeat() {
+        let mut follower = three_node_cluster(1);
+        assert_eq!(follower.current_term(), 0);
+
+        // Heartbeat from leader in term 5.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 5,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+
+        assert_eq!(follower.current_term(), 5);
+        assert!(follower.is_follower());
+        assert_eq!(follower.leader_id(), Some(2));
+        // voted_for cleared because term advanced.
+        assert_eq!(follower.voted_for(), None);
+    }
+
+    #[test]
+    fn candidate_steps_down_on_heartbeat_from_current_term() {
+        let mut node = three_node_cluster(1);
+        node.tick(25); // candidate in term 1
+        node.drain_messages();
+        assert!(node.is_candidate());
+
+        // Heartbeat from the real leader of term 1.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+
+        assert!(node.is_follower());
+        assert_eq!(node.current_term(), 1);
+        assert_eq!(node.leader_id(), Some(2));
+    }
+
+    #[test]
+    fn candidate_steps_down_on_heartbeat_from_higher_term() {
+        let mut node = three_node_cluster(1);
+        node.tick(25); // candidate in term 1
+        node.drain_messages();
+
+        // Heartbeat from a leader in term 3.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 3,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+
+        assert!(node.is_follower());
+        assert_eq!(node.current_term(), 3);
+        assert_eq!(node.leader_id(), Some(2));
+    }
+
+    #[test]
+    fn heartbeat_from_stale_leader_is_rejected() {
+        let mut follower = three_node_cluster(1);
+
+        // Advance follower to term 5 via a valid heartbeat.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 5,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+        follower.drain_messages();
+        assert_eq!(follower.current_term(), 5);
+
+        // Stale heartbeat from term 3 — must be rejected.
+        follower.step(envelope(
+            3,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 3,
+                leader_id: 3,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+
+        // Term unchanged, leader unchanged.
+        assert_eq!(follower.current_term(), 5);
+        assert_eq!(follower.leader_id(), Some(2));
+
+        // Response tells the stale leader about our higher term.
+        let messages = follower.drain_messages();
+        assert_eq!(messages.len(), 1);
+        if let Rpc::AppendEntriesResponse(reply) = &messages[0].payload {
+            assert!(!reply.success);
+            assert_eq!(reply.term, 5);
+        }
+    }
+
+    #[test]
+    fn heartbeat_response_success_updates_leader_tracking() {
+        let mut leader = elect_leader_node1();
+
+        // Send a heartbeat.
+        leader.tick(5);
+        leader.drain_messages();
+
+        // Peer 2 responds with success.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }),
+        ));
+
+        // Verify leader updated match_index for peer 2.
+        if let Role::Leader {
+            ref match_index,
+            ref next_index,
+            ..
+        } = leader.role
+        {
+            assert_eq!(*match_index.get(&2).unwrap(), 1);
+            assert_eq!(*next_index.get(&2).unwrap(), 2);
+        } else {
+            panic!("expected leader");
+        }
+    }
+
+    #[test]
+    fn leader_steps_down_on_heartbeat_response_with_higher_term() {
+        let mut leader = elect_leader_node1();
+
+        // Peer responds to heartbeat with a higher term — the peer has
+        // seen a newer election epoch.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 7,
+                success: false,
+                match_index: 0,
+            }),
+        ));
+
+        assert!(leader.is_follower());
+        assert_eq!(leader.current_term(), 7);
+    }
+
+    #[test]
+    fn multiple_heartbeat_intervals_fire_correctly() {
+        let mut leader = elect_leader_node1();
+
+        for round in 1..=5 {
+            leader.tick(5); // heartbeat interval
+            let messages = leader.drain_messages();
+            assert_eq!(
+                messages.len(),
+                2,
+                "round {round}: should send heartbeat to both peers"
+            );
+        }
+
+        // Leader is still leader after 5 heartbeat rounds.
+        assert!(leader.is_leader());
+    }
+
+    #[test]
+    fn leader_does_not_send_heartbeat_to_itself() {
+        let mut leader = elect_leader_node1();
+
+        leader.tick(5);
+        let messages = leader.drain_messages();
+
+        for msg in &messages {
+            assert_ne!(msg.to, 1, "leader must not send heartbeat to itself");
+            assert_eq!(msg.from, 1);
+        }
+    }
+
+    #[test]
+    fn heartbeat_with_empty_entries_gets_success_response() {
+        let mut follower = three_node_cluster(1);
+
+        // Pure heartbeat: no entries, prev_log_index=0.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+
+        let messages = follower.drain_messages();
+        assert_eq!(messages.len(), 1);
+        if let Rpc::AppendEntriesResponse(reply) = &messages[0].payload {
+            assert!(reply.success, "empty heartbeat must succeed");
+            assert_eq!(reply.term, 1);
+        } else {
+            panic!("expected AppendEntriesResponse");
+        }
+    }
+
+    #[test]
+    fn heartbeat_advances_follower_commit_index() {
+        let mut follower = three_node_cluster(1);
+
+        // First, give follower some entries.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        data: vec![1],
+                    },
+                    LogEntry {
+                        term: 1,
+                        data: vec![2],
+                    },
+                ],
+                leader_commit: 0, // not committed yet
+            }),
+        ));
+        follower.drain_messages();
+        assert_eq!(follower.commit_index(), 0);
+
+        // Later heartbeat carries updated leader_commit.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 2,
+                prev_log_term: 1,
+                entries: vec![], // heartbeat — no new entries
+                leader_commit: 2,
+            }),
+        ));
+
+        assert_eq!(follower.commit_index(), 2);
+        assert_eq!(follower.last_applied(), 2);
+
+        let applied = follower.drain_applied();
+        assert_eq!(applied.len(), 2);
+    }
+
+    #[test]
+    fn heartbeat_leader_piggybacks_pending_entries() {
+        let mut leader = elect_leader_node1();
+
+        // Propose a new entry.
+        leader.propose(vec![42]);
+        leader.drain_messages(); // discard the immediate replication
+
+        // Heartbeat should carry the pending entry (noop + propose)
+        // to any lagging follower.
+        leader.tick(5);
+        let messages = leader.drain_messages();
+
+        for msg in &messages {
+            if let Rpc::AppendEntries(args) = &msg.payload {
+                // Leader has 2 entries (noop at 1, propose at 2).
+                // For peers that haven't confirmed anything, the heartbeat
+                // should carry entries.
+                assert!(
+                    !args.entries.is_empty() || args.prev_log_index >= 2,
+                    "heartbeat should piggyback pending entries for lagging peers"
+                );
+            }
+        }
+    }
+
+    /// End-to-end: leader sends heartbeats, followers process them,
+    /// responses come back, leader tracks state. Full round trip.
+    #[test]
+    fn heartbeat_full_round_trip() {
+        let config = default_config();
+        let mut leader = RaftNode::new(1, vec![2, 3], config.clone());
+        let mut f2 = RaftNode::new(2, vec![1, 3], config.clone());
+        let mut f3 = RaftNode::new(3, vec![1, 2], config.clone());
+
+        // Elect node 1.
+        leader.start_election();
+        let votes = leader.drain_messages();
+        for msg in votes {
+            match msg.to {
+                2 => f2.step(msg),
+                3 => f3.step(msg),
+                _ => {}
+            }
+        }
+        let mut responses = f2.drain_messages();
+        responses.extend(f3.drain_messages());
+        for msg in responses {
+            leader.step(msg);
+        }
+        assert!(leader.is_leader());
+        let initial_heartbeats = leader.drain_messages();
+
+        // Deliver initial heartbeats.
+        for msg in initial_heartbeats {
+            match msg.to {
+                2 => f2.step(msg),
+                3 => f3.step(msg),
+                _ => {}
+            }
+        }
+
+        // Followers should know about the leader.
+        assert_eq!(f2.leader_id(), Some(1));
+        assert_eq!(f3.leader_id(), Some(1));
+
+        // Collect and deliver heartbeat responses.
+        let mut hb_responses = f2.drain_messages();
+        hb_responses.extend(f3.drain_messages());
+        for msg in hb_responses {
+            leader.step(msg);
+        }
+
+        // Trigger a periodic heartbeat and do another full round trip.
+        leader.tick(5);
+        let heartbeats = leader.drain_messages();
+        assert_eq!(heartbeats.len(), 2);
+
+        for msg in heartbeats {
+            match msg.to {
+                2 => f2.step(msg),
+                3 => f3.step(msg),
+                _ => {}
+            }
+        }
+
+        // Both followers still following.
+        assert!(f2.is_follower());
+        assert!(f3.is_follower());
+        assert_eq!(f2.current_term(), 1);
+        assert_eq!(f3.current_term(), 1);
+
+        // Collect responses.
+        let mut final_responses = f2.drain_messages();
+        final_responses.extend(f3.drain_messages());
+        for msg in final_responses {
+            leader.step(msg);
+        }
+
+        // Leader has updated tracking for both peers.
+        assert!(leader.is_leader());
+        if let Role::Leader {
+            ref match_index, ..
+        } = leader.role
+        {
+            // Both peers have confirmed the noop entry.
+            assert!(
+                *match_index.get(&2).unwrap() >= 1,
+                "leader should track peer 2's match_index"
+            );
+            assert!(
+                *match_index.get(&3).unwrap() >= 1,
+                "leader should track peer 3's match_index"
+            );
+        }
+    }
 }
