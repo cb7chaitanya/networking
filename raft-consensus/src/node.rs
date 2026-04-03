@@ -236,6 +236,57 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         }
     }
 
+    /// Restore a node from persisted storage after a crash.
+    ///
+    /// Loads `current_term`, `voted_for`, and the log from storage. The node
+    /// starts as a Follower (the safe default — it will discover the current
+    /// leader via heartbeats or start an election if no leader exists).
+    ///
+    /// Volatile state (`commit_index`, `last_applied`) is reset to 0. The node
+    /// will learn the current `commit_index` from the leader's next heartbeat
+    /// and re-apply committed entries.
+    pub fn restore(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        config: ClusterConfig,
+        storage: S,
+        mut log: L,
+    ) -> std::result::Result<Self, crate::storage::StorageError> {
+        let hard_state = storage.load_state()?;
+
+        // Replay persisted log into the in-memory log.
+        for entry in &hard_state.log {
+            log.append(entry.clone());
+        }
+
+        let election_timeout = Self::random_election_timeout_with_seed(
+            id,
+            config.election_timeout_min,
+            config.election_timeout_max,
+        );
+
+        Ok(Self {
+            id,
+            peers,
+            role: Role::Follower,
+            persistent: PersistentState {
+                current_term: hard_state.current_term,
+                voted_for: hard_state.voted_for,
+            },
+            volatile: VolatileState::new(), // reset on crash recovery
+            log,
+            storage,
+            election_timer: Timer::new(election_timeout),
+            heartbeat_timer: Timer::new(config.heartbeat_interval),
+            config,
+            current_leader: None,
+            pre_vote_responses: HashSet::new(),
+            outbox: Vec::new(),
+            applied: Vec::new(),
+            rng_state: id,
+        })
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     //  Public API — the three entry points the caller uses to drive the node
     // ════════════════════════════════════════════════════════════════════════
@@ -355,8 +406,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             term: self.persistent.current_term,
             data,
         };
-        self.log.append(entry);
-        self.persist_log();
+        self.log.append(entry.clone());
+        self.persist_log_append(&[entry]);
 
         // Immediately try to replicate to all followers.
         self.replicate_to_all();
@@ -494,8 +545,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             term: self.persistent.current_term,
             data: Command::Noop.encode(),
         };
-        self.log.append(noop);
-        self.persist_log();
+        self.log.append(noop.clone());
+        self.persist_log_append(&[noop]);
 
         // Send heartbeats to all peers to establish authority.
         self.send_heartbeats();
@@ -701,6 +752,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         //
         // "If an existing entry conflicts with a new one (same index but
         // different terms), delete the existing entry and all that follow it."
+        let mut truncated = false;
+        let mut new_entries: Vec<LogEntry> = Vec::new();
         for (i, entry) in args.entries.iter().enumerate() {
             let index = args.prev_log_index + 1 + i as u64;
             match self.log.term_at(index) {
@@ -711,15 +764,23 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                 Some(_) => {
                     // Conflict: truncate from here and append the rest.
                     self.log.truncate_from(index);
+                    if !truncated {
+                        self.persist_log_truncate(index);
+                        truncated = true;
+                    }
                     self.log.append(entry.clone());
+                    new_entries.push(entry.clone());
                 }
                 None => {
                     // New entry beyond our log — append.
                     self.log.append(entry.clone());
+                    new_entries.push(entry.clone());
                 }
             }
         }
-        self.persist_log();
+        if !new_entries.is_empty() {
+            self.persist_log_append(&new_entries);
+        }
 
         // ── Advance commit index ──
         // "If leaderCommit > commitIndex, set commitIndex =
@@ -1114,22 +1175,34 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     //  Persistence
     // ════════════════════════════════════════════════════════════════════════
 
-    /// Persist the current term and voted_for. Must be called before responding
-    /// to any RPC that depends on the updated state.
-    fn persist_state(&mut self) {
-        // In a production system, failure here is fatal — we cannot safely
-        // continue if persistent state is not durable.
-        let _ = self.storage.save_state(&self.persistent);
+    /// Persist the current term. Must be durable before the node acts on
+    /// the new term value.
+    fn persist_term(&mut self) {
+        let _ = self.storage.save_term(self.persistent.current_term);
     }
 
-    /// Persist the log. Called after any log mutation.
-    fn persist_log(&mut self) {
-        // Collect all entries for saving. A real implementation would use
-        // incremental writes, but for MemoryStorage this is fine.
-        let entries: Vec<LogEntry> = (1..=self.log.last_index())
-            .filter_map(|i| self.log.get(i).cloned())
-            .collect();
-        let _ = self.storage.save_log(&entries);
+    /// Persist who we voted for. Must be durable before the vote response
+    /// is sent.
+    fn persist_vote(&mut self) {
+        let _ = self.storage.save_vote(self.persistent.voted_for);
+    }
+
+    /// Persist both term and vote. Called when both change together
+    /// (e.g., stepping down to a new term clears the vote).
+    fn persist_state(&mut self) {
+        self.persist_term();
+        self.persist_vote();
+    }
+
+    /// Persist newly appended log entries. Called after any log append.
+    /// Only writes the new entries, not the entire log.
+    fn persist_log_append(&mut self, entries: &[LogEntry]) {
+        let _ = self.storage.append_log_entries(entries);
+    }
+
+    /// Persist a log truncation. Called when conflicting entries are removed.
+    fn persist_log_truncate(&mut self, from_index: LogIndex) {
+        let _ = self.storage.truncate_log(from_index);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -4706,5 +4779,264 @@ mod tests {
         assert_eq!(n1.last_applied(), n1.commit_index());
         assert_eq!(n2.last_applied(), n2.commit_index());
         assert_eq!(n3.last_applied(), n3.commit_index());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Persistence and crash recovery tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    use crate::storage::MemoryStorage as MS;
+
+    /// Helper: extract the storage from a node so we can "crash" and
+    /// restore from it. Uses the fact that MemoryStorage is Clone.
+    fn snapshot_storage(node: &RaftNode) -> MS {
+        node.storage.clone()
+    }
+
+    #[test]
+    fn storage_captures_term_on_election() {
+        let mut node = three_node_cluster(1);
+        node.tick(25); // become candidate in term 1
+
+        let storage = snapshot_storage(&node);
+        let state = storage.load_state().unwrap();
+        assert_eq!(state.current_term, 1);
+    }
+
+    #[test]
+    fn storage_captures_vote() {
+        let mut node = three_node_cluster(1);
+        node.step(envelope(
+            2,
+            1,
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1,
+                candidate_id: 2,
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        ));
+        node.drain_messages();
+
+        let storage = snapshot_storage(&node);
+        let state = storage.load_state().unwrap();
+        assert_eq!(state.voted_for, Some(2));
+    }
+
+    #[test]
+    fn storage_captures_log_append() {
+        let mut leader = elect_leader_node1();
+        leader.propose(vec![42]);
+        leader.drain_messages();
+
+        let storage = snapshot_storage(&leader);
+        let state = storage.load_state().unwrap();
+        // noop(1) + propose(2) = 2 entries.
+        assert_eq!(state.log.len(), 2);
+        assert_eq!(state.log[1].data, vec![42]);
+    }
+
+    #[test]
+    fn storage_captures_log_truncation() {
+        let mut follower = three_node_cluster(1);
+
+        // Give follower entries via AppendEntries so storage is updated.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry { term: 1, data: vec![1] },
+                    LogEntry { term: 1, data: vec![2] },
+                ],
+                leader_commit: 0,
+            }),
+        ));
+        follower.drain_messages();
+
+        // Leader overwrites index 2 with a different term.
+        follower.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 2,
+                leader_id: 2,
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![LogEntry { term: 2, data: vec![20] }],
+                leader_commit: 0,
+            }),
+        ));
+        follower.drain_messages();
+
+        let storage = snapshot_storage(&follower);
+        let state = storage.load_state().unwrap();
+        assert_eq!(state.log.len(), 2);
+        assert_eq!(state.log[1].term, 2);
+        assert_eq!(state.log[1].data, vec![20]);
+    }
+
+    #[test]
+    fn restore_recovers_term_and_vote() {
+        // Create a node, do some work, snapshot storage, restore from it.
+        let mut node = three_node_cluster(1);
+        node.tick(25); // term 1, voted for self
+        node.drain_messages();
+
+        let storage = snapshot_storage(&node);
+
+        // "Crash" and restore.
+        let restored = RaftNode::restore(
+            1,
+            vec![2, 3],
+            default_config(),
+            storage,
+            InMemoryLog::new(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.current_term(), 1);
+        assert_eq!(restored.voted_for(), Some(1));
+        assert!(restored.is_follower()); // always starts as follower
+    }
+
+    #[test]
+    fn restore_recovers_log() {
+        let mut leader = elect_leader_node1();
+        leader.propose(vec![10]);
+        leader.propose(vec![20]);
+        leader.drain_messages();
+
+        let storage = snapshot_storage(&leader);
+
+        let restored = RaftNode::restore(
+            1,
+            vec![2, 3],
+            default_config(),
+            storage,
+            InMemoryLog::new(),
+        )
+        .unwrap();
+
+        // noop(1) + 2 entries = 3.
+        assert_eq!(restored.log.last_index(), 3);
+        assert_eq!(restored.log.get(2).unwrap().data, vec![10]);
+        assert_eq!(restored.log.get(3).unwrap().data, vec![20]);
+    }
+
+    #[test]
+    fn restore_resets_volatile_state() {
+        let mut leader = elect_leader_node1();
+        leader.propose(vec![1]);
+        leader.drain_messages();
+
+        // Advance commit_index.
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        ));
+        leader.drain_messages();
+        assert!(leader.commit_index() > 0);
+
+        let storage = snapshot_storage(&leader);
+        let restored = RaftNode::restore(
+            1,
+            vec![2, 3],
+            default_config(),
+            storage,
+            InMemoryLog::new(),
+        )
+        .unwrap();
+
+        // Volatile state is NOT persisted — reset to 0 on recovery.
+        assert_eq!(restored.commit_index(), 0);
+        assert_eq!(restored.last_applied(), 0);
+    }
+
+    #[test]
+    fn restored_node_participates_in_cluster() {
+        let (mut n1, mut n2, mut n3) = leader_and_followers();
+
+        // Propose and commit an entry.
+        n1.propose(vec![42]);
+        deliver_all(&mut n1, &mut n2, &mut n3);
+        n1.tick(5);
+        deliver_all(&mut n1, &mut n2, &mut n3);
+
+        // "Crash" node 2 and restore from its storage.
+        let storage = snapshot_storage(&n2);
+        let mut n2_restored = RaftNode::restore(
+            2,
+            vec![1, 3],
+            default_config(),
+            storage,
+            InMemoryLog::new(),
+        )
+        .unwrap();
+
+        // Restored node has the log but commit_index=0.
+        assert_eq!(n2_restored.log.last_index(), n2.log.last_index());
+        assert_eq!(n2_restored.commit_index(), 0);
+
+        // After receiving a heartbeat from the leader, it catches up.
+        n1.tick(5);
+        let hbs = n1.drain_messages();
+        for msg in hbs {
+            if msg.to == 2 {
+                n2_restored.step(msg);
+            }
+        }
+        n2_restored.drain_messages();
+
+        assert!(n2_restored.commit_index() > 0);
+        assert_eq!(n2_restored.leader_id(), Some(1));
+    }
+
+    #[test]
+    fn restore_from_fresh_storage() {
+        // A brand-new node with no prior state.
+        let storage = MS::new();
+        let restored = RaftNode::restore(
+            1,
+            vec![2, 3],
+            default_config(),
+            storage,
+            InMemoryLog::new(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.current_term(), 0);
+        assert_eq!(restored.voted_for(), None);
+        assert_eq!(restored.log.last_index(), 0);
+    }
+
+    #[test]
+    fn incremental_persist_not_full_log_rewrite() {
+        // Verify that proposing N entries results in N individual appends
+        // to storage, not N full-log rewrites.
+        let mut leader = elect_leader_node1();
+
+        // Storage already has the noop from election.
+        let before = snapshot_storage(&leader).load_state().unwrap().log.len();
+        assert_eq!(before, 1);
+
+        leader.propose(vec![1]);
+        leader.drain_messages();
+        let after1 = snapshot_storage(&leader).load_state().unwrap().log.len();
+        assert_eq!(after1, 2); // incrementally added 1
+
+        leader.propose(vec![2]);
+        leader.drain_messages();
+        let after2 = snapshot_storage(&leader).load_state().unwrap().log.len();
+        assert_eq!(after2, 3); // incrementally added 1 more
     }
 }
