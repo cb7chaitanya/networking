@@ -61,6 +61,7 @@ use crate::congestion_control::{CongestionControl, RenoCC};
 use crate::connection::{ConnError, Connection};
 use crate::gbn_receiver::GbnReceiver;
 use crate::gbn_sender::{AckResult, GbnSender};
+use crate::metrics;
 use crate::packet::{flags, Header, Packet, SackBlock, TcpOption};
 use crate::persist_timer::PersistTransition;
 use crate::rtt::RttEstimator;
@@ -181,6 +182,7 @@ impl GbnConnection {
     ) -> Self {
         let (state, socket, peer, next_seq, rcv_nxt, _rto, negotiated_mss, snd_wscale, rcv_wscale) =
             conn.into_parts();
+        metrics::ACTIVE_CONNECTIONS.inc();
         Self {
             state,
             socket: Arc::new(socket),
@@ -242,6 +244,29 @@ impl GbnConnection {
 }
 
 impl<CC: CongestionControl> GbnConnection<CC> {
+    /// Transition the connection state, updating metrics gauges as needed.
+    fn transition_state(&mut self, new: ConnectionState) {
+        let old = self.state;
+        if old == new {
+            return;
+        }
+
+        // Leaving TIME_WAIT → decrement gauge.
+        if old == ConnectionState::TimeWait {
+            metrics::TIME_WAIT_CONNECTIONS.dec();
+        }
+        // Entering TIME_WAIT → increment gauge.
+        if new == ConnectionState::TimeWait {
+            metrics::TIME_WAIT_CONNECTIONS.inc();
+        }
+        // Entering Closed from a non-Closed state → connection is done.
+        if new == ConnectionState::Closed && old != ConnectionState::Closed {
+            metrics::ACTIVE_CONNECTIONS.dec();
+        }
+
+        self.state = new;
+    }
+
     /// The Maximum Segment Size negotiated during the 3-way handshake.
     ///
     /// Data passed to [`send`] is split into chunks of at most this many bytes.
@@ -511,7 +536,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
 
             // RST received → abort immediately.
             if h.flags & flags::RST != 0 {
-                self.state = ConnectionState::Closed;
+                self.transition_state(ConnectionState::Closed);
                 return Err(ConnError::Reset);
             }
 
@@ -520,7 +545,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 let rst = build_rst_for(&pkt);
                 let _ = self.socket.send_to(&rst, self.peer).await;
                 log::debug!("[gbn] recv: ← unexpected SYN in {:?}; → RST", self.state);
-                self.state = ConnectionState::Closed;
+                self.transition_state(ConnectionState::Closed);
                 return Err(ConnError::Reset);
             }
 
@@ -533,7 +558,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                     h.seq,
                     self.receiver.ack_number()
                 );
-                self.state = ConnectionState::Closed;
+                self.transition_state(ConnectionState::Closed);
                 return Err(ConnError::Reset);
             }
 
@@ -541,7 +566,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 self.receiver.on_fin(h.seq);
                 let ack = self.make_ack_pkt();
                 let _ = self.socket.send_to(&ack, self.peer).await;
-                self.state = ConnectionState::CloseWait;
+                self.transition_state(ConnectionState::CloseWait);
                 log::debug!("[gbn] ← FIN; → ACK ack={}", self.receiver.ack_number());
                 return Err(ConnError::Eof);
             }
@@ -714,7 +739,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         let mut fin_acked = false;
         'fw1: for _attempt in 0..=MAX_RETRIES {
             self.socket.send_to(&fin, self.peer).await?;
-            self.state = ConnectionState::FinWait1;
+            self.transition_state(ConnectionState::FinWait1);
             log::debug!("[gbn] active close → FIN_WAIT_1; → FIN seq={}", fin_seq);
 
             match timeout(rto, self.socket.recv_from()).await {
@@ -723,7 +748,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
 
                     if h.flags & flags::RST != 0 {
                         log::debug!("[gbn] FIN_WAIT_1 ← RST → CLOSED");
-                        self.state = ConnectionState::Closed;
+                        self.transition_state(ConnectionState::Closed);
                         return Ok(());
                     }
 
@@ -738,16 +763,16 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                         let ack = self.make_ack_pkt();
                         let _ = self.socket.send_to(&ack, self.peer).await;
                         log::debug!("[gbn] FIN_WAIT_1 ← FIN+ACK → TIME_WAIT");
-                        self.state = ConnectionState::TimeWait;
+                        self.transition_state(ConnectionState::TimeWait);
                         self.do_time_wait(ack).await;
-                        self.state = ConnectionState::Closed;
+                        self.transition_state(ConnectionState::Closed);
                         return Ok(());
                     }
 
                     if acks_our_fin {
                         // Normal path: our FIN was ACKed; wait for peer's FIN.
                         log::debug!("[gbn] FIN_WAIT_1 ← ACK of FIN → FIN_WAIT_2");
-                        self.state = ConnectionState::FinWait2;
+                        self.transition_state(ConnectionState::FinWait2);
                         fin_acked = true;
                         break 'fw1;
                     }
@@ -758,7 +783,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                         let ack = self.make_ack_pkt();
                         let _ = self.socket.send_to(&ack, self.peer).await;
                         log::debug!("[gbn] FIN_WAIT_1 ← simultaneous FIN → CLOSING");
-                        self.state = ConnectionState::Closing;
+                        self.transition_state(ConnectionState::Closing);
                         return self.close_from_closing(fin_seq, rto).await;
                     }
                 }
@@ -773,7 +798,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
 
         if !fin_acked {
             log::warn!("[gbn] FIN not ACKed after {} retries; force-closing", MAX_RETRIES);
-            self.state = ConnectionState::Closed;
+            self.transition_state(ConnectionState::Closed);
             return Ok(());
         }
 
@@ -785,15 +810,15 @@ impl<CC: CongestionControl> GbnConnection<CC> {
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
                 log::warn!("[gbn] FIN_WAIT_2 timed out; force-closing");
-                self.state = ConnectionState::Closed;
+                self.transition_state(ConnectionState::Closed);
                 return Ok(());
             }
         };
 
         // ── Phase 3: TIME_WAIT ─────────────────────────────────────────────
-        self.state = ConnectionState::TimeWait;
+        self.transition_state(ConnectionState::TimeWait);
         self.do_time_wait(last_ack).await;
-        self.state = ConnectionState::Closed;
+        self.transition_state(ConnectionState::Closed);
         Ok(())
     }
 
@@ -813,7 +838,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         let rst = build_rst_from(&self.sender);
         self.socket.send_to(&rst, self.peer).await?;
         log::debug!("[gbn] → RST (abort) seq={}", rst.header.seq);
-        self.state = ConnectionState::Closed;
+        self.transition_state(ConnectionState::Closed);
         Ok(())
     }
 
@@ -950,7 +975,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
 
         // RST received → abort immediately.
         if h.flags & flags::RST != 0 {
-            self.state = ConnectionState::Closed;
+            self.transition_state(ConnectionState::Closed);
             return Err(ConnError::Reset);
         }
 
@@ -959,7 +984,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
             let rst = build_rst_for(&pkt);
             let _ = self.socket.send_to(&rst, self.peer).await;
             log::debug!("[gbn] ← unexpected SYN in {:?}; → RST", self.state);
-            self.state = ConnectionState::Closed;
+            self.transition_state(ConnectionState::Closed);
             return Err(ConnError::Reset);
         }
 
@@ -973,7 +998,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 h.seq,
                 self.receiver.ack_number()
             );
-            self.state = ConnectionState::Closed;
+            self.transition_state(ConnectionState::Closed);
             return Err(ConnError::Reset);
         }
 
@@ -981,7 +1006,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
             self.receiver.on_fin(h.seq);
             let ack = self.make_ack_pkt();
             let _ = self.socket.send_to(&ack, self.peer).await;
-            self.state = ConnectionState::CloseWait;
+            self.transition_state(ConnectionState::CloseWait);
             return Err(ConnError::Eof);
         }
 
@@ -1071,7 +1096,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         };
         let fin_seq = fin.header.seq;
         let mut rto = self.rtt.rto();
-        self.state = ConnectionState::LastAck;
+        self.transition_state(ConnectionState::LastAck);
         log::debug!("[gbn] passive close → LAST_ACK; → FIN seq={}", fin_seq);
 
         for _attempt in 0..=MAX_RETRIES {
@@ -1081,14 +1106,14 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 Ok(Ok((pkt, addr))) if addr == self.peer => {
                     if pkt.header.flags & flags::RST != 0 {
                         log::debug!("[gbn] passive close ← RST → CLOSED");
-                        self.state = ConnectionState::Closed;
+                        self.transition_state(ConnectionState::Closed);
                         return Ok(());
                     }
                     if pkt.header.flags & flags::ACK != 0
                         && pkt.header.ack == fin_seq.wrapping_add(1)
                     {
                         log::debug!("[gbn] passive close ← ACK of FIN → CLOSED");
-                        self.state = ConnectionState::Closed;
+                        self.transition_state(ConnectionState::Closed);
                         return Ok(());
                     }
                 }
@@ -1102,7 +1127,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         }
 
         log::warn!("[gbn] passive close: FIN not ACKed; force-closing");
-        self.state = ConnectionState::Closed;
+        self.transition_state(ConnectionState::Closed);
         Ok(())
     }
 
@@ -1121,7 +1146,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
             let h = &pkt.header;
 
             if h.flags & flags::RST != 0 {
-                self.state = ConnectionState::Closed;
+                self.transition_state(ConnectionState::Closed);
                 return Err(ConnError::Reset);
             }
 
@@ -1129,7 +1154,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 let rst = build_rst_for(&pkt);
                 let _ = self.socket.send_to(&rst, self.peer).await;
                 log::debug!("[gbn] FIN_WAIT_2 ← unexpected SYN; → RST");
-                self.state = ConnectionState::Closed;
+                self.transition_state(ConnectionState::Closed);
                 return Err(ConnError::Reset);
             }
 
@@ -1202,17 +1227,17 @@ impl<CC: CongestionControl> GbnConnection<CC> {
                 Ok(Ok((pkt, addr))) if addr == self.peer => {
                     if pkt.header.flags & flags::RST != 0 {
                         log::debug!("[gbn] CLOSING ← RST → CLOSED");
-                        self.state = ConnectionState::Closed;
+                        self.transition_state(ConnectionState::Closed);
                         return Ok(());
                     }
                     if pkt.header.flags & flags::ACK != 0
                         && pkt.header.ack == fin_seq.wrapping_add(1)
                     {
                         log::debug!("[gbn] CLOSING ← ACK of FIN → TIME_WAIT");
-                        self.state = ConnectionState::TimeWait;
+                        self.transition_state(ConnectionState::TimeWait);
                         let ack = self.make_ack_pkt();
                         self.do_time_wait(ack).await;
-                        self.state = ConnectionState::Closed;
+                        self.transition_state(ConnectionState::Closed);
                         return Ok(());
                     }
                 }
@@ -1226,7 +1251,7 @@ impl<CC: CongestionControl> GbnConnection<CC> {
         }
 
         log::warn!("[gbn] CLOSING: ACK of FIN not received; force-closing");
-        self.state = ConnectionState::Closed;
+        self.transition_state(ConnectionState::Closed);
         Ok(())
     }
 }

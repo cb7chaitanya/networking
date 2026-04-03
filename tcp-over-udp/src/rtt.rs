@@ -33,6 +33,8 @@
 
 use std::time::Duration;
 
+use crate::metrics;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -137,6 +139,7 @@ impl RttEstimator {
     /// [`record_sample`]: Self::record_sample
     pub fn back_off(&mut self) {
         self.rto = (self.rto * 2).min(self.max_rto);
+        metrics::RTO_EVENTS.inc();
     }
 
     /// Current RTO.  Use this value for the retransmit timer deadline.
