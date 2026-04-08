@@ -52,14 +52,15 @@ impl From<std::io::Error> for TransportError {
 }
 
 // ── Transport ─────────────────────────────────────────────────────────────────
+#[derive(Clone)]
 pub struct Transport {
     pub local_addr: SocketAddr,
     socket: Arc<UdpSocket>,
     key: Option<ClusterKey>,
     sim: Option<Arc<Mutex<NetSim>>>,
-    rate_limiter: Option<Mutex<InboundRateLimiter>>,
+    rate_limiter: Option<Arc<Mutex<InboundRateLimiter>>>,
     /// Count of packets dropped by rate limiting (caller reads this).
-    pub rate_limited_count: std::sync::atomic::AtomicU64,
+    pub rate_limited_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Transport {
@@ -73,7 +74,7 @@ impl Transport {
             key: None,
             sim: None,
             rate_limiter: None,
-            rate_limited_count: std::sync::atomic::AtomicU64::new(0),
+            rate_limited_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -91,7 +92,7 @@ impl Transport {
 
     /// Attach an inbound rate limiter.
     pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
-        self.rate_limiter = Some(Mutex::new(InboundRateLimiter::new(&config)));
+        self.rate_limiter = Some(Arc::new(Mutex::new(InboundRateLimiter::new(&config))));
         self
     }
 

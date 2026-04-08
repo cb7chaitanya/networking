@@ -37,3 +37,9 @@ dead_retention_ms = 15000      # how long to keep dead entries before GC
 [metrics]
 log_interval_ms = 10000        # console metrics log interval (0 = disabled)
 server_port = 0                # HTTP metrics server port (0 = disabled)
+
+[backpressure]
+enabled = true                 # enable adaptive gossip throttling
+capacity = 256                 # queue depth threshold (pressure = 1.0 at this depth)
+damping = 0.8                  # fanout damping factor (0.0–1.0)
+stretch = 2.0                  # gossip interval stretch factor at full pressure

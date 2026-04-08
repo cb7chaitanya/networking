@@ -68,6 +68,12 @@ pub struct Metrics {
     pub reliable_retries: u64,
     /// REQUEST_ACK messages that exhausted all retries without receiving an ACK.
     pub reliable_exhausted: u64,
+
+    // ── Backpressure ────────────────────────────────────────────────────────
+    /// Gossip rounds skipped due to backpressure shedding.
+    pub backpressure_shed: u64,
+    /// Peak queue depth observed since last metrics snapshot.
+    pub queue_high_water_mark: u64,
 }
 
 impl Metrics {
@@ -121,7 +127,9 @@ impl Metrics {
         counter!("swim_rate_limited_total", "Inbound packets dropped by rate limiter.", self.rate_limited);
         counter!("swim_reliable_retries_total", "REQUEST_ACK retransmissions.", self.reliable_retries);
         counter!("swim_reliable_exhausted_total", "REQUEST_ACK retries exhausted.", self.reliable_exhausted);
+        counter!("swim_backpressure_shed_total", "Gossip rounds skipped due to backpressure.", self.backpressure_shed);
 
+        gauge!("swim_queue_high_water_mark", "Peak queue depth observed.", self.queue_high_water_mark);
         gauge!("swim_members_alive", "Number of Alive members.", alive);
         gauge!("swim_members_suspect", "Number of Suspect members.", suspect);
         gauge!("swim_members_dead", "Number of Dead members.", dead);
@@ -132,7 +140,7 @@ impl Metrics {
     /// Format as a JSON object for log-based dashboards.
     pub fn json(&self, alive: usize, suspect: usize, dead: usize) -> String {
         format!(
-            r#"{{"gossip_rounds":{},"gossip_sent":{},"gossip_recv":{},"pings_sent":{},"pings_recv":{},"acks_sent":{},"acks_recv":{},"ping_reqs_sent":{},"ping_reqs_recv":{},"probe_direct_timeouts":{},"probe_failures":{},"merges_new":{},"merges_updated":{},"merges_stale":{},"anti_entropy_sent":{},"rate_limited":{},"reliable_retries":{},"reliable_exhausted":{},"alive":{},"suspect":{},"dead":{}}}"#,
+            r#"{{"gossip_rounds":{},"gossip_sent":{},"gossip_recv":{},"pings_sent":{},"pings_recv":{},"acks_sent":{},"acks_recv":{},"ping_reqs_sent":{},"ping_reqs_recv":{},"probe_direct_timeouts":{},"probe_failures":{},"merges_new":{},"merges_updated":{},"merges_stale":{},"anti_entropy_sent":{},"rate_limited":{},"reliable_retries":{},"reliable_exhausted":{},"backpressure_shed":{},"queue_high_water_mark":{},"alive":{},"suspect":{},"dead":{}}}"#,
             self.gossip_rounds, self.gossip_sent, self.gossip_recv,
             self.pings_sent, self.pings_recv,
             self.acks_sent, self.acks_recv,
@@ -142,6 +150,7 @@ impl Metrics {
             self.anti_entropy_sent,
             self.rate_limited,
             self.reliable_retries, self.reliable_exhausted,
+            self.backpressure_shed, self.queue_high_water_mark,
             alive, suspect, dead,
         )
     }
@@ -156,6 +165,7 @@ impl Metrics {
              merges_new={} merges_updated={} merges_stale={} \
              anti_entropy_sent={} rate_limited={} \
              reliable_retries={} reliable_exhausted={} \
+             backpressure_shed={} queue_hwm={} \
              alive={} suspect={} dead={}",
             self.gossip_rounds,
             self.gossip_sent,
@@ -175,6 +185,8 @@ impl Metrics {
             self.rate_limited,
             self.reliable_retries,
             self.reliable_exhausted,
+            self.backpressure_shed,
+            self.queue_high_water_mark,
             alive,
             suspect,
             dead,
