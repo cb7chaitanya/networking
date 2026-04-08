@@ -20,6 +20,7 @@ use crate::message::{
 use crate::metrics::Metrics;
 use crate::node::{generate_node_id, NodeConfig, NodeId, NodeState};
 use crate::reliable::PendingAcks;
+use crate::timeline::{TimelineEventKind, TimelineLog};
 use crate::transport::Transport;
 
 // ── Node ───────────────────────────────────────────────────────────────────────
@@ -32,6 +33,7 @@ pub struct Node {
     pub metrics: Metrics,
     pub pending_acks: PendingAcks,
     pub chunk_assembler: ChunkAssembler,
+    pub timeline: TimelineLog,
     /// Monotonic counter for anti-entropy table snapshots.
     ae_version: u64,
 }
@@ -73,6 +75,7 @@ impl Node {
             metrics: Metrics::default(),
             pending_acks,
             chunk_assembler,
+            timeline: TimelineLog::new(),
             ae_version: 0,
         }
     }
@@ -94,6 +97,7 @@ struct MetricsSnapshot {
     suspect: usize,
     dead: usize,
     members: Vec<MemberInfo>,
+    timeline_json: String,
 }
 
 impl Default for MemberInfo {
@@ -157,6 +161,8 @@ async fn metrics_server(port: u16, shared: Arc<Mutex<MetricsSnapshot>>) {
                 )
             }).collect();
             ("application/json", format!(r#"{{"nodes":[{}]}}"#, nodes.join(",")))
+        } else if path == "/timeline" {
+            ("application/json", snap.timeline_json.clone())
         } else if path.contains("json") {
             ("application/json", snap.metrics.json(snap.alive, snap.suspect, snap.dead))
         } else {
@@ -225,6 +231,12 @@ pub async fn run_node(
             // ── Shutdown signal ────────────────────────────────────────────────
             _ = &mut shutdown_rx => {
                 log::info!("[node {}] broadcasting LEAVE and shutting down", node.id);
+                node.timeline.record(
+                    TimelineEventKind::Leave,
+                    node.id,
+                    None,
+                    "local node shutting down",
+                );
                 let leave = build_leave(
                     node.id,
                     node.table.our_heartbeat(),
@@ -235,6 +247,12 @@ pub async fn run_node(
                     if let Some(e) = node.table.entries.get(peer_id) {
                         let _ = node.transport.send_to(&leave, e.addr).await;
                     }
+                }
+                // Auto-export timeline JSON on shutdown.
+                if let Err(e) = node.timeline.export_json_file(std::path::Path::new("timeline.json")) {
+                    log::warn!("[timeline] failed to write timeline.json: {e}");
+                } else {
+                    log::info!("[timeline] exported {} events to timeline.json", node.timeline.len());
                 }
                 break;
             }
@@ -271,6 +289,12 @@ pub async fn run_node(
                 );
                 if !targets.is_empty() {
                     node.metrics.gossip_rounds += 1;
+                    node.timeline.record(
+                        TimelineEventKind::GossipSpread,
+                        node.id,
+                        None,
+                        format!("gossip round to {} peer(s)", targets.len()),
+                    );
                     let fanout = gossip::effective_fanout(
                         node.config.gossip_fanout,
                         node.table.entries.len(),
@@ -311,6 +335,12 @@ pub async fn run_node(
                 node.metrics.probe_direct_timeouts += scan.escalate_to_indirect.len() as u64;
 
                 for target_id in scan.escalate_to_indirect {
+                    node.timeline.record(
+                        TimelineEventKind::ProbeTimeout,
+                        node.id,
+                        Some(target_id),
+                        format!("direct probe timed out for node {target_id}"),
+                    );
                     // Direct probe timed out; send PING_REQ to k intermediaries.
                     if let Some(target_state) = node.table.entries.get(&target_id) {
                         let target_addr = target_state.addr;
@@ -333,6 +363,12 @@ pub async fn run_node(
                             }
                         }
                         if !intermediaries.is_empty() {
+                            node.timeline.record(
+                                TimelineEventKind::IndirectProbe,
+                                node.id,
+                                Some(target_id),
+                                format!("indirect probe via {} intermediaries", intermediaries.len()),
+                            );
                             node.failure_det.record_indirect_probe_sent(target_id);
                             log::debug!(
                                 "[node {}] indirect probe for {target_id} via {} nodes",
@@ -345,6 +381,12 @@ pub async fn run_node(
 
                 node.metrics.probe_failures += scan.declare_suspect.len() as u64;
                 for id in scan.declare_suspect {
+                    node.timeline.record(
+                        TimelineEventKind::NodeSuspected,
+                        node.id,
+                        Some(id),
+                        format!("node {id} suspected after probe failure"),
+                    );
                     node.table.suspect(id);
                 }
 
@@ -355,6 +397,12 @@ pub async fn run_node(
                     node.config.suspect_timeout_multiplier,
                     node.config.suspect_timeout_jitter_ms,
                 ) {
+                    node.timeline.record(
+                        TimelineEventKind::NodeDeclaredDead,
+                        node.id,
+                        Some(id),
+                        format!("node {id} declared dead after suspect timeout"),
+                    );
                     node.table.declare_dead(id);
                 }
 
@@ -466,6 +514,7 @@ pub async fn run_node(
                     snap.suspect = suspect;
                     snap.dead = dead;
                     snap.members = members;
+                    snap.timeline_json = node.timeline.export_json();
                 }
             }
         }
@@ -492,6 +541,14 @@ async fn handle_message(
     );
     sender_alive.incarnation = msg.sender_incarnation;
     let outcome = node.table.merge_entry(&sender_alive);
+    if outcome == crate::metrics::MergeOutcome::New {
+        node.timeline.record(
+            TimelineEventKind::NodeJoined,
+            node.id,
+            Some(msg.sender_id),
+            format!("discovered node {} @ {}", msg.sender_id, from_addr),
+        );
+    }
     node.metrics.record_merge(outcome);
 
     // If we had an in-flight probe for this sender, an incoming message resolves it.
@@ -588,6 +645,12 @@ async fn handle_message(
                 node.id,
                 msg.sender_id,
                 from_addr,
+            );
+            node.timeline.record(
+                TimelineEventKind::Leave,
+                node.id,
+                Some(msg.sender_id),
+                format!("received LEAVE from node {} @ {}", msg.sender_id, from_addr),
             );
             // Respond with ACK before marking dead so the departing node
             // knows we received its LEAVE.
