@@ -961,16 +961,18 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.current_leader = Some(from);
         self.reset_election_timer();
 
-        // Candidates step down on contact from the legitimate leader, same as
-        // for AppendEntries.
-        if matches!(self.role, Role::Candidate { .. }) {
+        // Any role other than Follower must step down.  Candidates haven't
+        // committed to the new term yet; a Leader receiving an InstallSnapshot
+        // for the *current* term (impossible in a correct cluster but handled
+        // defensively) must also revert.
+        if !matches!(self.role, Role::Follower) {
             self.become_follower();
         }
 
         let last_included_index = args.last_included_index;
         let last_included_term = args.last_included_term;
 
-        // Stale snapshot: we have already installed this index (or a later one).
+        // Stale snapshot: we have already installed this index (or a newer one).
         // Acknowledge so the leader stops retrying.
         if last_included_index <= self.snapshot_index {
             self.send(
@@ -988,7 +990,17 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             return;
         }
 
-        // Persist the snapshot before touching any volatile state (crash safety).
+        // Check before we modify the log whether our log already contains a
+        // matching entry at last_included_index.  If it does, the Log Matching
+        // Property guarantees our log agrees with the leader's through that
+        // index, so we can retain the tail (entries after last_included_index).
+        // Otherwise, our log diverges and the tail must be discarded (§7 step 7).
+        let log_matches_at_boundary =
+            self.log.term_at(last_included_index) == Some(last_included_term);
+
+        // Persist the snapshot before touching any volatile state (crash safety:
+        // a crash after saving but before updating in-memory state is safe
+        // because restore() reloads the snapshot on the next boot).
         let snap = Snapshot {
             last_included_index,
             last_included_term,
@@ -998,8 +1010,17 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             return; // storage failure — don't reply; leader retries on timeout
         }
 
-        // Discard log entries now covered by the snapshot.
+        // Remove log entries covered by the snapshot.
         self.log.compact(last_included_index, last_included_term);
+
+        if !log_matches_at_boundary {
+            // Log diverged at the boundary or our log was too short.
+            // Discard any entries that may exist beyond the snapshot point —
+            // they come from a conflicting branch and must not be applied.
+            self.log.truncate_from(last_included_index + 1);
+        }
+        // (If log_matches_at_boundary, the tail after last_included_index is
+        // valid and is kept — it will be applied once the leader commits it.)
 
         // Advance snapshot tracking fields.
         self.snapshot_index = last_included_index;
@@ -5519,5 +5540,280 @@ mod tests {
         // Compacted entries remain inaccessible.
         assert!(leader.log.get(1).is_none());
         assert!(leader.log.get(2).is_none());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  InstallSnapshot handler tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Build an InstallSnapshot envelope from node `from` to node 1, for
+    /// the given index/term boundary.  Data is empty (not needed for tests).
+    fn install_snapshot_envelope(from: NodeId, term: Term, last_index: u64, last_term: Term) -> Envelope {
+        envelope(
+            from,
+            1,
+            Rpc::InstallSnapshot(InstallSnapshotArgs {
+                term,
+                leader_id: from,
+                last_included_index: last_index,
+                last_included_term: last_term,
+                offset: 0,
+                data: vec![],
+                done: true,
+            }),
+        )
+    }
+
+    /// A follower node in term `t` with no log entries.
+    fn follower_in_term(t: Term) -> RaftNode {
+        let mut node = three_node_cluster(1);
+        // Advance the node's term without starting a real election.
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: t,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![],
+                leader_commit: 0,
+            }),
+        ));
+        node.drain_messages();
+        node
+    }
+
+    // ── Term gating ──
+
+    #[test]
+    fn stale_term_install_snapshot_rejected() {
+        // Node is in term 5.  An InstallSnapshot with term 3 must be rejected.
+        let mut node = follower_in_term(5);
+        let old_snapshot_index = node.snapshot_index();
+
+        // Step delivers a message with term 3; step() rejects it via
+        // reject_stale_message() before dispatch.
+        node.step(install_snapshot_envelope(2, 3, 10, 3));
+
+        // The node must send back an InstallSnapshotResponse with its own term.
+        let msgs = node.drain_messages();
+        assert_eq!(msgs.len(), 1);
+        if let Rpc::InstallSnapshotResponse(reply) = &msgs[0].payload {
+            assert_eq!(reply.term, 5, "reply must carry our current term");
+        } else {
+            panic!("expected InstallSnapshotResponse, got {:?}", msgs[0].payload);
+        }
+
+        // Snapshot must not have been installed.
+        assert_eq!(node.snapshot_index(), old_snapshot_index);
+    }
+
+    // ── Stale snapshot rejection ──
+
+    #[test]
+    fn stale_snapshot_same_index_acknowledged_but_not_installed() {
+        let mut node = follower_in_term(1);
+        // Bootstrap: install snapshot at index 5.
+        node.step(install_snapshot_envelope(2, 1, 5, 1));
+        node.drain_messages();
+        assert_eq!(node.snapshot_index(), 5);
+
+        // Re-send the same snapshot (leader retransmission).
+        node.step(install_snapshot_envelope(2, 1, 5, 1));
+        let msgs = node.drain_messages();
+
+        // Must acknowledge so the leader knows we have it.
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].payload, Rpc::InstallSnapshotResponse(_)));
+        // No change in state.
+        assert_eq!(node.snapshot_index(), 5);
+    }
+
+    #[test]
+    fn stale_snapshot_lower_index_acknowledged_but_not_installed() {
+        let mut node = follower_in_term(1);
+        node.step(install_snapshot_envelope(2, 1, 7, 1));
+        node.drain_messages();
+        assert_eq!(node.snapshot_index(), 7);
+
+        // A snapshot that covers only up to index 4 is stale.
+        node.step(install_snapshot_envelope(2, 1, 4, 1));
+        let msgs = node.drain_messages();
+
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].payload, Rpc::InstallSnapshotResponse(_)));
+        assert_eq!(node.snapshot_index(), 7, "must not regress to older snapshot");
+    }
+
+    // ── Replacement snapshots ──
+
+    #[test]
+    fn newer_snapshot_replaces_older_snapshot() {
+        let mut node = follower_in_term(1);
+
+        // Install first snapshot.
+        node.step(install_snapshot_envelope(2, 1, 3, 1));
+        node.drain_messages();
+        assert_eq!(node.snapshot_index(), 3);
+        assert_eq!(node.snapshot_term(), 1);
+
+        // Install a second, newer snapshot.
+        node.step(install_snapshot_envelope(2, 1, 8, 1));
+        let msgs = node.drain_messages();
+
+        assert_eq!(msgs.len(), 1);
+        assert!(matches!(msgs[0].payload, Rpc::InstallSnapshotResponse(_)));
+        assert_eq!(node.snapshot_index(), 8);
+        assert_eq!(node.snapshot_term(), 1);
+
+        // Storage must hold the newer snapshot.
+        let stored = node.storage().load_snapshot().unwrap().unwrap();
+        assert_eq!(stored.last_included_index, 8);
+    }
+
+    #[test]
+    fn replacement_snapshot_advances_commit_and_last_applied() {
+        let mut node = follower_in_term(1);
+
+        node.step(install_snapshot_envelope(2, 1, 3, 1));
+        node.drain_messages();
+        assert_eq!(node.commit_index(), 3);
+        assert_eq!(node.last_applied(), 3);
+
+        node.step(install_snapshot_envelope(2, 1, 9, 1));
+        node.drain_messages();
+        assert_eq!(node.commit_index(), 9);
+        assert_eq!(node.last_applied(), 9);
+    }
+
+    // ── Conflicting log entries ──
+
+    #[test]
+    fn conflicting_log_tail_discarded_on_install() {
+        // Follower has entries 1-5 all from term 1.  Leader sends a snapshot
+        // covering [1-3] with last_included_term=2 — our entry at index 3 has
+        // term 1, which does NOT match.  Entries 4 and 5 must be discarded.
+        let mut node = follower_in_term(1);
+
+        // Inject 5 entries (term 1) via AppendEntries.
+        let entries: Vec<LogEntry> = (1u8..=5)
+            .map(|i| LogEntry { term: 1, data: vec![i] })
+            .collect();
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 0,
+            }),
+        ));
+        node.drain_messages();
+        assert_eq!(node.log.last_index(), 5);
+
+        // InstallSnapshot: last_included_index=3, last_included_term=2.
+        // Our log has term 1 at index 3, so the boundary does NOT match.
+        node.step(install_snapshot_envelope(2, 1, 3, 2));
+        node.drain_messages();
+
+        // Snapshot installed at the boundary.
+        assert_eq!(node.snapshot_index(), 3);
+        assert_eq!(node.snapshot_term(), 2);
+
+        // Conflicting tail (indices 4-5) must be gone.
+        assert_eq!(node.log.last_index(), 3, "tail must have been discarded");
+        assert_eq!(node.log.len(), 0, "no live entries should remain");
+    }
+
+    #[test]
+    fn matching_log_tail_retained_on_install() {
+        // Follower has entries 1-5, all from term 1.  Leader sends a snapshot
+        // covering [1-3] with last_included_term=1 — our entry at index 3 has
+        // term 1, which DOES match.  Entries 4 and 5 must be kept.
+        let mut node = follower_in_term(1);
+
+        let entries: Vec<LogEntry> = (1u8..=5)
+            .map(|i| LogEntry { term: 1, data: vec![i] })
+            .collect();
+        node.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 2,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 0,
+            }),
+        ));
+        node.drain_messages();
+        assert_eq!(node.log.last_index(), 5);
+
+        // InstallSnapshot: last_included_term=1 — matches our entry at index 3.
+        node.step(install_snapshot_envelope(2, 1, 3, 1));
+        node.drain_messages();
+
+        assert_eq!(node.snapshot_index(), 3);
+        // Tail entries (4, 5) must still be accessible.
+        assert_eq!(node.log.last_index(), 5);
+        assert_eq!(node.log.len(), 2, "two live entries should remain");
+        assert_eq!(node.log.get(4).unwrap().data, vec![4]);
+        assert_eq!(node.log.get(5).unwrap().data, vec![5]);
+    }
+
+    // ── Step-down ──
+
+    #[test]
+    fn candidate_steps_down_on_install_snapshot() {
+        let mut node = three_node_cluster(1);
+        node.tick(25); // trigger election timeout → Candidate
+        node.drain_messages();
+        assert!(node.is_candidate());
+        let term = node.current_term();
+
+        // InstallSnapshot from the current-term leader.
+        node.step(install_snapshot_envelope(2, term, 5, term));
+        node.drain_messages();
+
+        assert!(node.is_follower(), "candidate must step down to follower");
+        assert_eq!(node.snapshot_index(), 5);
+    }
+
+    // ── Idempotency and persistence ordering ──
+
+    #[test]
+    fn snapshot_persisted_before_in_memory_state_updated() {
+        // Storage must hold the snapshot regardless of whether we crash after
+        // persisting but before the in-memory fields are set.  We verify that
+        // storage is updated synchronously as part of handling.
+        let mut node = follower_in_term(1);
+        node.step(install_snapshot_envelope(2, 1, 6, 1));
+        node.drain_messages();
+
+        let stored = node.storage().load_snapshot().unwrap().unwrap();
+        assert_eq!(stored.last_included_index, 6);
+        assert_eq!(stored.last_included_term, 1);
+        // And the in-memory view agrees.
+        assert_eq!(node.snapshot_index(), 6);
+        assert_eq!(node.snapshot_term(), 1);
+    }
+
+    #[test]
+    fn install_snapshot_sends_response_with_current_term() {
+        let mut node = follower_in_term(2);
+        node.step(install_snapshot_envelope(2, 2, 4, 2));
+        let msgs = node.drain_messages();
+
+        assert_eq!(msgs.len(), 1);
+        if let Rpc::InstallSnapshotResponse(reply) = &msgs[0].payload {
+            assert_eq!(reply.term, 2);
+        } else {
+            panic!("expected InstallSnapshotResponse");
+        }
     }
 }
