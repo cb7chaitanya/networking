@@ -202,6 +202,30 @@ pub struct ApplyResult {
     pub data: Vec<u8>,
 }
 
+// ── ReadIndex ──
+
+/// Result of a confirmed linearizable read.
+///
+/// The caller receives this once the leader has verified its authority via a
+/// heartbeat quorum.  The read may be executed against the state machine as
+/// soon as `last_applied >= read_index`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadResult {
+    /// The commit index that must be applied before executing the read.
+    pub read_index: LogIndex,
+}
+
+/// In-flight read-index request waiting for a heartbeat quorum.
+struct PendingRead {
+    /// Snapshot of commit_index at the moment the read was requested.
+    read_index: LogIndex,
+    /// Set of nodes that have acknowledged our authority (started with self).
+    acks: HashSet<NodeId>,
+    /// `None`  → local read; push `ReadResult` to `ready_reads` on confirm.
+    /// `Some(id)` → forwarded from a follower; send `ReadIndexResponse` to `id`.
+    reply_to: Option<NodeId>,
+}
+
 // ── RaftNode ──
 
 /// The core Raft state machine.
@@ -272,6 +296,14 @@ pub struct RaftNode<S: Storage = MemoryStorage, L: RaftLog = InMemoryLog> {
     /// pre-vote responses. Reset when we transition to a real election.
     pre_vote_responses: HashSet<NodeId>,
 
+    // ── ReadIndex state (§8) ──
+    /// In-flight reads waiting for a heartbeat quorum to confirm leadership.
+    /// Cleared whenever this node loses leadership.
+    pending_reads: Vec<PendingRead>,
+    /// Reads whose leadership has been confirmed — ready for the caller to drain.
+    /// The caller must wait for `last_applied >= read_index` before serving.
+    ready_reads: Vec<ReadResult>,
+
     // ── RNG state ──
     /// Simple deterministic RNG for election timeout randomization.
     /// We use a basic LCG so the node has zero external dependencies.
@@ -307,6 +339,8 @@ impl RaftNode<MemoryStorage, InMemoryLog> {
             snapshot_term: 0,
             current_leader: None,
             pre_vote_responses: HashSet::new(),
+            pending_reads: Vec::new(),
+            ready_reads: Vec::new(),
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id, // seed from node ID for determinism
@@ -348,6 +382,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             snapshot_term: 0,
             current_leader: None,
             pre_vote_responses: HashSet::new(),
+            pending_reads: Vec::new(),
+            ready_reads: Vec::new(),
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id,
@@ -427,6 +463,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             snapshot_term,
             current_leader: None,
             pre_vote_responses: HashSet::new(),
+            pending_reads: Vec::new(),
+            ready_reads: Vec::new(),
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id,
@@ -556,6 +594,19 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                 self.handle_pre_vote_response(envelope.from, reply);
                 return;
             }
+            // ReadIndex messages bypass the universal term check.  They are
+            // client-facing RPCs (not peer protocol), so we must not step down
+            // or reject based on the term they carry.
+            Rpc::ReadIndexRequest(args) => {
+                let args = args.clone();
+                self.handle_read_index_request(envelope.from, args);
+                return;
+            }
+            Rpc::ReadIndexResponse(reply) => {
+                let reply = reply.clone();
+                self.handle_read_index_response(reply);
+                return;
+            }
             _ => {}
         }
 
@@ -587,8 +638,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             Rpc::AppendEntriesResponse(reply) => {
                 self.handle_append_entries_response(envelope.from, reply)
             }
-            // PreVote variants already handled above.
+            // PreVote and ReadIndex variants already handled above.
             Rpc::PreVote(_) | Rpc::PreVoteResponse(_) => unreachable!(),
+            Rpc::ReadIndexRequest(_) | Rpc::ReadIndexResponse(_) => unreachable!(),
             Rpc::InstallSnapshot(args) => self.handle_install_snapshot(envelope.from, args),
             Rpc::InstallSnapshotResponse(reply) => {
                 self.handle_install_snapshot_response(envelope.from, reply)
@@ -604,6 +656,43 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     /// Drain all entries that have been committed and applied since the last drain.
     pub fn drain_applied(&mut self) -> Vec<ApplyResult> {
         std::mem::take(&mut self.applied)
+    }
+
+    /// Drain all confirmed linearizable read results.
+    ///
+    /// A `ReadResult` appears here once the leader has verified its authority
+    /// via a heartbeat quorum.  The caller is responsible for waiting until
+    /// `last_applied() >= result.read_index` before executing the actual read
+    /// against its state machine.
+    pub fn drain_read_results(&mut self) -> Vec<ReadResult> {
+        std::mem::take(&mut self.ready_reads)
+    }
+
+    /// Initiate a linearizable read (§8).
+    ///
+    /// **Leader**: records the current commit index as the `read_index`,
+    /// immediately triggers a fresh heartbeat round, and pushes a `ReadResult`
+    /// to `ready_reads` once a quorum of `AppendEntriesResponse(success=true)`
+    /// responses confirms our continued leadership.
+    ///
+    /// **Follower**: forwards a `ReadIndexRequest` to the known leader.  The
+    /// result appears in `ready_reads` when the leader's `ReadIndexResponse`
+    /// is received and delivered back via `step()`.
+    ///
+    /// **No known leader / candidate**: the call is a no-op; no result is ever
+    /// pushed.
+    pub fn read_index(&mut self) {
+        if self.is_leader() {
+            self.start_local_read(None);
+        } else if let Some(leader) = self.current_leader {
+            let term = self.persistent.current_term;
+            let id = self.id;
+            self.send(
+                leader,
+                Rpc::ReadIndexRequest(ReadIndexArgs { term, reader_id: id }),
+            );
+        }
+        // Candidate or no-leader: silently drop.
     }
 
     /// Propose a new command (as raw bytes). Only the leader can accept
@@ -660,6 +749,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     fn become_follower(&mut self) {
         self.role = Role::Follower;
         self.reset_election_timer();
+        self.abort_pending_reads();
     }
 
     /// Transition to Candidate and start an election.
@@ -675,6 +765,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     /// `voted_for` was reset to `None` by `update_term()`, so voting for self
     /// is safe.
     fn become_candidate(&mut self) {
+        self.abort_pending_reads();
         // Step 1: increment term
         self.persistent.current_term += 1;
 
@@ -1057,6 +1148,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
             // Check if we can advance the commit index.
             self.maybe_advance_commit_index();
+            // Credit this acknowledgment to any pending linearizable reads.
+            self.credit_read_ack(from);
         } else {
             // Backtrack using the match_index hint from the follower.
             // Guard: don't advance next_index on failure — only backtrack.
@@ -1387,6 +1480,101 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    // ════════════════════════════════════════════════════════════════════════
+    //  ReadIndex helpers (§8)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Create a pending read on the leader and kick off a fresh heartbeat round.
+    /// `reply_to = None` → local read (push to `ready_reads` on confirm).
+    /// `reply_to = Some(id)` → forwarded read (send `ReadIndexResponse` to `id`).
+    fn start_local_read(&mut self, reply_to: Option<NodeId>) {
+        let read_index = self.volatile.commit_index;
+        let mut acks = HashSet::new();
+        acks.insert(self.id);
+        self.pending_reads.push(PendingRead { read_index, acks, reply_to });
+
+        // Single-node cluster: self alone is a quorum — confirm immediately.
+        // Multi-node: trigger a fresh heartbeat; responses will credit the read.
+        self.try_confirm_pending_reads();
+        if !self.pending_reads.is_empty() {
+            self.replicate_to_all();
+        }
+    }
+
+    /// Credit an `AppendEntriesResponse(success=true)` from `acker` to every
+    /// pending read and confirm any that now have a quorum.
+    fn credit_read_ack(&mut self, acker: NodeId) {
+        if self.pending_reads.is_empty() {
+            return;
+        }
+        for read in &mut self.pending_reads {
+            read.acks.insert(acker);
+        }
+        self.try_confirm_pending_reads();
+    }
+
+    /// Drain pending reads whose `acks` now form a quorum and dispatch them.
+    fn try_confirm_pending_reads(&mut self) {
+        let all = std::mem::take(&mut self.pending_reads);
+        let current_term = self.persistent.current_term;
+        let self_id = self.id;
+
+        for r in all {
+            if self.membership.has_quorum(&r.acks) {
+                match r.reply_to {
+                    Some(id) => self.outbox.push(Envelope {
+                        from: self_id,
+                        to: id,
+                        payload: Rpc::ReadIndexResponse(ReadIndexReply {
+                            term: current_term,
+                            read_index: r.read_index,
+                        }),
+                    }),
+                    None => self.ready_reads.push(ReadResult { read_index: r.read_index }),
+                }
+            } else {
+                self.pending_reads.push(r);
+            }
+        }
+    }
+
+    /// Abandon all in-flight read requests. Called whenever this node loses
+    /// leadership — the reads can never be confirmed and must be retried.
+    fn abort_pending_reads(&mut self) {
+        self.pending_reads.clear();
+    }
+
+    /// Handle a `ReadIndexRequest` from a follower (or from a local proxy).
+    ///
+    /// If we are the current leader we start a heartbeat quorum round and will
+    /// send `ReadIndexResponse` to `args.reader_id` once it completes.  If we
+    /// are not the leader we immediately reply with `read_index = 0` so the
+    /// follower can retry against the real leader.
+    fn handle_read_index_request(&mut self, _from: NodeId, args: ReadIndexArgs) {
+        if self.is_leader() {
+            self.start_local_read(Some(args.reader_id));
+        } else {
+            // Not the leader — reject immediately.
+            self.send(
+                args.reader_id,
+                Rpc::ReadIndexResponse(ReadIndexReply {
+                    term: self.persistent.current_term,
+                    read_index: 0,
+                }),
+            );
+        }
+    }
+
+    /// Handle a `ReadIndexResponse` from the leader (received by the follower
+    /// that initiated the forwarded read).  A non-zero `read_index` is pushed
+    /// to `ready_reads`; zero means the leader rejected us and we drop it.
+    fn handle_read_index_response(&mut self, reply: ReadIndexReply) {
+        if reply.read_index > 0 {
+            self.ready_reads.push(ReadResult { read_index: reply.read_index });
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     //  Replication helpers (leader only)
     // ════════════════════════════════════════════════════════════════════════
 
@@ -1537,6 +1725,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             | Rpc::AppendEntriesResponse(_)
             | Rpc::PreVoteResponse(_)
             | Rpc::InstallSnapshotResponse(_) => {}
+            // ReadIndex messages bypass the universal term check and are
+            // dispatched before we reach this function — this arm is unreachable.
+            Rpc::ReadIndexRequest(_) | Rpc::ReadIndexResponse(_) => {}
         }
     }
 
@@ -6329,5 +6520,220 @@ mod tests {
         ack(&mut leader, 3, idx);
         assert_eq!(leader.commit_index(), idx);
         assert!(!leader.membership.is_joint());
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  ReadIndex tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ── Helpers ──
+
+    // ── Leader reads succeed ──
+
+    #[test]
+    fn leader_read_index_succeeds_after_heartbeat_quorum() {
+        // Single-node cluster: no peers, quorum = {self}, confirmed immediately.
+        let mut leader = RaftNode::new(1, vec![], default_config());
+        leader.tick(25); // single-node election completes synchronously
+        leader.drain_messages();
+        assert!(leader.is_leader());
+        assert!(leader.commit_index() >= 1); // noop committed
+
+        leader.read_index();
+        // No peers → pending read satisfies quorum with just self.
+        let results = leader.drain_read_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].read_index, leader.last_applied());
+    }
+
+    #[test]
+    fn leader_read_index_multi_node_succeeds_after_ack() {
+        let mut leader = three_node_cluster(1);
+        leader.tick(25);
+        leader.drain_messages();
+        leader.step(envelope(2, 1, Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: true })));
+        assert!(leader.is_leader());
+        let commit_before = leader.commit_index();
+
+        // Request a read.
+        leader.read_index();
+
+        // No result yet — waiting for heartbeat acks.
+        assert!(leader.drain_read_results().is_empty());
+
+        // One ack — 2 out of 3 voters (self + node 2) = majority.
+        leader.step(envelope(2, 1, Rpc::AppendEntriesResponse(AppendEntriesReply {
+            term: 1,
+            success: true,
+            match_index: leader.log.last_index(),
+        })));
+        leader.drain_messages();
+
+        let results = leader.drain_read_results();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].read_index, commit_before);
+    }
+
+    #[test]
+    fn single_ack_insufficient_in_five_node_cluster() {
+        // Five-node cluster needs 3 acks (including self) for majority.
+        // Self + one peer = 2/5, not enough.
+        let mut leader = RaftNode::new(1, vec![2, 3, 4, 5], default_config());
+        leader.tick(25);
+        leader.drain_messages();
+        for peer in [2u64, 3, 4, 5] {
+            leader.step(envelope(peer, 1, Rpc::RequestVoteResponse(RequestVoteReply {
+                term: 1, vote_granted: true,
+            })));
+        }
+        assert!(leader.is_leader());
+        leader.drain_messages();
+
+        leader.read_index();
+        assert!(leader.drain_read_results().is_empty());
+
+        // One ack from node 2: confirmed = {1, 2} = 2/5, not majority.
+        leader.step(envelope(2, 1, Rpc::AppendEntriesResponse(AppendEntriesReply {
+            term: 1, success: true, match_index: 1,
+        })));
+        leader.drain_messages();
+        assert!(leader.drain_read_results().is_empty(), "2/5 is not a majority");
+
+        // Second ack: {1, 2, 3} = 3/5 = majority → confirms.
+        leader.step(envelope(3, 1, Rpc::AppendEntriesResponse(AppendEntriesReply {
+            term: 1, success: true, match_index: 1,
+        })));
+        leader.drain_messages();
+        assert_eq!(leader.drain_read_results().len(), 1, "3/5 should confirm");
+    }
+
+    // ── Stale leader cannot serve reads ──
+
+    #[test]
+    fn stale_leader_read_index_never_confirms() {
+        // Build a three-node cluster.
+        let mut leader = three_node_cluster(1);
+        leader.tick(25);
+        leader.drain_messages();
+        leader.step(envelope(2, 1, Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: true })));
+        assert!(leader.is_leader());
+        leader.drain_messages();
+
+        // "Partition" the leader: no more acks will arrive from peers.
+        // Request a read — the pending read requires a quorum it can never get.
+        leader.read_index();
+        assert!(leader.drain_read_results().is_empty());
+
+        // Tick many times — no acks arrive, so the read never confirms.
+        for _ in 0..50 {
+            leader.tick(1);
+        }
+        leader.drain_messages();
+        assert!(
+            leader.drain_read_results().is_empty(),
+            "partitioned leader must not confirm reads"
+        );
+    }
+
+    #[test]
+    fn read_index_aborted_on_leadership_loss() {
+        let mut leader = three_node_cluster(1);
+        leader.tick(25);
+        leader.drain_messages();
+        leader.step(envelope(2, 1, Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: true })));
+        assert!(leader.is_leader());
+        leader.drain_messages();
+
+        leader.read_index();
+        assert!(leader.drain_read_results().is_empty());
+
+        // Deliver a higher-term message that causes leader to step down.
+        leader.step(envelope(2, 1, Rpc::AppendEntries(AppendEntriesArgs {
+            term: 99, leader_id: 2,
+            prev_log_index: 0, prev_log_term: 0,
+            entries: vec![], leader_commit: 0,
+        })));
+        leader.drain_messages();
+
+        assert!(leader.is_follower());
+        // Pending reads must be cleared — they can never be confirmed.
+        assert!(leader.pending_reads.is_empty());
+        assert!(leader.drain_read_results().is_empty());
+    }
+
+    // ── Follower forwarding ──
+
+    #[test]
+    fn follower_read_index_forwarded_to_leader_and_resolved() {
+        let config = default_config();
+        let mut leader = RaftNode::new(1, vec![2], config.clone());
+        let mut follower = RaftNode::new(2, vec![1], config.clone());
+
+        // Elect node 1 as leader.
+        leader.tick(25);
+        let rv = leader.drain_messages();
+        for msg in rv { follower.step(msg); }
+        let votes = follower.drain_messages();
+        for vote in votes { leader.step(vote); }
+        assert!(leader.is_leader());
+
+        // Let follower learn about the leader.
+        let hbs = leader.drain_messages();
+        for hb in hbs { follower.step(hb); }
+        let acks = follower.drain_messages();
+        for ack in acks { leader.step(ack); }
+        leader.drain_messages();
+
+        // Follower calls read_index() — sends ReadIndexRequest to leader.
+        follower.read_index();
+        let req_msgs = follower.drain_messages();
+        assert_eq!(req_msgs.len(), 1, "follower should send one ReadIndexRequest");
+        assert!(matches!(req_msgs[0].payload, Rpc::ReadIndexRequest(_)));
+
+        // Leader processes the ReadIndexRequest → starts heartbeat round.
+        leader.step(req_msgs[0].clone());
+        let hb_msgs = leader.drain_messages();
+
+        // Leader is a two-node cluster; it needs one peer ack.
+        // Follower (node 2) sends AppendEntriesResponse(success=true).
+        for hb in &hb_msgs {
+            if hb.to == 2 {
+                follower.step(hb.clone());
+                let acks = follower.drain_messages();
+                for ack in acks { leader.step(ack); }
+            }
+        }
+        // After the ack, the leader sends ReadIndexResponse to the follower.
+        let response_msgs = leader.drain_messages();
+        let read_resp: Vec<_> = response_msgs.iter().filter(|m| matches!(m.payload, Rpc::ReadIndexResponse(_))).collect();
+        assert_eq!(read_resp.len(), 1, "leader should send ReadIndexResponse to follower");
+
+        // Follower receives ReadIndexResponse → result appears in ready_reads.
+        follower.step(read_resp[0].clone());
+        let results = follower.drain_read_results();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].read_index > 0);
+        assert!(results[0].read_index <= follower.commit_index().max(leader.commit_index()));
+    }
+
+    #[test]
+    fn non_leader_rejects_read_index_request() {
+        // A follower that receives a ReadIndexRequest it cannot serve (no leader
+        // role) should reply with read_index = 0.
+        let mut follower = RaftNode::new(1, vec![2], default_config());
+
+        // Send a ReadIndexRequest directly to the follower (simulates a client
+        // that incorrectly contacted the wrong node).
+        follower.step(envelope(2, 1, Rpc::ReadIndexRequest(ReadIndexArgs {
+            term: 0,
+            reader_id: 2,
+        })));
+        let msgs = follower.drain_messages();
+        assert_eq!(msgs.len(), 1);
+        if let Rpc::ReadIndexResponse(reply) = &msgs[0].payload {
+            assert_eq!(reply.read_index, 0, "non-leader must reply with read_index=0");
+        } else {
+            panic!("expected ReadIndexResponse");
+        }
     }
 }

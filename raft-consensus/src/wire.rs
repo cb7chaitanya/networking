@@ -79,6 +79,13 @@ const TAG_PRE_VOTE: u8 = 5;
 const TAG_PRE_VOTE_RESPONSE: u8 = 6;
 const TAG_INSTALL_SNAPSHOT: u8 = 7;
 const TAG_INSTALL_SNAPSHOT_RESPONSE: u8 = 8;
+// Tag 9 — ReadIndexRequest:
+//   [9: u8] [term: u64] [reader_id: u64]   Total: 17 bytes
+//
+// Tag 10 — ReadIndexResponse:
+//   [10: u8] [term: u64] [read_index: u64]  Total: 17 bytes
+const TAG_READ_INDEX_REQUEST: u8 = 9;
+const TAG_READ_INDEX_RESPONSE: u8 = 10;
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Encoder
@@ -95,6 +102,8 @@ pub fn encode(rpc: &Rpc) -> Vec<u8> {
         Rpc::PreVoteResponse(reply) => encode_pre_vote_response(reply),
         Rpc::InstallSnapshot(args) => encode_install_snapshot(args),
         Rpc::InstallSnapshotResponse(reply) => encode_install_snapshot_response(reply),
+        Rpc::ReadIndexRequest(args) => encode_read_index_request(args),
+        Rpc::ReadIndexResponse(reply) => encode_read_index_response(reply),
     }
 }
 
@@ -188,6 +197,22 @@ fn encode_install_snapshot_response(reply: &InstallSnapshotReply) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + 8);
     buf.push(TAG_INSTALL_SNAPSHOT_RESPONSE);
     buf.extend_from_slice(&reply.term.to_be_bytes());
+    buf
+}
+
+fn encode_read_index_request(args: &ReadIndexArgs) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + 8);
+    buf.push(TAG_READ_INDEX_REQUEST);
+    buf.extend_from_slice(&args.term.to_be_bytes());
+    buf.extend_from_slice(&args.reader_id.to_be_bytes());
+    buf
+}
+
+fn encode_read_index_response(reply: &ReadIndexReply) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + 8);
+    buf.push(TAG_READ_INDEX_RESPONSE);
+    buf.extend_from_slice(&reply.term.to_be_bytes());
+    buf.extend_from_slice(&reply.read_index.to_be_bytes());
     buf
 }
 
@@ -303,6 +328,16 @@ pub fn decode(data: &[u8]) -> Result<Rpc, WireError> {
         TAG_INSTALL_SNAPSHOT_RESPONSE => {
             let term = cursor.read_u64()?;
             Ok(Rpc::InstallSnapshotResponse(InstallSnapshotReply { term }))
+        }
+        TAG_READ_INDEX_REQUEST => {
+            let term = cursor.read_u64()?;
+            let reader_id = cursor.read_u64()?;
+            Ok(Rpc::ReadIndexRequest(ReadIndexArgs { term, reader_id }))
+        }
+        TAG_READ_INDEX_RESPONSE => {
+            let term = cursor.read_u64()?;
+            let read_index = cursor.read_u64()?;
+            Ok(Rpc::ReadIndexResponse(ReadIndexReply { term, read_index }))
         }
         other => Err(WireError::UnknownTag(other)),
     }

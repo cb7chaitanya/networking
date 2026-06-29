@@ -55,6 +55,14 @@ pub enum Rpc {
     PreVoteResponse(PreVoteReply),
     InstallSnapshot(InstallSnapshotArgs),
     InstallSnapshotResponse(InstallSnapshotReply),
+    /// Sent by a follower to the known leader to initiate a linearizable read
+    /// without touching the log (§8). The `reader_id` field lets the leader
+    /// send the response directly to the originating follower.
+    ReadIndexRequest(ReadIndexArgs),
+    /// Leader's response once it has confirmed its leadership via a heartbeat
+    /// quorum.  `read_index` is the commit index the caller must wait for;
+    /// `0` means the leader rejected the request (it is no longer a leader).
+    ReadIndexResponse(ReadIndexReply),
 }
 
 impl Rpc {
@@ -69,6 +77,8 @@ impl Rpc {
             Rpc::PreVoteResponse(reply) => reply.term,
             Rpc::InstallSnapshot(args) => args.term,
             Rpc::InstallSnapshotResponse(reply) => reply.term,
+            Rpc::ReadIndexRequest(args) => args.term,
+            Rpc::ReadIndexResponse(reply) => reply.term,
         }
     }
 }
@@ -263,6 +273,41 @@ pub struct InstallSnapshotArgs {
 pub struct InstallSnapshotReply {
     /// The responder's current term, for the leader to update itself if stale.
     pub term: Term,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ReadIndex RPCs (§8 — linearizable reads without log writes)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Sent by a follower (or a local client proxy) to the leader to initiate a
+/// linearizable read.  The leader performs a heartbeat quorum round and replies
+/// with the commit index the caller must wait for before executing its read.
+///
+/// Handled before the universal term check in `RaftNode::step()` — like
+/// PreVote, this is an out-of-band exchange that must not trigger step-down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadIndexArgs {
+    /// Sender's current term — carried so `Rpc::term()` compiles without
+    /// special-casing; the receiver bypasses the universal term check for
+    /// this message type.
+    pub term: Term,
+    /// Node ID of the originating reader.  The leader sends its reply
+    /// directly to this node.
+    pub reader_id: NodeId,
+}
+
+/// Response from the leader once it has confirmed its leadership via a
+/// heartbeat quorum (or immediately when it has already heard from a quorum
+/// during the current heartbeat cycle).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReadIndexReply {
+    /// The leader's current term at confirmation time.
+    pub term: Term,
+    /// The safe commit index: the caller must wait until
+    /// `last_applied >= read_index` before executing the read.
+    /// `0` indicates the responder is not the leader and the request was
+    /// rejected — the caller should retry after locating the current leader.
+    pub read_index: LogIndex,
 }
 
 #[cfg(test)]
