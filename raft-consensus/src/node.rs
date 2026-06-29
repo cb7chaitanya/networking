@@ -155,6 +155,14 @@ pub struct RaftNode<S: Storage = MemoryStorage, L: RaftLog = InMemoryLog> {
     /// Entries that have been committed and applied, ready for the caller.
     applied: Vec<ApplyResult>,
 
+    // ── Snapshot tracking ──
+    /// Index of the last log entry covered by the most recently installed
+    /// snapshot. Zero if no snapshot has been installed on this node.
+    pub snapshot_index: LogIndex,
+    /// Term of the entry at `snapshot_index`. Zero if no snapshot has been
+    /// installed.
+    pub snapshot_term: Term,
+
     // ── Leader tracking ──
     /// Who we believe the current leader is. Set when receiving a valid
     /// AppendEntries, cleared on term changes. Useful for client redirects.
@@ -193,6 +201,8 @@ impl RaftNode<MemoryStorage, InMemoryLog> {
             election_timer: Timer::new(election_timeout),
             heartbeat_timer: Timer::new(config.heartbeat_interval),
             config,
+            snapshot_index: 0,
+            snapshot_term: 0,
             current_leader: None,
             pre_vote_responses: HashSet::new(),
             outbox: Vec::new(),
@@ -228,6 +238,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             election_timer: Timer::new(election_timeout),
             heartbeat_timer: Timer::new(config.heartbeat_interval),
             config,
+            snapshot_index: 0,
+            snapshot_term: 0,
             current_leader: None,
             pre_vote_responses: HashSet::new(),
             outbox: Vec::new(),
@@ -238,13 +250,20 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
     /// Restore a node from persisted storage after a crash.
     ///
-    /// Loads `current_term`, `voted_for`, and the log from storage. The node
-    /// starts as a Follower (the safe default — it will discover the current
-    /// leader via heartbeats or start an election if no leader exists).
+    /// Recovery order:
     ///
-    /// Volatile state (`commit_index`, `last_applied`) is reset to 0. The node
-    /// will learn the current `commit_index` from the leader's next heartbeat
-    /// and re-apply committed entries.
+    /// 1. Load the snapshot (if any). `snapshot_index` and `snapshot_term` are
+    ///    set from it, and both `commit_index` and `last_applied` are advanced
+    ///    to `snapshot_index` — the state machine is considered fast-forwarded
+    ///    to the snapshot boundary without replaying those entries.
+    ///
+    /// 2. Replay only the log entries whose index is **greater than**
+    ///    `snapshot_index`. Entries at or before the snapshot are already
+    ///    reflected in the snapshot state and must not be re-applied.
+    ///
+    /// 3. The node starts as a Follower regardless of its previous role. It
+    ///    will discover the current leader via heartbeats or start a new
+    ///    election if none exists.
     pub fn restore(
         id: NodeId,
         peers: Vec<NodeId>,
@@ -254,8 +273,17 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     ) -> std::result::Result<Self, crate::storage::StorageError> {
         let hard_state = storage.load_state()?;
 
-        // Replay persisted log into the in-memory log.
-        for entry in &hard_state.log {
+        // Step 1: load snapshot and derive the snapshot boundary.
+        let (snapshot_index, snapshot_term) = match storage.load_snapshot()? {
+            Some(snap) => (snap.last_included_index, snap.last_included_term),
+            None => (0, 0),
+        };
+
+        // Step 2: replay only log entries after the snapshot boundary.
+        // Entries at positions 0..snapshot_index (1-based indices 1..=snapshot_index)
+        // are already covered by the snapshot and must be skipped.
+        let skip = snapshot_index as usize;
+        for entry in hard_state.log.iter().skip(skip) {
             log.append(entry.clone());
         }
 
@@ -273,12 +301,20 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                 current_term: hard_state.current_term,
                 voted_for: hard_state.voted_for,
             },
-            volatile: VolatileState::new(), // reset on crash recovery
+            // Step 3: volatile state starts at the snapshot boundary, not zero.
+            // The state machine is already at snapshot_index; anything below
+            // that does not need to be re-applied.
+            volatile: VolatileState {
+                commit_index: snapshot_index,
+                last_applied: snapshot_index,
+            },
             log,
             storage,
             election_timer: Timer::new(election_timeout),
             heartbeat_timer: Timer::new(config.heartbeat_interval),
             config,
+            snapshot_index,
+            snapshot_term,
             current_leader: None,
             pre_vote_responses: HashSet::new(),
             outbox: Vec::new(),
@@ -1281,6 +1317,18 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     /// Returns the last applied index.
     pub fn last_applied(&self) -> LogIndex {
         self.volatile.last_applied
+    }
+
+    /// Returns the index of the last entry covered by the installed snapshot,
+    /// or 0 if no snapshot has been installed.
+    pub fn snapshot_index(&self) -> LogIndex {
+        self.snapshot_index
+    }
+
+    /// Returns the term of the last entry covered by the installed snapshot,
+    /// or 0 if no snapshot has been installed.
+    pub fn snapshot_term(&self) -> Term {
+        self.snapshot_term
     }
 
     /// Returns true if this node is the leader.
@@ -5037,6 +5085,110 @@ mod tests {
         assert_eq!(restored.current_term(), 0);
         assert_eq!(restored.voted_for(), None);
         assert_eq!(restored.log.last_index(), 0);
+    }
+
+    // ── Snapshot-aware restore tests ──
+
+    use crate::storage::Snapshot;
+
+    #[test]
+    fn restore_no_snapshot_leaves_indices_at_zero() {
+        // Storage has log entries but no snapshot.
+        let mut storage = MS::new();
+        storage.save_term(2).unwrap();
+        for i in 1u8..=4 {
+            storage.append_log_entry(LogEntry { term: 1, data: vec![i] }).unwrap();
+        }
+
+        let restored = RaftNode::restore(
+            1,
+            vec![2, 3],
+            default_config(),
+            storage,
+            InMemoryLog::new(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.snapshot_index(), 0);
+        assert_eq!(restored.snapshot_term(), 0);
+        assert_eq!(restored.commit_index(), 0);
+        assert_eq!(restored.last_applied(), 0);
+        // All four entries are still replayed.
+        assert_eq!(restored.log.last_index(), 4);
+    }
+
+    #[test]
+    fn restore_from_snapshot_only() {
+        // Storage has a snapshot but no trailing log entries. This is the
+        // common case right after a snapshot is taken and the log prefix is
+        // discarded — the node fast-forwards its state machine to the
+        // snapshot boundary without replaying any log entries.
+        let mut storage = MS::new();
+        storage.save_term(3).unwrap();
+        storage.save_snapshot(&Snapshot {
+            last_included_index: 10,
+            last_included_term: 2,
+            data: vec![0xCA, 0xFE],
+        }).unwrap();
+        // No log entries — they were truncated after the snapshot was taken.
+
+        let restored = RaftNode::restore(
+            1,
+            vec![2, 3],
+            default_config(),
+            storage,
+            InMemoryLog::new(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.snapshot_index(), 10);
+        assert_eq!(restored.snapshot_term(), 2);
+        // Volatile state is advanced to the snapshot boundary.
+        assert_eq!(restored.commit_index(), 10);
+        assert_eq!(restored.last_applied(), 10);
+        // No log entries to replay.
+        assert_eq!(restored.log.last_index(), 0);
+        // Hard state is also recovered.
+        assert_eq!(restored.current_term(), 3);
+    }
+
+    #[test]
+    fn restore_snapshot_with_log_tail() {
+        // Storage has a snapshot at index 5, plus three entries written after
+        // the snapshot. Entries 1-5 (covered by the snapshot) are still in
+        // HardState.log as they haven't been truncated yet; restore() must
+        // skip them and replay only indices 6-8.
+        let mut storage = MS::new();
+        storage.save_term(4).unwrap();
+        storage.save_snapshot(&Snapshot {
+            last_included_index: 5,
+            last_included_term: 2,
+            data: vec![1, 2, 3],
+        }).unwrap();
+        // Simulate full log: entries 1-5 (covered) + entries 6-8 (tail).
+        for i in 1u8..=8 {
+            storage.append_log_entry(LogEntry { term: if i <= 5 { 2 } else { 3 }, data: vec![i] }).unwrap();
+        }
+
+        let restored = RaftNode::restore(
+            1,
+            vec![2, 3],
+            default_config(),
+            storage,
+            InMemoryLog::new(),
+        )
+        .unwrap();
+
+        assert_eq!(restored.snapshot_index(), 5);
+        assert_eq!(restored.snapshot_term(), 2);
+        // commit_index and last_applied are at the snapshot boundary.
+        assert_eq!(restored.commit_index(), 5);
+        assert_eq!(restored.last_applied(), 5);
+        // Only the three tail entries were replayed into the in-memory log.
+        assert_eq!(restored.log.last_index(), 3);
+        assert_eq!(restored.log.get(1).unwrap().data, vec![6]);
+        assert_eq!(restored.log.get(2).unwrap().data, vec![7]);
+        assert_eq!(restored.log.get(3).unwrap().data, vec![8]);
     }
 
     #[test]
