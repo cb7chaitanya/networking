@@ -8,3 +8,4 @@ description = "Raft consensus algorithm implemented from scratch in Rust"
 serde = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
+serde_json = "1"

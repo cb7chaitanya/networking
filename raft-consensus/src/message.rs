@@ -53,6 +53,8 @@ pub enum Rpc {
     AppendEntriesResponse(AppendEntriesReply),
     PreVote(PreVoteArgs),
     PreVoteResponse(PreVoteReply),
+    InstallSnapshot(InstallSnapshotArgs),
+    InstallSnapshotResponse(InstallSnapshotReply),
 }
 
 impl Rpc {
@@ -65,6 +67,8 @@ impl Rpc {
             Rpc::AppendEntriesResponse(reply) => reply.term,
             Rpc::PreVote(args) => args.term,
             Rpc::PreVoteResponse(reply) => reply.term,
+            Rpc::InstallSnapshot(args) => args.term,
+            Rpc::InstallSnapshotResponse(reply) => reply.term,
         }
     }
 }
@@ -202,4 +206,278 @@ pub struct PreVoteReply {
     pub term: Term,
     /// True if the responder would grant a real vote.
     pub vote_granted: bool,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  InstallSnapshot RPC (§7)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Sent by the leader to bring a lagging follower up to date via a snapshot.
+///
+/// Raft snapshots can be large, so the protocol supports **chunked transfer**:
+/// the leader splits the snapshot data into chunks and sends each chunk as a
+/// separate `InstallSnapshot` RPC. `offset` gives each chunk's byte position
+/// within the complete snapshot, and `done` marks the final chunk.
+///
+/// The receiving follower buffers chunks keyed by `offset` and, once `done`
+/// is seen, assembles and installs the snapshot. Any existing log entries up
+/// through `last_included_index` are then discarded.
+///
+/// Wire layout (see `wire` module):
+/// ```text
+/// [term: u64] [leader_id: u64] [last_included_index: u64] [last_included_term: u64]
+/// [offset: u64] [data_len: u32] [data: bytes] [done: u8]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallSnapshotArgs {
+    /// The leader's current term.
+    pub term: Term,
+    /// The leader's node ID, so the follower can redirect clients.
+    pub leader_id: NodeId,
+    /// Index of the last log entry covered by this snapshot. After installing
+    /// the snapshot, the follower discards all log entries up to and including
+    /// this index.
+    pub last_included_index: LogIndex,
+    /// Term of the entry at `last_included_index`. Used to satisfy AppendEntries
+    /// log-consistency checks that probe the snapshot boundary.
+    pub last_included_term: Term,
+    /// Byte offset of this chunk within the complete snapshot.
+    /// Zero for the first (or only) chunk.
+    pub offset: u64,
+    /// Raw snapshot bytes for this chunk.
+    pub data: Vec<u8>,
+    /// `true` if this is the final chunk of the snapshot.
+    pub done: bool,
+}
+
+/// Response to an `InstallSnapshot` RPC.
+///
+/// The follower sends its current term so the leader can step down if it has
+/// become stale.
+///
+/// Wire layout:
+/// ```text
+/// [term: u64]
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstallSnapshotReply {
+    /// The responder's current term, for the leader to update itself if stale.
+    pub term: Term,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Helpers ──
+
+    fn make_args(done: bool, offset: u64, data: Vec<u8>) -> InstallSnapshotArgs {
+        InstallSnapshotArgs {
+            term: 5,
+            leader_id: 1,
+            last_included_index: 42,
+            last_included_term: 3,
+            offset,
+            data,
+            done,
+        }
+    }
+
+    // ── InstallSnapshotArgs: field correctness ──
+
+    #[test]
+    fn install_snapshot_args_fields_preserved() {
+        let args = InstallSnapshotArgs {
+            term: 7,
+            leader_id: 2,
+            last_included_index: 100,
+            last_included_term: 6,
+            offset: 0,
+            data: vec![1, 2, 3],
+            done: true,
+        };
+        assert_eq!(args.term, 7);
+        assert_eq!(args.leader_id, 2);
+        assert_eq!(args.last_included_index, 100);
+        assert_eq!(args.last_included_term, 6);
+        assert_eq!(args.offset, 0);
+        assert_eq!(args.data, vec![1, 2, 3]);
+        assert!(args.done);
+    }
+
+    #[test]
+    fn install_snapshot_args_done_false() {
+        let args = make_args(false, 0, vec![0xAB]);
+        assert!(!args.done);
+    }
+
+    #[test]
+    fn install_snapshot_args_non_zero_offset() {
+        let args = make_args(false, 4096, vec![0u8; 16]);
+        assert_eq!(args.offset, 4096);
+        assert_eq!(args.data.len(), 16);
+    }
+
+    #[test]
+    fn install_snapshot_args_empty_data() {
+        let args = make_args(true, 0, vec![]);
+        assert!(args.data.is_empty());
+    }
+
+    // ── InstallSnapshotReply: field correctness ──
+
+    #[test]
+    fn install_snapshot_reply_field_preserved() {
+        let reply = InstallSnapshotReply { term: 9 };
+        assert_eq!(reply.term, 9);
+    }
+
+    // ── Rpc::term() for new variants ──
+
+    #[test]
+    fn rpc_term_install_snapshot() {
+        let rpc = Rpc::InstallSnapshot(make_args(true, 0, vec![]));
+        assert_eq!(rpc.term(), 5);
+    }
+
+    #[test]
+    fn rpc_term_install_snapshot_response() {
+        let rpc = Rpc::InstallSnapshotResponse(InstallSnapshotReply { term: 12 });
+        assert_eq!(rpc.term(), 12);
+    }
+
+    // ── Envelope::term() for new variants ──
+
+    #[test]
+    fn envelope_term_install_snapshot() {
+        let env = Envelope {
+            from: 1,
+            to: 2,
+            payload: Rpc::InstallSnapshot(make_args(true, 0, vec![])),
+        };
+        assert_eq!(env.term(), 5);
+    }
+
+    #[test]
+    fn envelope_term_install_snapshot_response() {
+        let env = Envelope {
+            from: 2,
+            to: 1,
+            payload: Rpc::InstallSnapshotResponse(InstallSnapshotReply { term: 8 }),
+        };
+        assert_eq!(env.term(), 8);
+    }
+
+    // ── Serde roundtrips ──
+
+    #[test]
+    fn install_snapshot_args_serde_roundtrip() {
+        let args = InstallSnapshotArgs {
+            term: 5,
+            leader_id: 1,
+            last_included_index: 42,
+            last_included_term: 3,
+            offset: 1024,
+            data: vec![10, 20, 30],
+            done: false,
+        };
+        let json = serde_json::to_string(&args).unwrap();
+        let decoded: InstallSnapshotArgs = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, args);
+    }
+
+    #[test]
+    fn install_snapshot_args_done_flag_serde_roundtrip() {
+        for done in [true, false] {
+            let args = make_args(done, 0, vec![1]);
+            let json = serde_json::to_string(&args).unwrap();
+            let decoded: InstallSnapshotArgs = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.done, done);
+        }
+    }
+
+    #[test]
+    fn install_snapshot_args_empty_data_serde_roundtrip() {
+        let args = make_args(true, 0, vec![]);
+        let json = serde_json::to_string(&args).unwrap();
+        let decoded: InstallSnapshotArgs = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, args);
+    }
+
+    #[test]
+    fn install_snapshot_args_large_offset_serde_roundtrip() {
+        let args = make_args(false, u64::MAX, vec![0xFF]);
+        let json = serde_json::to_string(&args).unwrap();
+        let decoded: InstallSnapshotArgs = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.offset, u64::MAX);
+    }
+
+    #[test]
+    fn install_snapshot_reply_serde_roundtrip() {
+        let reply = InstallSnapshotReply { term: 99 };
+        let json = serde_json::to_string(&reply).unwrap();
+        let decoded: InstallSnapshotReply = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, reply);
+    }
+
+    #[test]
+    fn rpc_install_snapshot_serde_roundtrip() {
+        let rpc = Rpc::InstallSnapshot(InstallSnapshotArgs {
+            term: 4,
+            leader_id: 3,
+            last_included_index: 50,
+            last_included_term: 2,
+            offset: 0,
+            data: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            done: true,
+        });
+        let json = serde_json::to_string(&rpc).unwrap();
+        let decoded: Rpc = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.term(), 4);
+        if let Rpc::InstallSnapshot(args) = decoded {
+            assert_eq!(args.last_included_index, 50);
+            assert_eq!(args.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            assert!(args.done);
+        } else {
+            panic!("expected InstallSnapshot variant");
+        }
+    }
+
+    #[test]
+    fn rpc_install_snapshot_response_serde_roundtrip() {
+        let rpc = Rpc::InstallSnapshotResponse(InstallSnapshotReply { term: 7 });
+        let json = serde_json::to_string(&rpc).unwrap();
+        let decoded: Rpc = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.term(), 7);
+        assert!(matches!(decoded, Rpc::InstallSnapshotResponse(_)));
+    }
+
+    // ── Backward-compatibility: existing variants still serialize correctly ──
+
+    #[test]
+    fn existing_rpc_variants_still_round_trip_via_serde() {
+        let variants: Vec<Rpc> = vec![
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1, candidate_id: 1, last_log_index: 0, last_log_term: 0,
+            }),
+            Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: true }),
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1, leader_id: 1, prev_log_index: 0, prev_log_term: 0,
+                entries: vec![], leader_commit: 0,
+            }),
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1, success: true, match_index: 0,
+            }),
+            Rpc::PreVote(PreVoteArgs {
+                term: 2, candidate_id: 2, last_log_index: 1, last_log_term: 1,
+            }),
+            Rpc::PreVoteResponse(PreVoteReply { term: 2, vote_granted: false }),
+        ];
+        for rpc in variants {
+            let term = rpc.term();
+            let json = serde_json::to_string(&rpc).unwrap();
+            let decoded: Rpc = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.term(), term);
+        }
+    }
 }
