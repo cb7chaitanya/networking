@@ -32,7 +32,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::log::{InMemoryLog, RaftLog};
+use crate::log::{Command, InMemoryLog, RaftLog};
 use crate::message::Envelope;
 use crate::node::{ApplyResult, ClusterConfig, RaftNode};
 use crate::state::NodeId;
@@ -434,6 +434,82 @@ impl Simulator {
             .unwrap_or_else(|| panic!("node {node_id} is not alive"));
         node.compact(last_included_index)
             .expect("compact should not fail with MemoryStorage");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Membership changes (joint consensus)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Add `new_id` to the cluster via joint consensus.
+    ///
+    /// Creates a new `RaftNode` for `new_id` (with the current cluster as its
+    /// initial peer list) and proposes `Command::AddNode(new_id)` to the current
+    /// leader.  The simulator begins routing messages to `new_id` immediately so
+    /// the leader can replicate existing entries to it during the joint phase.
+    ///
+    /// Returns `true` if the entry was accepted (a leader exists and is alive).
+    /// Call `stabilize()` after this to let the joint phase complete.
+    pub fn add_node(&mut self, new_id: NodeId) -> bool {
+        assert!(
+            !self.nodes.contains_key(&new_id) && !self.all_ids.contains(&new_id),
+            "node {new_id} is already in the cluster"
+        );
+
+        // Create the new node with the full current membership as its initial
+        // peer list so it has the correct voter set once the AddNode entry
+        // commits and finalises.
+        let peers: Vec<NodeId> = self.all_ids.clone();
+        self.all_ids.push(new_id);
+        let node = RaftNode::new(new_id, peers, self.config.clone());
+        self.nodes.insert(new_id, node);
+
+        // Propose AddNode to the leader; the leader's joint-consensus machinery
+        // will start replicating to new_id immediately after appending.
+        let leader_id = match self.leader() {
+            Some(id) => id,
+            None => return false,
+        };
+        if let Some(leader) = self.nodes.get_mut(&leader_id) {
+            leader.append_entry(Command::AddNode(new_id)).is_some()
+        } else {
+            false
+        }
+    }
+
+    /// Remove `remove_id` from the cluster via joint consensus.
+    ///
+    /// Proposes `Command::RemoveNode(remove_id)` to the current leader.
+    /// The removed node remains alive and reachable until `eject_node()` is
+    /// called; it will step down to follower once the config change commits
+    /// (if it was the leader).
+    ///
+    /// Returns `true` if the entry was accepted.
+    pub fn remove_node(&mut self, remove_id: NodeId) -> bool {
+        let leader_id = match self.leader() {
+            Some(id) => id,
+            None => return false,
+        };
+        if let Some(leader) = self.nodes.get_mut(&leader_id) {
+            leader.append_entry(Command::RemoveNode(remove_id)).is_some()
+        } else {
+            false
+        }
+    }
+
+    /// Permanently eject `node_id` from the simulator after the membership
+    /// change has committed.  Removes the node from the live set, discards its
+    /// saved storage, removes it from `all_ids`, and drops any in-flight
+    /// messages addressed to it.
+    ///
+    /// This is a cleanup step — call it only after the RemoveNode config entry
+    /// has committed and the cluster has stabilized without the node.
+    pub fn eject_node(&mut self, node_id: NodeId) {
+        self.nodes.remove(&node_id);
+        self.saved_storage.remove(&node_id);
+        self.all_ids.retain(|&id| id != node_id);
+        self.in_flight.retain(|msg| msg.envelope.to != node_id);
+        // Clear any partitions involving this node.
+        self.partitions.retain(|&(a, b)| a != node_id && b != node_id);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1089,6 +1165,187 @@ mod tests {
             "node 3 snapshot_index={}, expected >= {commit}",
             sim.node(3).snapshot_index()
         );
+
+        sim.assert_logs_consistent();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Joint-consensus / membership change tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Adding a new follower mid-cluster: the new node must catch up to the
+    /// full committed log through the normal AppendEntries path once the
+    /// joint-consensus entry is replicated and committed.
+    #[test]
+    fn add_follower_joins_and_replicates() {
+        let mut sim = Simulator::new(3, test_config(), 1);
+        sim.elect(1);
+
+        // Replicate some entries before the join so the new node has to catch up.
+        sim.propose(vec![10]);
+        sim.propose(vec![20]);
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        let pre_join_commit = sim.node(1).commit_index();
+        assert!(pre_join_commit >= 3, "noop + 2 entries should be committed");
+
+        // Add node 4 to the cluster.
+        let accepted = sim.add_node(4);
+        assert!(accepted, "leader should accept the AddNode proposal");
+
+        // Let the joint phase complete: leader replicates AddNode(4) to
+        // nodes 2 and 3 (old majority = 2/3 ✓, new majority = 3/4: need {1,2,3}
+        // or {1,2,4} or {1,3,4} — with node 4 lagging, {1,2,3} works ✓).
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        // Node 4 must be live and part of the cluster.
+        assert!(sim.is_alive(4));
+        assert!(sim.node(4).voters().contains(&4), "node 4 should see itself as a voter");
+
+        // Node 4 must have caught up to at least the pre-join committed entries.
+        let n4_commit = sim.node(4).commit_index();
+        assert!(
+            n4_commit >= pre_join_commit,
+            "node 4 commit_index={n4_commit} must be >= {pre_join_commit}"
+        );
+
+        // All four nodes must agree on committed entries.
+        sim.assert_logs_consistent();
+    }
+
+    /// Removing the leader via joint consensus: the leader proposes its own
+    /// removal, the config entry commits (requiring both old and new majority),
+    /// the leader steps down, and the remaining nodes elect a new leader.
+    #[test]
+    fn remove_leader_steps_down_and_new_leader_elected() {
+        let mut sim = Simulator::new(3, test_config(), 1);
+        sim.elect(1);
+
+        // Commit a normal entry so the cluster is healthy.
+        sim.propose(vec![42]);
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        let old_commit = sim.node(1).commit_index();
+        let old_term = sim.node(1).current_term();
+
+        // Leader 1 proposes its own removal.
+        // Old = {1,2,3} (need 2/3). New = {2,3} (need 2/2).
+        // Both nodes 2 and 3 must ack for it to commit.
+        let accepted = sim.remove_node(1);
+        assert!(accepted);
+
+        // Stabilize for the joint-consensus commit + step-down.
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        // Node 1 must have stepped down.
+        assert!(
+            !sim.node(1).is_leader(),
+            "removed leader must not remain leader"
+        );
+
+        // Nodes 2 and 3 should elect a new leader after node 1 steps down.
+        // Tick past election timeout if needed.
+        sim.tick(25);
+        sim.stabilize();
+
+        let new_leader = sim.assert_one_leader();
+        assert_ne!(new_leader, 1, "new leader must not be the removed node");
+        assert!(
+            sim.node(new_leader).current_term() > old_term,
+            "new leader must be in a higher term"
+        );
+
+        // Config on the new leader must no longer include node 1.
+        assert!(
+            !sim.node(new_leader).voters().contains(&1),
+            "removed node 1 must not be in the new config"
+        );
+        assert!(
+            sim.node(new_leader).voters().contains(&new_leader),
+            "new leader must be in its own config"
+        );
+
+        // Commit one more entry to prove the cluster still works.
+        let idx = sim.node_mut(new_leader).propose(vec![99]);
+        assert!(idx, "new leader should accept proposals");
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        assert!(
+            sim.node(new_leader).commit_index() > old_commit,
+            "cluster should make progress after leader removal"
+        );
+
+        // Eject node 1 from the simulator, then verify consistency.
+        sim.eject_node(1);
+        sim.assert_logs_consistent();
+    }
+
+    /// Leader crash during a joint-consensus transition: a new leader is elected
+    /// and must commit the in-progress AddNode entry, bringing the new node into
+    /// the stable config.
+    #[test]
+    fn leader_change_during_joint_transition() {
+        let mut sim = Simulator::new(3, test_config(), 1);
+        sim.elect(1);
+
+        sim.propose(vec![10]);
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        // Start adding node 4: leader 1 appends AddNode(4) and replicates to 2,3,4.
+        let accepted = sim.add_node(4);
+        assert!(accepted);
+
+        // Stabilize enough that nodes 2, 3, and 4 all have the AddNode entry,
+        // so they can participate in an election under the joint config.
+        sim.stabilize();
+
+        // Crash node 1 (the leader) while the AddNode entry may not yet be committed.
+        sim.crash(1);
+        assert!(!sim.is_alive(1));
+
+        // Tick past election timeout so a new leader is elected among {2, 3, 4}.
+        // Under joint config: old = {1,2,3} (need 2/3), new = {1,2,3,4} (need 3/4).
+        // With node 1 crashed, nodes {2, 3, 4} can satisfy old (2/3 ✓) and new
+        // (3/4 ✓) once all three vote for the same candidate.
+        sim.tick(25);
+        sim.stabilize();
+
+        let new_leader = sim.assert_one_leader();
+        assert_ne!(new_leader, 1, "new leader must not be the crashed node");
+
+        // The new leader must commit the AddNode(4) entry from its log and finalise.
+        // Give it a few heartbeat rounds.
+        sim.tick(10);
+        sim.stabilize();
+
+        // Node 4 must be in the cluster's voter set.
+        let voters = sim.node(new_leader).voters().clone();
+        assert!(
+            voters.contains(&4),
+            "AddNode(4) must be committed and finalised; voters={:?}",
+            voters
+        );
+
+        // Commit a fresh entry to prove the cluster is healthy.
+        let proposed = sim.node_mut(new_leader).propose(vec![99]);
+        assert!(proposed);
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        assert!(sim.node(new_leader).commit_index() > 0);
 
         sim.assert_logs_consistent();
     }

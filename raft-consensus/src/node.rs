@@ -518,7 +518,14 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     /// This is the public entry point for triggering elections. The simulator
     /// or test harness can call this directly instead of waiting for the
     /// election timer to expire.
+    ///
+    /// A node that has been removed from the cluster (its own ID is no longer
+    /// in the voter set) must not start elections — it could disrupt the
+    /// remaining cluster by winning with a higher term and fresher log.
     pub fn start_election(&mut self) {
+        if !self.membership.voters.contains(&self.id) {
+            return;
+        }
         if self.config.pre_vote {
             self.start_pre_vote();
         } else {
@@ -1370,6 +1377,12 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             // Drop tracking for nodes no longer in the cluster.
             next_index.retain(|id, _| new_voters.contains(id));
             match_index.retain(|id, _| new_voters.contains(id));
+        }
+
+        // §6: if the removed leader discovers it is no longer in the new config,
+        // it steps down immediately after the config entry commits.
+        if !new_voters.contains(&self.id) {
+            self.become_follower();
         }
     }
 
