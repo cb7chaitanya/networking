@@ -95,6 +95,57 @@ impl Default for HardState {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+//  Snapshot
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Lightweight snapshot header — index and term without the data blob.
+///
+/// Useful for deciding whether an incoming snapshot is newer than the one
+/// already held, without deserializing the full application state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMetadata {
+    /// Index of the last log entry covered by this snapshot.
+    pub last_included_index: LogIndex,
+    /// Term of the last log entry covered by this snapshot.
+    pub last_included_term: Term,
+}
+
+/// A point-in-time snapshot of the application state machine.
+///
+/// Snapshots compress the Raft log: once a prefix of log entries has been
+/// applied, that prefix can be replaced by the resulting state. Any follower
+/// that has fallen too far behind receives the snapshot directly via
+/// `InstallSnapshot` (not yet implemented — this module covers storage only).
+///
+/// The `data` field is opaque to the Raft layer; the application owns its
+/// serialization format.
+///
+/// Invariant: `last_included_index >= 1` (a snapshot always covers at least
+/// one applied entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Index of the last log entry included in this snapshot. Log entries up
+    /// to and including this index can be discarded after the snapshot is
+    /// durably saved.
+    pub last_included_index: LogIndex,
+    /// Term of the last log entry included in this snapshot. Needed to answer
+    /// AppendEntries consistency checks that probe the snapshot boundary.
+    pub last_included_term: Term,
+    /// Serialized application state. The Raft layer never inspects this.
+    pub data: Vec<u8>,
+}
+
+impl Snapshot {
+    /// Return lightweight metadata without cloning the data blob.
+    pub fn metadata(&self) -> SnapshotMetadata {
+        SnapshotMetadata {
+            last_included_index: self.last_included_index,
+            last_included_term: self.last_included_term,
+        }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 //  Storage trait
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -159,6 +210,25 @@ pub trait Storage {
     /// Returns `HardState` with term, vote, and log. A fresh node (no prior
     /// persisted data) returns `HardState::default()`.
     fn load_state(&self) -> Result<HardState>;
+
+    // ── Snapshot ──
+
+    /// Persist a snapshot. Overwrites any previously saved snapshot.
+    ///
+    /// Must be durable before returning. A disk backend would write the data
+    /// atomically (e.g., write-then-rename) so a partial write can never
+    /// replace a good snapshot.
+    ///
+    /// After this returns, log entries up to `snapshot.last_included_index`
+    /// may be discarded. The caller is responsible for calling
+    /// `truncate_log()` at the appropriate time.
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<()>;
+
+    /// Load the most recently saved snapshot, or `None` if none exists.
+    ///
+    /// Called during node restore so the state machine can be fast-forwarded
+    /// to the snapshot before replaying any remaining log entries.
+    fn load_snapshot(&self) -> Result<Option<Snapshot>>;
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -178,6 +248,7 @@ pub struct MemoryStorage {
     current_term: Term,
     voted_for: Option<NodeId>,
     log: Vec<LogEntry>,
+    snapshot: Option<Snapshot>,
 }
 
 impl MemoryStorage {
@@ -186,6 +257,7 @@ impl MemoryStorage {
             current_term: 0,
             voted_for: None,
             log: Vec::new(),
+            snapshot: None,
         }
     }
 
@@ -196,6 +268,7 @@ impl MemoryStorage {
             current_term: state.current_term,
             voted_for: state.voted_for,
             log: state.log,
+            snapshot: None,
         }
     }
 }
@@ -240,6 +313,15 @@ impl Storage for MemoryStorage {
             log: self.log.clone(),
         })
     }
+
+    fn save_snapshot(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.snapshot = Some(snapshot.clone());
+        Ok(())
+    }
+
+    fn load_snapshot(&self) -> Result<Option<Snapshot>> {
+        Ok(self.snapshot.clone())
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -269,6 +351,14 @@ impl Storage for FailingStorage {
     }
 
     fn load_state(&self) -> Result<HardState> {
+        Err(StorageError::Io("simulated disk failure".into()))
+    }
+
+    fn save_snapshot(&mut self, _snapshot: &Snapshot) -> Result<()> {
+        Err(StorageError::Io("simulated disk failure".into()))
+    }
+
+    fn load_snapshot(&self) -> Result<Option<Snapshot>> {
         Err(StorageError::Io("simulated disk failure".into()))
     }
 }
@@ -515,5 +605,228 @@ mod tests {
         assert!(storage.append_log_entry(make_entry(1, 0)).is_err());
         assert!(storage.truncate_log(1).is_err());
         assert!(storage.load_state().is_err());
+    }
+
+    // ── Snapshot helpers ──
+
+    fn make_snapshot(last_included_index: LogIndex, last_included_term: Term, data: u8) -> Snapshot {
+        Snapshot {
+            last_included_index,
+            last_included_term,
+            data: vec![data; 4],
+        }
+    }
+
+    // ── Snapshot: fresh storage ──
+
+    #[test]
+    fn fresh_storage_has_no_snapshot() {
+        let storage = MemoryStorage::new();
+        let snap = storage.load_snapshot().unwrap();
+        assert!(snap.is_none());
+    }
+
+    #[test]
+    fn from_hard_state_has_no_snapshot() {
+        let storage = MemoryStorage::from_hard_state(HardState {
+            current_term: 5,
+            voted_for: Some(1),
+            log: vec![make_entry(1, 0)],
+        });
+        // Snapshot is not part of HardState; must be saved separately.
+        assert!(storage.load_snapshot().unwrap().is_none());
+    }
+
+    // ── Snapshot: save and load ──
+
+    #[test]
+    fn save_and_load_snapshot_roundtrip() {
+        let mut storage = MemoryStorage::new();
+        let snap = make_snapshot(10, 2, 0xAB);
+        storage.save_snapshot(&snap).unwrap();
+
+        let loaded = storage.load_snapshot().unwrap().expect("snapshot should exist");
+        assert_eq!(loaded, snap);
+    }
+
+    #[test]
+    fn snapshot_fields_are_preserved() {
+        let mut storage = MemoryStorage::new();
+        let snap = Snapshot {
+            last_included_index: 42,
+            last_included_term: 7,
+            data: vec![1, 2, 3, 4, 5],
+        };
+        storage.save_snapshot(&snap).unwrap();
+
+        let loaded = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded.last_included_index, 42);
+        assert_eq!(loaded.last_included_term, 7);
+        assert_eq!(loaded.data, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn snapshot_with_empty_data() {
+        let mut storage = MemoryStorage::new();
+        let snap = Snapshot {
+            last_included_index: 1,
+            last_included_term: 1,
+            data: vec![],
+        };
+        storage.save_snapshot(&snap).unwrap();
+
+        let loaded = storage.load_snapshot().unwrap().unwrap();
+        assert!(loaded.data.is_empty());
+    }
+
+    // ── Snapshot: overwrite ──
+
+    #[test]
+    fn save_snapshot_overwrites_previous() {
+        let mut storage = MemoryStorage::new();
+        storage.save_snapshot(&make_snapshot(5, 1, 0x11)).unwrap();
+        storage.save_snapshot(&make_snapshot(20, 3, 0x22)).unwrap();
+
+        let loaded = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded.last_included_index, 20);
+        assert_eq!(loaded.last_included_term, 3);
+        assert_eq!(loaded.data, vec![0x22; 4]);
+    }
+
+    #[test]
+    fn multiple_saves_always_returns_latest() {
+        let mut storage = MemoryStorage::new();
+        for i in 1u64..=5 {
+            let snap = make_snapshot(i * 10, i, i as u8);
+            storage.save_snapshot(&snap).unwrap();
+        }
+        let loaded = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded.last_included_index, 50);
+        assert_eq!(loaded.last_included_term, 5);
+    }
+
+    // ── Snapshot: independence from log/term/vote ──
+
+    #[test]
+    fn snapshot_does_not_affect_log() {
+        let mut storage = MemoryStorage::new();
+        storage.append_log_entries(&[make_entry(1, 1), make_entry(1, 2)]).unwrap();
+        storage.save_snapshot(&make_snapshot(1, 1, 0)).unwrap();
+
+        // Log is unchanged after saving a snapshot.
+        let state = storage.load_state().unwrap();
+        assert_eq!(state.log.len(), 2);
+    }
+
+    #[test]
+    fn log_does_not_affect_snapshot() {
+        let mut storage = MemoryStorage::new();
+        storage.save_snapshot(&make_snapshot(5, 1, 0xFF)).unwrap();
+        storage.append_log_entry(make_entry(2, 99)).unwrap();
+
+        // Snapshot is unchanged after appending a log entry.
+        let loaded = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded.last_included_index, 5);
+    }
+
+    #[test]
+    fn snapshot_does_not_affect_term_or_vote() {
+        let mut storage = MemoryStorage::new();
+        storage.save_term(7).unwrap();
+        storage.save_vote(Some(3)).unwrap();
+        storage.save_snapshot(&make_snapshot(10, 3, 0)).unwrap();
+
+        let state = storage.load_state().unwrap();
+        assert_eq!(state.current_term, 7);
+        assert_eq!(state.voted_for, Some(3));
+    }
+
+    #[test]
+    fn term_and_vote_do_not_affect_snapshot() {
+        let mut storage = MemoryStorage::new();
+        storage.save_snapshot(&make_snapshot(8, 2, 0xBB)).unwrap();
+        storage.save_term(10).unwrap();
+        storage.save_vote(None).unwrap();
+
+        let loaded = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded.last_included_index, 8);
+        assert_eq!(loaded.last_included_term, 2);
+    }
+
+    // ── SnapshotMetadata ──
+
+    #[test]
+    fn metadata_matches_snapshot_fields() {
+        let snap = Snapshot {
+            last_included_index: 99,
+            last_included_term: 4,
+            data: vec![0u8; 1024],
+        };
+        let meta = snap.metadata();
+        assert_eq!(meta.last_included_index, snap.last_included_index);
+        assert_eq!(meta.last_included_term, snap.last_included_term);
+    }
+
+    #[test]
+    fn metadata_does_not_include_data() {
+        // SnapshotMetadata is cheap to copy — it contains only two u64 fields.
+        let snap = make_snapshot(7, 2, 0xCC);
+        let meta = snap.metadata();
+        // Verify the metadata struct only has the two index/term fields.
+        assert_eq!(meta, SnapshotMetadata { last_included_index: 7, last_included_term: 2 });
+    }
+
+    // ── Snapshot: full lifecycle ──
+
+    #[test]
+    fn snapshot_full_lifecycle() {
+        let mut storage = MemoryStorage::new();
+
+        // No snapshot on a fresh node.
+        assert!(storage.load_snapshot().unwrap().is_none());
+
+        // Append some log entries and set term/vote.
+        storage.save_term(1).unwrap();
+        storage.save_vote(Some(1)).unwrap();
+        storage.append_log_entries(&[
+            make_entry(1, 1),
+            make_entry(1, 2),
+            make_entry(1, 3),
+        ]).unwrap();
+
+        // Take a snapshot at index 2 (entries 1-2 are now covered).
+        let snap = Snapshot { last_included_index: 2, last_included_term: 1, data: vec![42] };
+        storage.save_snapshot(&snap).unwrap();
+
+        // Verify everything coexists correctly.
+        let loaded_snap = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(loaded_snap.last_included_index, 2);
+
+        let state = storage.load_state().unwrap();
+        assert_eq!(state.current_term, 1);
+        assert_eq!(state.log.len(), 3); // caller is responsible for truncating
+
+        // Newer snapshot replaces the old one.
+        let snap2 = Snapshot { last_included_index: 3, last_included_term: 1, data: vec![99] };
+        storage.save_snapshot(&snap2).unwrap();
+
+        let latest = storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(latest.last_included_index, 3);
+        assert_eq!(latest.data, vec![99]);
+    }
+
+    // ── FailingStorage: snapshot ──
+
+    #[test]
+    fn failing_storage_snapshot_save_fails() {
+        let mut storage = FailingStorage;
+        let snap = make_snapshot(1, 1, 0);
+        assert!(storage.save_snapshot(&snap).is_err());
+    }
+
+    #[test]
+    fn failing_storage_snapshot_load_fails() {
+        let storage = FailingStorage;
+        assert!(storage.load_snapshot().is_err());
     }
 }
