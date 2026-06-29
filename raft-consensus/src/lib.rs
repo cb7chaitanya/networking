@@ -1,6 +1,8 @@
 pub mod log;
 pub mod message;
+pub mod metrics;
 pub mod node;
+pub mod server;
 pub mod simulator;
 pub mod state;
 pub mod storage;

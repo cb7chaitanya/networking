@@ -25,9 +25,11 @@
 //!   will ever apply a different entry at that index.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use crate::log::{Command, InMemoryLog, LogEntry, RaftLog};
 use crate::message::*;
+use crate::metrics::RaftMetrics;
 use crate::state::*;
 use crate::storage::{MemoryStorage, Snapshot, Storage};
 
@@ -327,6 +329,11 @@ pub struct RaftNode<S: Storage = MemoryStorage, L: RaftLog = InMemoryLog> {
     /// target once it is fully caught up.
     transfer: Option<LeaderTransfer>,
 
+    // ── Metrics ──
+    /// Optional Prometheus metrics.  `None` = no-op (zero overhead).
+    /// Attach via `node.with_metrics(arc)` after construction.
+    metrics: Option<Arc<RaftMetrics>>,
+
     // ── RNG state ──
     /// Simple deterministic RNG for election timeout randomization.
     /// We use a basic LCG so the node has zero external dependencies.
@@ -365,6 +372,7 @@ impl RaftNode<MemoryStorage, InMemoryLog> {
             pending_reads: Vec::new(),
             ready_reads: Vec::new(),
             transfer: None,
+            metrics: None,
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id, // seed from node ID for determinism
@@ -409,6 +417,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             pending_reads: Vec::new(),
             ready_reads: Vec::new(),
             transfer: None,
+            metrics: None,
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id,
@@ -491,6 +500,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             pending_reads: Vec::new(),
             ready_reads: Vec::new(),
             transfer: None,
+            metrics: None,
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id,
@@ -597,6 +607,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     pub fn start_election(&mut self) {
         if !self.membership.voters.contains(&self.id) {
             return;
+        }
+        if let Some(ref m) = self.metrics {
+            m.inc_elections();
         }
         if self.config.pre_vote {
             self.start_pre_vote();
@@ -730,6 +743,27 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // Candidate or no-leader: silently drop.
     }
 
+    /// Attach a metrics collector to this node.
+    ///
+    /// The node will update counters and gauges on every meaningful state
+    /// transition. Calling this is entirely optional — `None` means no
+    /// overhead.
+    ///
+    /// Designed for use as a builder method:
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use raft_consensus::metrics::RaftMetrics;
+    /// # use raft_consensus::node::{RaftNode, ClusterConfig};
+    /// let metrics = Arc::new(RaftMetrics::new());
+    /// let config = ClusterConfig { election_timeout_min: 10, election_timeout_max: 20,
+    ///                              heartbeat_interval: 5, pre_vote: false };
+    /// let node = RaftNode::new(1, vec![], config).with_metrics(Arc::clone(&metrics));
+    /// ```
+    pub fn with_metrics(mut self, metrics: Arc<RaftMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
     /// Initiate a graceful leadership transfer to `target` (Raft dissertation §3.10).
     ///
     /// The leader will:
@@ -849,6 +883,11 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // Step 1: increment term
         self.persistent.current_term += 1;
 
+        if let Some(ref m) = self.metrics {
+            m.set_current_term(self.persistent.current_term);
+            m.set_leader_id(0); // no leader during an election
+        }
+
         // Step 2: vote for self
         self.persistent.voted_for = Some(self.id);
         self.persist_state();
@@ -922,6 +961,10 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // We are the leader now.
         self.current_leader = Some(self.id);
 
+        if let Some(ref m) = self.metrics {
+            m.set_leader_id(self.id);
+        }
+
         // Reset heartbeat timer so we send heartbeats immediately.
         self.heartbeat_timer.reset(0);
 
@@ -965,6 +1008,12 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // We don't know who the leader is in this new term.
         self.current_leader = None;
         self.persist_state();
+
+        if let Some(ref m) = self.metrics {
+            m.set_current_term(new_term);
+            m.set_leader_id(0); // leader unknown after a term change
+        }
+
         self.become_follower();
     }
 
@@ -1078,6 +1127,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
         // Track who the current leader is (for client redirects).
         self.current_leader = Some(args.leader_id);
+        if let Some(ref m) = self.metrics {
+            m.set_leader_id(args.leader_id);
+        }
 
         // If we're a Candidate and receive a valid AppendEntries for our term,
         // the sender is the legitimate leader. Step down.
@@ -1255,6 +1307,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     fn handle_install_snapshot(&mut self, from: NodeId, args: InstallSnapshotArgs) {
         // Receiving a snapshot proves the leader is alive — suppress elections.
         self.current_leader = Some(from);
+        if let Some(ref m) = self.metrics {
+            m.set_leader_id(from);
+        }
         self.reset_election_timer();
 
         // Any role other than Follower must step down.  Candidates haven't
@@ -1330,6 +1385,10 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         }
         if last_included_index > self.volatile.last_applied {
             self.volatile.last_applied = last_included_index;
+        }
+        if let Some(ref m) = self.metrics {
+            m.set_commit_index(self.volatile.commit_index);
+            m.set_last_applied(self.volatile.last_applied);
         }
 
         self.send(
@@ -1452,6 +1511,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             // this requires majority of BOTH old and new voter sets.
             if self.membership.has_quorum(&confirmed) {
                 self.volatile.commit_index = n;
+                if let Some(ref m) = self.metrics {
+                    m.set_commit_index(n);
+                }
                 self.apply_committed_entries();
                 break; // found the highest committable index
             }
@@ -1486,6 +1548,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
                 self.applied.push(ApplyResult { index, term, data });
             }
+        }
+        if let Some(ref m) = self.metrics {
+            m.set_last_applied(self.volatile.last_applied);
         }
     }
 
@@ -1980,6 +2045,14 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
     /// Queue a message for outbound delivery.
     fn send(&mut self, to: NodeId, payload: Rpc) {
+        if let Some(ref m) = self.metrics {
+            match &payload {
+                Rpc::RequestVote(_)    => m.inc_vote_requests(),
+                Rpc::AppendEntries(_)  => m.inc_append_entries(),
+                Rpc::InstallSnapshot(_) => m.inc_snapshots_sent(),
+                _ => {}
+            }
+        }
         self.outbox.push(Envelope {
             from: self.id,
             to,
