@@ -226,6 +226,23 @@ struct PendingRead {
     reply_to: Option<NodeId>,
 }
 
+// ── Leadership transfer state ──
+
+/// Tracks an in-progress graceful leadership transfer (Raft dissertation §3.10).
+///
+/// While a transfer is active the leader:
+///   - Rejects new proposals so the target stays up to date.
+///   - Sends `TimeoutNow` to `target` once `match_index[target]` reaches the
+///     leader's `last_log_index`.
+///   - Aborts automatically if the deadline expires without the target winning.
+struct LeaderTransfer {
+    target: NodeId,
+    /// Countdown timer — transfer aborts when it reaches zero.
+    deadline: Timer,
+    /// True after we've already sent TimeoutNow; prevents duplicate sends.
+    timeout_now_sent: bool,
+}
+
 // ── RaftNode ──
 
 /// The core Raft state machine.
@@ -304,6 +321,12 @@ pub struct RaftNode<S: Storage = MemoryStorage, L: RaftLog = InMemoryLog> {
     /// The caller must wait for `last_applied >= read_index` before serving.
     ready_reads: Vec<ReadResult>,
 
+    // ── Leadership transfer state (§3.10) ──
+    /// Active graceful transfer. `None` when no transfer is in progress.
+    /// While set, new proposals are rejected and TimeoutNow is sent to the
+    /// target once it is fully caught up.
+    transfer: Option<LeaderTransfer>,
+
     // ── RNG state ──
     /// Simple deterministic RNG for election timeout randomization.
     /// We use a basic LCG so the node has zero external dependencies.
@@ -341,6 +364,7 @@ impl RaftNode<MemoryStorage, InMemoryLog> {
             pre_vote_responses: HashSet::new(),
             pending_reads: Vec::new(),
             ready_reads: Vec::new(),
+            transfer: None,
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id, // seed from node ID for determinism
@@ -384,6 +408,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             pre_vote_responses: HashSet::new(),
             pending_reads: Vec::new(),
             ready_reads: Vec::new(),
+            transfer: None,
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id,
@@ -465,6 +490,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             pre_vote_responses: HashSet::new(),
             pending_reads: Vec::new(),
             ready_reads: Vec::new(),
+            transfer: None,
             outbox: Vec::new(),
             applied: Vec::new(),
             rng_state: id,
@@ -545,6 +571,14 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                 if self.heartbeat_timer.is_expired() {
                     self.send_heartbeats();
                     self.heartbeat_timer.reset(self.config.heartbeat_interval);
+                }
+                // Advance the transfer deadline; abort if it elapses so the
+                // leader resumes accepting proposals.
+                if let Some(ref mut t) = self.transfer {
+                    t.deadline.tick(ticks);
+                }
+                if self.transfer.as_ref().map_or(false, |t| t.deadline.is_expired()) {
+                    self.transfer = None;
                 }
             }
         }
@@ -645,6 +679,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             Rpc::InstallSnapshotResponse(reply) => {
                 self.handle_install_snapshot_response(envelope.from, reply)
             }
+            Rpc::TimeoutNow(args) => self.handle_timeout_now(envelope.from, args),
         }
     }
 
@@ -695,10 +730,54 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // Candidate or no-leader: silently drop.
     }
 
+    /// Initiate a graceful leadership transfer to `target` (Raft dissertation §3.10).
+    ///
+    /// The leader will:
+    /// 1. Block new proposals while the transfer is in progress.
+    /// 2. Replicate its full log to `target`.
+    /// 3. Send `TimeoutNow` once `match_index[target] >= last_log_index`.
+    /// 4. Step down when the target starts an election (its RequestVote arrives
+    ///    with a higher term).
+    ///
+    /// If the transfer does not complete within `election_timeout_max` ticks the
+    /// leader aborts the transfer and resumes accepting proposals.
+    ///
+    /// Returns `false` if this node is not the leader or `target` is not a known
+    /// peer.
+    pub fn transfer_leadership(&mut self, target: NodeId) -> bool {
+        if !self.is_leader() {
+            return false;
+        }
+        let peer_known = match &self.role {
+            Role::Leader { ref next_index, .. } => next_index.contains_key(&target),
+            _ => false,
+        };
+        if !peer_known {
+            return false;
+        }
+
+        self.transfer = Some(LeaderTransfer {
+            target,
+            deadline: Timer::new(self.config.election_timeout_max),
+            timeout_now_sent: false,
+        });
+
+        // Trigger replication immediately so the target starts catching up.
+        self.replicate_to(target);
+        // If the target is already fully caught up, send TimeoutNow right away.
+        self.try_complete_transfer(target);
+        true
+    }
+
     /// Propose a new command (as raw bytes). Only the leader can accept
     /// proposals; returns false if this node is not the leader.
     pub fn propose(&mut self, data: Vec<u8>) -> bool {
         if !matches!(self.role, Role::Leader { .. }) {
+            return false;
+        }
+        // Block new proposals while a leadership transfer is in progress so the
+        // target's log doesn't fall behind after we send TimeoutNow.
+        if self.transfer.is_some() {
             return false;
         }
 
@@ -750,6 +829,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.role = Role::Follower;
         self.reset_election_timer();
         self.abort_pending_reads();
+        self.transfer = None;
     }
 
     /// Transition to Candidate and start an election.
@@ -1150,6 +1230,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             self.maybe_advance_commit_index();
             // Credit this acknowledgment to any pending linearizable reads.
             self.credit_read_ack(from);
+            // If a transfer is pending and this ack is from the target, check
+            // whether the target is now fully caught up.
+            self.try_complete_transfer(from);
         } else {
             // Backtrack using the match_index hint from the follower.
             // Guard: don't advance next_index on failure — only backtrack.
@@ -1544,6 +1627,60 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.pending_reads.clear();
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    //  Leadership transfer (Raft dissertation §3.10)
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Check whether the transfer target has caught up to our log tail and, if
+    /// so, send it `TimeoutNow`.  Called from `handle_append_entries_response`
+    /// (on success) and immediately after `transfer_leadership` (covers the
+    /// already-caught-up case without waiting for the next ack).
+    ///
+    /// `acker` is the peer whose ack we just processed.  We only act when it
+    /// matches the transfer target so we don't scan on every heartbeat ack.
+    fn try_complete_transfer(&mut self, acker: NodeId) {
+        // Quick guards to avoid any work on the common path.
+        let already_sent = match &self.transfer {
+            Some(t) if t.target == acker => t.timeout_now_sent,
+            _ => return,
+        };
+        if already_sent {
+            return;
+        }
+
+        let target = self.transfer.as_ref().unwrap().target;
+        let last = self.log.last_index();
+        let caught_up = match &self.role {
+            Role::Leader { ref match_index, .. } => {
+                match_index.get(&target).copied().unwrap_or(0) >= last
+            }
+            _ => false,
+        };
+
+        if caught_up {
+            let term = self.persistent.current_term;
+            let id = self.id;
+            self.send(target, Rpc::TimeoutNow(TimeoutNowArgs { term, leader_id: id }));
+            if let Some(ref mut t) = self.transfer {
+                t.timeout_now_sent = true;
+            }
+        }
+    }
+
+    /// Handle a `TimeoutNow` message from the leader.
+    ///
+    /// The leader sends this when it wants to transfer leadership to us — it
+    /// has already verified our log is fully up to date.  We bypass the
+    /// election timer and start an election immediately.
+    fn handle_timeout_now(&mut self, _from: NodeId, _args: TimeoutNowArgs) {
+        // Only act if we are a follower.  If we are already a candidate or
+        // leader there is nothing to do.
+        if !matches!(self.role, Role::Follower) {
+            return;
+        }
+        self.start_election();
+    }
+
     /// Handle a `ReadIndexRequest` from a follower (or from a local proxy).
     ///
     /// If we are the current leader we start a heartbeat quorum round and will
@@ -1728,6 +1865,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             // ReadIndex messages bypass the universal term check and are
             // dispatched before we reach this function — this arm is unreachable.
             Rpc::ReadIndexRequest(_) | Rpc::ReadIndexResponse(_) => {}
+            // Stale TimeoutNow is simply ignored — the sender is no longer the
+            // leader and we should not disrupt the current leader on its behalf.
+            Rpc::TimeoutNow(_) => {}
         }
     }
 

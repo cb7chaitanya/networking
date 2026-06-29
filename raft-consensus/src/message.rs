@@ -63,6 +63,11 @@ pub enum Rpc {
     /// quorum.  `read_index` is the commit index the caller must wait for;
     /// `0` means the leader rejected the request (it is no longer a leader).
     ReadIndexResponse(ReadIndexReply),
+    /// Sent by a leader to a target follower to initiate a leadership transfer
+    /// (Raft dissertation §3.10). The target ignores its election timer and
+    /// immediately starts an election. The leader only sends this after verifying
+    /// the target's log is fully up to date, guaranteeing the target will win.
+    TimeoutNow(TimeoutNowArgs),
 }
 
 impl Rpc {
@@ -79,6 +84,7 @@ impl Rpc {
             Rpc::InstallSnapshotResponse(reply) => reply.term,
             Rpc::ReadIndexRequest(args) => args.term,
             Rpc::ReadIndexResponse(reply) => reply.term,
+            Rpc::TimeoutNow(args) => args.term,
         }
     }
 }
@@ -308,6 +314,23 @@ pub struct ReadIndexReply {
     /// `0` indicates the responder is not the leader and the request was
     /// rejected — the caller should retry after locating the current leader.
     pub read_index: LogIndex,
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TimeoutNow RPC (Raft dissertation §3.10 — leadership transfer)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// Sent by a leader to initiate a graceful leadership transfer.
+///
+/// The leader sends this only after the target follower's log is fully
+/// replicated (`match_index[target] >= last_log_index`), so the target is
+/// guaranteed to win the subsequent election.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutNowArgs {
+    /// The leader's current term.
+    pub term: Term,
+    /// The sending leader's node ID.
+    pub leader_id: NodeId,
 }
 
 #[cfg(test)]

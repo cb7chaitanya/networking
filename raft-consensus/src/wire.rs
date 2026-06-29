@@ -84,8 +84,12 @@ const TAG_INSTALL_SNAPSHOT_RESPONSE: u8 = 8;
 //
 // Tag 10 — ReadIndexResponse:
 //   [10: u8] [term: u64] [read_index: u64]  Total: 17 bytes
+//
+// Tag 11 — TimeoutNow:
+//   [11: u8] [term: u64] [leader_id: u64]  Total: 17 bytes
 const TAG_READ_INDEX_REQUEST: u8 = 9;
 const TAG_READ_INDEX_RESPONSE: u8 = 10;
+const TAG_TIMEOUT_NOW: u8 = 11;
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Encoder
@@ -104,6 +108,7 @@ pub fn encode(rpc: &Rpc) -> Vec<u8> {
         Rpc::InstallSnapshotResponse(reply) => encode_install_snapshot_response(reply),
         Rpc::ReadIndexRequest(args) => encode_read_index_request(args),
         Rpc::ReadIndexResponse(reply) => encode_read_index_response(reply),
+        Rpc::TimeoutNow(args) => encode_timeout_now(args),
     }
 }
 
@@ -213,6 +218,14 @@ fn encode_read_index_response(reply: &ReadIndexReply) -> Vec<u8> {
     buf.push(TAG_READ_INDEX_RESPONSE);
     buf.extend_from_slice(&reply.term.to_be_bytes());
     buf.extend_from_slice(&reply.read_index.to_be_bytes());
+    buf
+}
+
+fn encode_timeout_now(args: &TimeoutNowArgs) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8 + 8);
+    buf.push(TAG_TIMEOUT_NOW);
+    buf.extend_from_slice(&args.term.to_be_bytes());
+    buf.extend_from_slice(&args.leader_id.to_be_bytes());
     buf
 }
 
@@ -338,6 +351,11 @@ pub fn decode(data: &[u8]) -> Result<Rpc, WireError> {
             let term = cursor.read_u64()?;
             let read_index = cursor.read_u64()?;
             Ok(Rpc::ReadIndexResponse(ReadIndexReply { term, read_index }))
+        }
+        TAG_TIMEOUT_NOW => {
+            let term = cursor.read_u64()?;
+            let leader_id = cursor.read_u64()?;
+            Ok(Rpc::TimeoutNow(TimeoutNowArgs { term, leader_id }))
         }
         other => Err(WireError::UnknownTag(other)),
     }

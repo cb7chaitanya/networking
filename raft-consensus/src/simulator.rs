@@ -523,6 +523,20 @@ impl Simulator {
         }
     }
 
+    /// Initiate a graceful leadership transfer from `from_id` to `to_id`.
+    ///
+    /// Calls `transfer_leadership(to_id)` on the specified node and returns the
+    /// result.  The caller must `stabilize()` afterwards to let the transfer
+    /// complete — the target will receive `TimeoutNow`, start an election, and
+    /// win.
+    pub fn transfer_leadership(&mut self, from_id: NodeId, to_id: NodeId) -> bool {
+        if let Some(node) = self.nodes.get_mut(&from_id) {
+            node.transfer_leadership(to_id)
+        } else {
+            false
+        }
+    }
+
     /// Elect a leader: trigger election on `node_id`, stabilize, and assert
     /// the node became leader.
     pub fn elect(&mut self, node_id: NodeId) {
@@ -1348,5 +1362,151 @@ mod tests {
         assert!(sim.node(new_leader).commit_index() > 0);
 
         sim.assert_logs_consistent();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Leadership transfer tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Graceful transfer: target is already fully caught up when transfer is
+    /// initiated.  The leader sends TimeoutNow immediately, the target starts an
+    /// election and wins, and the old leader steps down.
+    #[test]
+    fn graceful_leadership_transfer() {
+        let config = ClusterConfig {
+            election_timeout_min: 10,
+            election_timeout_max: 20,
+            heartbeat_interval: 5,
+            pre_vote: false,
+        };
+        let mut sim = Simulator::new(3, config, 1);
+
+        // Elect node 1 as leader.
+        sim.elect(1);
+        assert_eq!(sim.leader(), Some(1));
+
+        // Propose and commit a few entries so there is something to replicate.
+        assert!(sim.propose_to(1, vec![1]));
+        assert!(sim.propose_to(1, vec![2]));
+        sim.stabilize();
+        // Tick a heartbeat interval so the leader broadcasts the updated
+        // commit index to followers before we initiate the transfer.
+        sim.tick(5);
+        sim.stabilize();
+
+        // Node 2 must have the log fully replicated (log index 2).
+        assert!(sim.node(2).log.last_index() >= 2);
+
+        // Transfer leadership to node 2 — it is already caught up so TimeoutNow
+        // goes out immediately during stabilize().
+        let ok = sim.transfer_leadership(1, 2);
+        assert!(ok, "transfer_leadership should succeed on the current leader");
+        sim.stabilize();
+
+        // Node 2 must be the new leader.
+        assert!(
+            sim.node(2).is_leader(),
+            "node 2 should be the leader after graceful transfer"
+        );
+        // Node 1 must no longer be the leader.
+        assert!(
+            !sim.node(1).is_leader(),
+            "node 1 should have stepped down after transfer"
+        );
+        // Cluster must agree on a single leader.
+        assert_eq!(sim.leader(), Some(2));
+        sim.assert_logs_consistent();
+    }
+
+    /// Transfer when target is behind: the leader commits entries while the target
+    /// is partitioned, then the partition heals, transfer is initiated, and the
+    /// leader catches the target up before sending TimeoutNow.
+    #[test]
+    fn transfer_when_target_is_behind() {
+        let config = ClusterConfig {
+            election_timeout_min: 10,
+            election_timeout_max: 20,
+            heartbeat_interval: 5,
+            pre_vote: false,
+        };
+        let mut sim = Simulator::new(3, config, 2);
+
+        // Elect node 1.
+        sim.elect(1);
+
+        // Isolate node 2 so it falls behind.
+        sim.isolate(2);
+
+        // Commit entries with the quorum of nodes 1 and 3 only.
+        assert!(sim.propose_to(1, vec![10]));
+        assert!(sim.propose_to(1, vec![20]));
+        sim.stabilize();
+        assert!(sim.node(1).commit_index() >= 2);
+        assert_eq!(sim.node(2).commit_index(), 0, "node 2 should be behind");
+
+        // Heal the partition so the leader can replicate to node 2.
+        sim.heal();
+
+        // Initiate transfer to node 2 while it is still behind.
+        let ok = sim.transfer_leadership(1, 2);
+        assert!(ok);
+
+        // Stabilize: leader replicates to node 2, then sends TimeoutNow, then
+        // node 2 wins the election.
+        sim.stabilize();
+
+        assert!(
+            sim.node(2).is_leader(),
+            "node 2 should become leader after catching up and receiving TimeoutNow"
+        );
+        assert!(!sim.node(1).is_leader());
+        assert_eq!(sim.leader(), Some(2));
+        sim.assert_logs_consistent();
+    }
+
+    /// Transfer failure: the target is permanently unreachable, so the leader
+    /// never sends TimeoutNow.  After the deadline elapses the transfer is aborted
+    /// and the original leader resumes accepting proposals.
+    #[test]
+    fn transfer_failure_leader_resumes_on_timeout() {
+        let config = ClusterConfig {
+            election_timeout_min: 10,
+            election_timeout_max: 20,
+            heartbeat_interval: 5,
+            pre_vote: false,
+        };
+        let mut sim = Simulator::new(3, config, 3);
+
+        // Elect node 1.
+        sim.elect(1);
+        assert_eq!(sim.leader(), Some(1));
+
+        // Isolate node 2 so the leader can never catch it up.
+        sim.isolate(2);
+        // Commit one entry (1+3 = quorum) to put node 2 behind.
+        assert!(sim.propose_to(1, vec![1]));
+        sim.stabilize();
+
+        // Initiate transfer to the unreachable node 2.
+        let ok = sim.transfer_leadership(1, 2);
+        assert!(ok);
+
+        // Proposals must be blocked while the transfer is pending.
+        let blocked = sim.propose_to(1, vec![2]);
+        assert!(!blocked, "proposals should be rejected during transfer");
+
+        // Tick past election_timeout_max (20) so the deadline fires.
+        sim.tick(25);
+
+        // After abort, node 1 must still be the leader.
+        assert!(
+            sim.node(1).is_leader(),
+            "node 1 should remain leader after failed transfer"
+        );
+        // And it must accept proposals again.
+        let accepted = sim.propose_to(1, vec![3]);
+        assert!(accepted, "proposals should be accepted after transfer aborted");
+
+        assert_eq!(sim.leader(), Some(1));
     }
 }
