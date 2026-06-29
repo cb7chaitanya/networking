@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::{LogIndex, Term};
+use crate::state::{LogIndex, NodeId, Term};
 
 // ── LogEntry ──
 
@@ -49,12 +49,22 @@ pub enum Command {
     Put { key: String, value: Vec<u8> },
     /// Application-level key-value delete.
     Delete { key: String },
+    /// Cluster membership: add a voter to the cluster.
+    /// The moment a node appends this entry it activates joint consensus
+    /// (majority of both old and new config required to commit).  The new
+    /// config is finalised once this entry commits.
+    AddNode(NodeId),
+    /// Cluster membership: remove a voter from the cluster.
+    /// Same joint-consensus semantics as `AddNode`.
+    RemoveNode(NodeId),
 }
 
 /// Wire tag bytes for command variants.
 const TAG_NOOP: u8 = 0;
 const TAG_PUT: u8 = 1;
 const TAG_DELETE: u8 = 2;
+const TAG_ADD_NODE: u8 = 3;
+const TAG_REMOVE_NODE: u8 = 4;
 
 impl Command {
     /// Serialize the command to bytes suitable for `LogEntry.data`.
@@ -81,6 +91,19 @@ impl Command {
                 buf.push(TAG_DELETE);
                 buf.extend_from_slice(&(key_bytes.len() as u32).to_be_bytes());
                 buf.extend_from_slice(key_bytes);
+                buf
+            }
+            // Membership commands: [tag:u8][node_id:u64] = 9 bytes, big-endian.
+            Command::AddNode(id) => {
+                let mut buf = Vec::with_capacity(9);
+                buf.push(TAG_ADD_NODE);
+                buf.extend_from_slice(&id.to_be_bytes());
+                buf
+            }
+            Command::RemoveNode(id) => {
+                let mut buf = Vec::with_capacity(9);
+                buf.push(TAG_REMOVE_NODE);
+                buf.extend_from_slice(&id.to_be_bytes());
                 buf
             }
         }
@@ -115,6 +138,26 @@ impl Command {
                 }
                 let key = String::from_utf8(data[5..5 + key_len].to_vec()).ok()?;
                 Some(Command::Delete { key })
+            }
+            TAG_ADD_NODE => {
+                if data.len() < 9 {
+                    return None;
+                }
+                let id = u64::from_be_bytes([
+                    data[1], data[2], data[3], data[4],
+                    data[5], data[6], data[7], data[8],
+                ]);
+                Some(Command::AddNode(id))
+            }
+            TAG_REMOVE_NODE => {
+                if data.len() < 9 {
+                    return None;
+                }
+                let id = u64::from_be_bytes([
+                    data[1], data[2], data[3], data[4],
+                    data[5], data[6], data[7], data[8],
+                ]);
+                Some(Command::RemoveNode(id))
             }
             _ => None,
         }
@@ -329,6 +372,42 @@ mod tests {
         };
         let bytes = cmd.encode();
         assert_eq!(Command::decode(&bytes), Some(cmd));
+    }
+
+    #[test]
+    fn command_add_node_roundtrip() {
+        let cmd = Command::AddNode(42);
+        let bytes = cmd.encode();
+        assert_eq!(bytes.len(), 9);
+        assert_eq!(bytes[0], 3); // TAG_ADD_NODE
+        assert_eq!(Command::decode(&bytes), Some(Command::AddNode(42)));
+    }
+
+    #[test]
+    fn command_remove_node_roundtrip() {
+        let cmd = Command::RemoveNode(99);
+        let bytes = cmd.encode();
+        assert_eq!(bytes.len(), 9);
+        assert_eq!(bytes[0], 4); // TAG_REMOVE_NODE
+        assert_eq!(Command::decode(&bytes), Some(Command::RemoveNode(99)));
+    }
+
+    #[test]
+    fn command_add_node_max_id() {
+        let cmd = Command::AddNode(u64::MAX);
+        assert_eq!(Command::decode(&cmd.encode()), Some(Command::AddNode(u64::MAX)));
+    }
+
+    #[test]
+    fn command_add_node_truncated_returns_none() {
+        let bytes = [3u8, 0, 0, 0, 0, 0, 0]; // only 7 bytes — too short
+        assert_eq!(Command::decode(&bytes), None);
+    }
+
+    #[test]
+    fn command_remove_node_truncated_returns_none() {
+        let bytes = [4u8, 0, 0]; // too short
+        assert_eq!(Command::decode(&bytes), None);
     }
 
     #[test]
