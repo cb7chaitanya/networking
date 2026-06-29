@@ -382,6 +382,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             }
             // PreVote variants already handled above.
             Rpc::PreVote(_) | Rpc::PreVoteResponse(_) => unreachable!(),
+            // InstallSnapshot RPC is storage infrastructure only for now;
+            // node-level handling will be added when log compaction is wired in.
+            Rpc::InstallSnapshot(_) | Rpc::InstallSnapshotResponse(_) => {}
         }
     }
 
@@ -1046,10 +1049,21 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                     }),
                 );
             }
+            // A stale leader is sending us a snapshot; tell it our current term
+            // so it can step down. We don't apply the snapshot.
+            Rpc::InstallSnapshot(_) => {
+                self.send(
+                    envelope.from,
+                    Rpc::InstallSnapshotResponse(InstallSnapshotReply {
+                        term: self.persistent.current_term,
+                    }),
+                );
+            }
             // Stale responses are simply dropped — no need to reply to a reply.
             Rpc::RequestVoteResponse(_)
             | Rpc::AppendEntriesResponse(_)
-            | Rpc::PreVoteResponse(_) => {}
+            | Rpc::PreVoteResponse(_)
+            | Rpc::InstallSnapshotResponse(_) => {}
         }
     }
 

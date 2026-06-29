@@ -12,23 +12,38 @@
 //! ```text
 //! Tag 1 — RequestVote:
 //!   [1: u8] [term: u64] [candidate_id: u64] [last_log_index: u64] [last_log_term: u64]
+//!   Total: 33 bytes
 //!
 //! Tag 2 — RequestVoteResponse:
 //!   [2: u8] [term: u64] [vote_granted: u8]
+//!   Total: 10 bytes
 //!
 //! Tag 3 — AppendEntries:
 //!   [3: u8] [term: u64] [leader_id: u64] [prev_log_index: u64] [prev_log_term: u64]
 //!   [leader_commit: u64] [entry_count: u32] [entries...]
 //!   Each entry: [term: u64] [data_len: u32] [data: bytes]
+//!   Fixed overhead: 45 bytes + per-entry overhead
 //!
 //! Tag 4 — AppendEntriesResponse:
 //!   [4: u8] [term: u64] [success: u8] [match_index: u64]
+//!   Total: 18 bytes
 //!
 //! Tag 5 — PreVote:
 //!   [5: u8] [term: u64] [candidate_id: u64] [last_log_index: u64] [last_log_term: u64]
+//!   Total: 33 bytes
 //!
 //! Tag 6 — PreVoteResponse:
 //!   [6: u8] [term: u64] [vote_granted: u8]
+//!   Total: 10 bytes
+//!
+//! Tag 7 — InstallSnapshot (§7):
+//!   [7: u8] [term: u64] [leader_id: u64] [last_included_index: u64] [last_included_term: u64]
+//!   [offset: u64] [data_len: u32] [data: bytes] [done: u8]
+//!   Fixed overhead: 46 bytes + data
+//!
+//! Tag 8 — InstallSnapshotResponse:
+//!   [8: u8] [term: u64]
+//!   Total: 9 bytes
 //! ```
 
 use crate::log::LogEntry;
@@ -62,6 +77,8 @@ const TAG_APPEND_ENTRIES: u8 = 3;
 const TAG_APPEND_ENTRIES_RESPONSE: u8 = 4;
 const TAG_PRE_VOTE: u8 = 5;
 const TAG_PRE_VOTE_RESPONSE: u8 = 6;
+const TAG_INSTALL_SNAPSHOT: u8 = 7;
+const TAG_INSTALL_SNAPSHOT_RESPONSE: u8 = 8;
 
 // ════════════════════════════════════════════════════════════════════════════
 //  Encoder
@@ -76,6 +93,8 @@ pub fn encode(rpc: &Rpc) -> Vec<u8> {
         Rpc::AppendEntriesResponse(reply) => encode_append_entries_response(reply),
         Rpc::PreVote(args) => encode_pre_vote(args),
         Rpc::PreVoteResponse(reply) => encode_pre_vote_response(reply),
+        Rpc::InstallSnapshot(args) => encode_install_snapshot(args),
+        Rpc::InstallSnapshotResponse(reply) => encode_install_snapshot_response(reply),
     }
 }
 
@@ -146,6 +165,29 @@ fn encode_pre_vote_response(reply: &PreVoteReply) -> Vec<u8> {
     buf.push(TAG_PRE_VOTE_RESPONSE);
     buf.extend_from_slice(&reply.term.to_be_bytes());
     buf.push(reply.vote_granted as u8);
+    buf
+}
+
+fn encode_install_snapshot(args: &InstallSnapshotArgs) -> Vec<u8> {
+    // Fixed part: tag(1) + term(8) + leader_id(8) + last_included_index(8)
+    //             + last_included_term(8) + offset(8) + data_len(4) + done(1) = 46 bytes
+    let mut buf = Vec::with_capacity(46 + args.data.len());
+    buf.push(TAG_INSTALL_SNAPSHOT);
+    buf.extend_from_slice(&args.term.to_be_bytes());
+    buf.extend_from_slice(&args.leader_id.to_be_bytes());
+    buf.extend_from_slice(&args.last_included_index.to_be_bytes());
+    buf.extend_from_slice(&args.last_included_term.to_be_bytes());
+    buf.extend_from_slice(&args.offset.to_be_bytes());
+    buf.extend_from_slice(&(args.data.len() as u32).to_be_bytes());
+    buf.extend_from_slice(&args.data);
+    buf.push(args.done as u8);
+    buf
+}
+
+fn encode_install_snapshot_response(reply: &InstallSnapshotReply) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8);
+    buf.push(TAG_INSTALL_SNAPSHOT_RESPONSE);
+    buf.extend_from_slice(&reply.term.to_be_bytes());
     buf
 }
 
@@ -238,6 +280,29 @@ pub fn decode(data: &[u8]) -> Result<Rpc, WireError> {
                 term,
                 vote_granted,
             }))
+        }
+        TAG_INSTALL_SNAPSHOT => {
+            let term = cursor.read_u64()?;
+            let leader_id = cursor.read_u64()?;
+            let last_included_index = cursor.read_u64()?;
+            let last_included_term = cursor.read_u64()?;
+            let offset = cursor.read_u64()?;
+            let data_len = cursor.read_u32()? as usize;
+            let data = cursor.read_bytes(data_len)?;
+            let done = cursor.read_u8()? != 0;
+            Ok(Rpc::InstallSnapshot(InstallSnapshotArgs {
+                term,
+                leader_id,
+                last_included_index,
+                last_included_term,
+                offset,
+                data,
+                done,
+            }))
+        }
+        TAG_INSTALL_SNAPSHOT_RESPONSE => {
+            let term = cursor.read_u64()?;
+            Ok(Rpc::InstallSnapshotResponse(InstallSnapshotReply { term }))
         }
         other => Err(WireError::UnknownTag(other)),
     }
@@ -483,5 +548,223 @@ mod tests {
             leader_commit: 0,
         }));
         assert_eq!(hb.len(), 45);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  InstallSnapshot wire tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    fn make_install_snapshot(
+        offset: u64,
+        data: Vec<u8>,
+        done: bool,
+    ) -> Rpc {
+        Rpc::InstallSnapshot(InstallSnapshotArgs {
+            term: 5,
+            leader_id: 1,
+            last_included_index: 42,
+            last_included_term: 3,
+            offset,
+            data,
+            done,
+        })
+    }
+
+    #[test]
+    fn install_snapshot_roundtrip() {
+        let rpc = make_install_snapshot(0, vec![0xDE, 0xAD, 0xBE, 0xEF], true);
+        let bytes = encode(&rpc);
+        let decoded = decode(&bytes).unwrap();
+        if let Rpc::InstallSnapshot(args) = decoded {
+            assert_eq!(args.term, 5);
+            assert_eq!(args.leader_id, 1);
+            assert_eq!(args.last_included_index, 42);
+            assert_eq!(args.last_included_term, 3);
+            assert_eq!(args.offset, 0);
+            assert_eq!(args.data, vec![0xDE, 0xAD, 0xBE, 0xEF]);
+            assert!(args.done);
+        } else {
+            panic!("expected InstallSnapshot");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_empty_data_roundtrip() {
+        let rpc = make_install_snapshot(0, vec![], true);
+        let bytes = encode(&rpc);
+        let decoded = decode(&bytes).unwrap();
+        if let Rpc::InstallSnapshot(args) = decoded {
+            assert!(args.data.is_empty());
+            assert!(args.done);
+        } else {
+            panic!("expected InstallSnapshot");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_done_false_roundtrip() {
+        let rpc = make_install_snapshot(512, vec![1, 2, 3], false);
+        let bytes = encode(&rpc);
+        let decoded = decode(&bytes).unwrap();
+        if let Rpc::InstallSnapshot(args) = decoded {
+            assert!(!args.done);
+        } else {
+            panic!("expected InstallSnapshot");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_non_zero_offset_roundtrip() {
+        let rpc = make_install_snapshot(65536, vec![0xAA; 8], false);
+        let bytes = encode(&rpc);
+        let decoded = decode(&bytes).unwrap();
+        if let Rpc::InstallSnapshot(args) = decoded {
+            assert_eq!(args.offset, 65536);
+            assert_eq!(args.data, vec![0xAA; 8]);
+        } else {
+            panic!("expected InstallSnapshot");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_max_offset_roundtrip() {
+        let rpc = make_install_snapshot(u64::MAX, vec![0xFF], true);
+        let bytes = encode(&rpc);
+        let decoded = decode(&bytes).unwrap();
+        if let Rpc::InstallSnapshot(args) = decoded {
+            assert_eq!(args.offset, u64::MAX);
+        } else {
+            panic!("expected InstallSnapshot");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_large_data_roundtrip() {
+        let data: Vec<u8> = (0u8..=255).cycle().take(1024).collect();
+        let rpc = make_install_snapshot(0, data.clone(), true);
+        let bytes = encode(&rpc);
+        let decoded = decode(&bytes).unwrap();
+        if let Rpc::InstallSnapshot(args) = decoded {
+            assert_eq!(args.data, data);
+        } else {
+            panic!("expected InstallSnapshot");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_wire_size() {
+        // Fixed overhead: tag(1) + term(8) + leader_id(8) + last_included_index(8)
+        //                 + last_included_term(8) + offset(8) + data_len(4) + done(1) = 46 bytes
+        let data = vec![0u8; 7];
+        let rpc = make_install_snapshot(0, data, true);
+        let bytes = encode(&rpc);
+        assert_eq!(bytes.len(), 46 + 7);
+    }
+
+    #[test]
+    fn install_snapshot_wire_size_empty_data() {
+        let rpc = make_install_snapshot(0, vec![], true);
+        let bytes = encode(&rpc);
+        assert_eq!(bytes.len(), 46); // no data bytes
+    }
+
+    #[test]
+    fn install_snapshot_response_roundtrip() {
+        let rpc = Rpc::InstallSnapshotResponse(InstallSnapshotReply { term: 12 });
+        let bytes = encode(&rpc);
+        let decoded = decode(&bytes).unwrap();
+        if let Rpc::InstallSnapshotResponse(reply) = decoded {
+            assert_eq!(reply.term, 12);
+        } else {
+            panic!("expected InstallSnapshotResponse");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_response_wire_size() {
+        // tag(1) + term(8) = 9 bytes
+        let rpc = Rpc::InstallSnapshotResponse(InstallSnapshotReply { term: 1 });
+        let bytes = encode(&rpc);
+        assert_eq!(bytes.len(), 9);
+    }
+
+    #[test]
+    fn install_snapshot_response_zero_term_roundtrip() {
+        let rpc = Rpc::InstallSnapshotResponse(InstallSnapshotReply { term: 0 });
+        let bytes = encode(&rpc);
+        let decoded = decode(&bytes).unwrap();
+        if let Rpc::InstallSnapshotResponse(reply) = decoded {
+            assert_eq!(reply.term, 0);
+        } else {
+            panic!("expected InstallSnapshotResponse");
+        }
+    }
+
+    #[test]
+    fn install_snapshot_truncated_header_returns_eof() {
+        // Full header is 46 bytes (no data); cut it short after the tag.
+        let rpc = make_install_snapshot(0, vec![], true);
+        let bytes = encode(&rpc);
+        // Give it only part of the fixed header.
+        for cut in [1, 8, 16, 20, 44] {
+            assert!(
+                matches!(decode(&bytes[..cut]), Err(WireError::UnexpectedEof)),
+                "expected EOF for cut={cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_snapshot_truncated_data_returns_eof() {
+        // Encode a snapshot with 10 bytes of data, then trim the data portion.
+        let rpc = make_install_snapshot(0, vec![0u8; 10], true);
+        let bytes = encode(&rpc);
+        // The data starts after the 41-byte fixed prefix (tag+5*u64+u32).
+        // Trim to include the data_len field but not all the data bytes.
+        let prefix = 41; // tag(1)+term(8)+leader_id(8)+last_inc_idx(8)+last_inc_term(8)+offset(8)+data_len(4)
+        let cut = prefix + 5; // only 5 of the 10 data bytes
+        assert!(matches!(decode(&bytes[..cut]), Err(WireError::UnexpectedEof)));
+    }
+
+    #[test]
+    fn install_snapshot_response_truncated_returns_eof() {
+        let rpc = Rpc::InstallSnapshotResponse(InstallSnapshotReply { term: 1 });
+        let bytes = encode(&rpc);
+        // 9 bytes total; cut to just the tag.
+        assert!(matches!(decode(&bytes[..1]), Err(WireError::UnexpectedEof)));
+    }
+
+    // ── Backward-compatibility: existing tags still decode correctly ──
+
+    #[test]
+    fn existing_wire_tags_unaffected_by_new_variants() {
+        let existing: Vec<Rpc> = vec![
+            Rpc::RequestVote(RequestVoteArgs {
+                term: 1, candidate_id: 2, last_log_index: 3, last_log_term: 1,
+            }),
+            Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: false }),
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 2, leader_id: 1, prev_log_index: 1, prev_log_term: 1,
+                entries: vec![LogEntry { term: 2, data: vec![99] }],
+                leader_commit: 1,
+            }),
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 2, success: true, match_index: 2,
+            }),
+            Rpc::PreVote(PreVoteArgs {
+                term: 3, candidate_id: 2, last_log_index: 2, last_log_term: 2,
+            }),
+            Rpc::PreVoteResponse(PreVoteReply { term: 3, vote_granted: true }),
+        ];
+        for rpc in existing {
+            let bytes = encode(&rpc);
+            let decoded = decode(&bytes).unwrap();
+            assert_eq!(decoded.term(), rpc.term());
+        }
+    }
+
+    #[test]
+    fn tag_255_still_unknown_after_adding_new_variants() {
+        assert!(matches!(decode(&[255]), Err(WireError::UnknownTag(255))));
     }
 }
