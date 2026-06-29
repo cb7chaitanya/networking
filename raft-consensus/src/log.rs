@@ -165,21 +165,51 @@ pub trait RaftLog {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Compact the log by discarding all entries at or before `base_index`.
+    ///
+    /// After this call:
+    /// - `get(i)` returns `None` for `i <= base_index` (entries are gone).
+    /// - `term_at(i)` returns `Some(base_term)` for any `0 < i <= base_index`.
+    /// - `last_index()` is unchanged — the log's logical extent is preserved.
+    /// - `last_term()` returns `base_term` if all entries were compacted.
+    ///
+    /// Calling `compact` with a `base_index` at or below the current base
+    /// is a no-op.
+    fn compact(&mut self, base_index: LogIndex, base_term: Term);
 }
 
 // ── InMemoryLog ──
 
 /// Simple in-memory log backed by a `Vec`. Suitable for testing and simulation.
 /// For production, this would be replaced with a write-ahead log on disk.
+///
+/// ## Compaction and base offset
+///
+/// After `compact(N, term)`, entries at indices 1..=N are discarded and the
+/// vec is rebased. The offset is tracked via `base_index` so all index
+/// arithmetic remains correct:
+///
+/// - Entry at logical index `i` lives at `entries[i - base_index - 1]`.
+/// - `last_index() == base_index + entries.len()`.
+/// - `term_at(i)` returns `Some(base_term)` for any `0 < i <= base_index`.
 #[derive(Debug, Clone)]
 pub struct InMemoryLog {
     entries: Vec<LogEntry>,
+    /// Logical index of the last compacted entry. Zero if no compaction has
+    /// occurred. All live entries have indices > base_index.
+    base_index: LogIndex,
+    /// Term of the entry at `base_index` (i.e. the snapshot term). Zero when
+    /// no compaction has occurred.
+    base_term: Term,
 }
 
 impl InMemoryLog {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            base_index: 0,
+            base_term: 0,
         }
     }
 }
@@ -196,45 +226,78 @@ impl RaftLog for InMemoryLog {
     }
 
     fn get(&self, index: LogIndex) -> Option<&LogEntry> {
-        if index == 0 || index as usize > self.entries.len() {
+        if index == 0 || index <= self.base_index {
             return None;
         }
-        Some(&self.entries[(index - 1) as usize])
+        let pos = (index - self.base_index - 1) as usize;
+        self.entries.get(pos)
     }
 
     fn last_index(&self) -> LogIndex {
-        self.entries.len() as LogIndex
+        self.base_index + self.entries.len() as LogIndex
     }
 
     fn last_term(&self) -> Term {
-        self.entries.last().map_or(0, |e| e.term)
+        self.entries.last().map_or(self.base_term, |e| e.term)
     }
 
     fn slice(&self, from: LogIndex, to: LogIndex) -> Vec<&LogEntry> {
-        if from == 0 || from > to || from as usize > self.entries.len() {
+        if from == 0 || from > to || from <= self.base_index {
             return Vec::new();
         }
-        let start = (from - 1) as usize;
-        let end = std::cmp::min(to as usize, self.entries.len());
+        let start = (from - self.base_index - 1) as usize;
+        let end = std::cmp::min(
+            (to - self.base_index) as usize,
+            self.entries.len(),
+        );
+        if start >= self.entries.len() {
+            return Vec::new();
+        }
         self.entries[start..end].iter().collect()
     }
 
     fn truncate_from(&mut self, index: LogIndex) {
-        if index == 0 {
+        if index == 0 || index <= self.base_index {
+            // Cannot truncate at or before the snapshot boundary.
             return;
         }
-        let pos = (index - 1) as usize;
+        let pos = (index - self.base_index - 1) as usize;
         if pos < self.entries.len() {
             self.entries.truncate(pos);
         }
     }
 
     fn term_at(&self, index: LogIndex) -> Option<Term> {
+        if index == 0 {
+            return None;
+        }
+        if index <= self.base_index {
+            // Entries in this range have been compacted away. The snapshot term
+            // is the best answer we have — exact for index == base_index, and
+            // as close as we can get for earlier indices whose data is gone.
+            return Some(self.base_term);
+        }
         self.get(index).map(|e| e.term)
     }
 
     fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    fn compact(&mut self, base_index: LogIndex, base_term: Term) {
+        if base_index <= self.base_index {
+            return; // already compacted this far
+        }
+        let current_last = self.base_index + self.entries.len() as LogIndex;
+        if base_index >= current_last {
+            // Compact at or beyond the last stored entry — clear everything.
+            self.entries.clear();
+        } else {
+            let drain_count = (base_index - self.base_index) as usize;
+            self.entries.drain(..drain_count);
+        }
+        self.base_index = base_index;
+        self.base_term = base_term;
     }
 }
 
@@ -309,5 +372,136 @@ mod tests {
         log.truncate_from(3);
         assert_eq!(log.last_index(), 2);
         assert!(log.get(3).is_none());
+    }
+
+    // ── Compaction ──
+
+    fn make_log(count: u8) -> InMemoryLog {
+        let mut log = InMemoryLog::new();
+        for i in 1..=count {
+            log.append(LogEntry { term: i as Term, data: vec![i] });
+        }
+        log
+    }
+
+    #[test]
+    fn compact_head_removes_prefix() {
+        let mut log = make_log(5);
+        // Compact the first 3 entries (indices 1-3, term 3 at index 3).
+        log.compact(3, 3);
+
+        // Logical extent is unchanged.
+        assert_eq!(log.last_index(), 5);
+        // Only 2 entries remain in memory.
+        assert_eq!(log.len(), 2);
+
+        // Compacted entries are no longer accessible via get().
+        assert!(log.get(1).is_none());
+        assert!(log.get(2).is_none());
+        assert!(log.get(3).is_none());
+
+        // Entries after the compaction point are still accessible.
+        assert_eq!(log.get(4).unwrap().data, vec![4]);
+        assert_eq!(log.get(5).unwrap().data, vec![5]);
+    }
+
+    #[test]
+    fn compact_entire_log_preserves_last_index() {
+        let mut log = make_log(4);
+        // Compact all 4 entries.
+        log.compact(4, 4);
+
+        assert_eq!(log.last_index(), 4); // logical extent unchanged
+        assert_eq!(log.len(), 0);         // no entries in memory
+
+        assert!(log.get(1).is_none());
+        assert!(log.get(4).is_none()); // boundary is also gone
+    }
+
+    #[test]
+    fn term_at_compacted_index_returns_base_term() {
+        let mut log = make_log(5);
+        // term at index 3 is 3 (from make_log).
+        log.compact(3, 3);
+
+        // Any compacted index returns base_term.
+        assert_eq!(log.term_at(1), Some(3)); // below base: mapped to base_term
+        assert_eq!(log.term_at(2), Some(3));
+        assert_eq!(log.term_at(3), Some(3)); // exactly at base
+
+        // Live entries return their actual term.
+        assert_eq!(log.term_at(4), Some(4));
+        assert_eq!(log.term_at(5), Some(5));
+
+        // Sentinel zero always returns None.
+        assert_eq!(log.term_at(0), None);
+    }
+
+    #[test]
+    fn append_after_compaction_correct_indices() {
+        let mut log = make_log(3);
+        log.compact(2, 2);
+
+        // Append a new entry — should land at index 4.
+        log.append(LogEntry { term: 4, data: vec![99] });
+
+        assert_eq!(log.last_index(), 4);
+        assert_eq!(log.get(3).unwrap().data, vec![3]); // tail entry still there
+        assert_eq!(log.get(4).unwrap().data, vec![99]); // new entry at index 4
+        assert!(log.get(2).is_none()); // compacted
+    }
+
+    #[test]
+    fn last_term_after_full_compaction_is_base_term() {
+        let mut log = make_log(3);
+        log.compact(3, 3);
+        // All entries gone; last_term() must fall back to base_term.
+        assert_eq!(log.last_term(), 3);
+    }
+
+    #[test]
+    fn slice_after_compaction_returns_live_entries_only() {
+        let mut log = make_log(6);
+        log.compact(3, 3);
+
+        // Slice starting in compacted range is empty.
+        assert!(log.slice(1, 3).is_empty());
+        // Slice starting exactly at base is also empty (base is compacted).
+        assert!(log.slice(3, 5).is_empty());
+
+        // Valid slice of live entries.
+        let s = log.slice(4, 6);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s[0].data, vec![4]);
+        assert_eq!(s[2].data, vec![6]);
+    }
+
+    #[test]
+    fn compact_below_current_base_is_noop() {
+        let mut log = make_log(5);
+        log.compact(3, 3);
+
+        // Compacting at or below the current base should change nothing.
+        log.compact(3, 99); // same index, different term
+        log.compact(1, 99); // below base
+
+        assert_eq!(log.base_index, 3);
+        assert_eq!(log.base_term, 3);
+        assert_eq!(log.len(), 2);
+    }
+
+    #[test]
+    fn truncate_at_or_before_base_is_noop() {
+        let mut log = make_log(5);
+        log.compact(3, 3);
+
+        // truncate_from at or below base must not corrupt the log.
+        log.truncate_from(3); // at base
+        log.truncate_from(1); // below base
+        log.truncate_from(0); // sentinel
+
+        assert_eq!(log.last_index(), 5);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.get(4).unwrap().data, vec![4]);
     }
 }

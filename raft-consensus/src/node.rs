@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use crate::log::{Command, InMemoryLog, LogEntry, RaftLog};
 use crate::message::*;
 use crate::state::*;
-use crate::storage::{MemoryStorage, Storage};
+use crate::storage::{MemoryStorage, Snapshot, Storage};
 
 // ── Configuration ──
 
@@ -321,6 +321,60 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             applied: Vec::new(),
             rng_state: id,
         })
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Log compaction
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Compact the log up to and including `last_included_index`.
+    ///
+    /// This is the leader-side entry point for log compaction (§7). The
+    /// application calls this once it has serialized its state machine into
+    /// a snapshot and wants to reclaim the log prefix that snapshot covers.
+    ///
+    /// Steps (order matters for crash safety):
+    ///
+    /// 1. **Persist snapshot first.** The snapshot is durable before any
+    ///    in-memory state changes. On a crash between steps 1 and 2 the node
+    ///    restarts with the full pre-compaction log but the snapshot already
+    ///    in storage — `restore()` skips the covered entries on reload.
+    ///
+    /// 2. **Compact the in-memory log.** Entries at indices ≤
+    ///    `last_included_index` are removed. `last_index()` is unchanged.
+    ///    `term_at(i)` for any compacted `i` returns `snapshot_term`.
+    ///
+    /// 3. **Update node snapshot state.** `snapshot_index` and
+    ///    `snapshot_term` are advanced to the new boundary.
+    ///
+    /// Returns an error only if the storage write fails.
+    pub fn compact(
+        &mut self,
+        last_included_index: LogIndex,
+    ) -> crate::storage::Result<()> {
+        // Resolve the term at the compaction boundary. If the entry is still
+        // in the log use it directly; if it was already compacted fall back
+        // to the current snapshot_term (the new base must be ≥ the old one).
+        let last_included_term = self
+            .log
+            .term_at(last_included_index)
+            .unwrap_or(self.snapshot_term);
+
+        // Step 1 — durable snapshot write (crash-safe boundary).
+        self.storage.save_snapshot(&Snapshot {
+            last_included_index,
+            last_included_term,
+            data: vec![],
+        })?;
+
+        // Step 2 — in-memory log compaction.
+        self.log.compact(last_included_index, last_included_term);
+
+        // Step 3 — advance node snapshot state.
+        self.snapshot_index = last_included_index;
+        self.snapshot_term = last_included_term;
+
+        Ok(())
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -5210,5 +5264,102 @@ mod tests {
         leader.drain_messages();
         let after2 = snapshot_storage(&leader).load_state().unwrap().log.len();
         assert_eq!(after2, 3); // incrementally added 1 more
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Log compaction tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// Return a leader that has three log entries: noop(idx=1) + two proposals.
+    fn leader_with_entries() -> RaftNode {
+        let mut leader = elect_leader_node1();
+        leader.propose(vec![10]);
+        leader.propose(vec![20]);
+        leader.drain_messages();
+        // log: [noop@1, data=10@2, data=20@3]
+        assert_eq!(leader.log.last_index(), 3);
+        leader
+    }
+
+    #[test]
+    fn compact_head_removes_compacted_entries() {
+        let mut leader = leader_with_entries();
+        // Compact the first two entries (noop + first proposal).
+        leader.compact(2).unwrap();
+
+        // Compacted entries are gone from the in-memory log.
+        assert!(leader.log.get(1).is_none());
+        assert!(leader.log.get(2).is_none());
+        // Remaining entry is still accessible.
+        assert_eq!(leader.log.get(3).unwrap().data, vec![20]);
+        // Logical extent is preserved.
+        assert_eq!(leader.log.last_index(), 3);
+        // In-memory storage is reduced.
+        assert_eq!(leader.log.len(), 1);
+    }
+
+    #[test]
+    fn compact_entire_log() {
+        let mut leader = leader_with_entries();
+        let last = leader.log.last_index();
+
+        // Compact all entries.
+        leader.compact(last).unwrap();
+
+        assert_eq!(leader.log.last_index(), last); // logical extent unchanged
+        assert_eq!(leader.log.len(), 0);            // no entries in memory
+
+        assert!(leader.log.get(1).is_none());
+        assert!(leader.log.get(last).is_none());
+    }
+
+    #[test]
+    fn compact_updates_snapshot_index_and_term() {
+        let mut leader = leader_with_entries();
+        let term_at_2 = leader.log.term_at(2).unwrap();
+
+        leader.compact(2).unwrap();
+
+        assert_eq!(leader.snapshot_index(), 2);
+        assert_eq!(leader.snapshot_term(), term_at_2);
+    }
+
+    #[test]
+    fn compact_persists_snapshot_to_storage() {
+        let mut leader = leader_with_entries();
+        leader.compact(2).unwrap();
+
+        // The snapshot must be durable in storage after compact().
+        let snap = leader.storage.load_snapshot().unwrap().unwrap();
+        assert_eq!(snap.last_included_index, 2);
+        assert_eq!(snap.last_included_term, leader.snapshot_term());
+    }
+
+    #[test]
+    fn term_at_compacted_index_returns_snapshot_term() {
+        let mut leader = leader_with_entries();
+        let snapshot_term = leader.log.term_at(2).unwrap();
+        leader.compact(2).unwrap();
+
+        // All indices at or below the compaction boundary return snapshot_term.
+        assert_eq!(leader.log.term_at(1), Some(snapshot_term));
+        assert_eq!(leader.log.term_at(2), Some(snapshot_term));
+        // The live entry still returns its real term.
+        assert_eq!(leader.log.term_at(3), leader.log.get(3).map(|e| e.term));
+    }
+
+    #[test]
+    fn append_after_compaction_accessible_at_correct_index() {
+        let mut leader = leader_with_entries();
+        leader.compact(2).unwrap();
+        // last_index is 3; proposing a new entry appends at index 4.
+        leader.propose(vec![99]);
+        leader.drain_messages();
+
+        assert_eq!(leader.log.last_index(), 4);
+        assert_eq!(leader.log.get(4).unwrap().data, vec![99]);
+        // Compacted entries remain inaccessible.
+        assert!(leader.log.get(1).is_none());
+        assert!(leader.log.get(2).is_none());
     }
 }
