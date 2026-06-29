@@ -44,13 +44,18 @@ pub enum Role {
     /// Manages the cluster: sends heartbeats, replicates log entries, and
     /// advances the commit index. Maintains per-follower replication cursors.
     ///
-    /// `next_index[peer]`:  index of the *next* entry to send to that peer.
-    ///                      Initialized to leader's last log index + 1.
-    /// `match_index[peer]`: highest index known to be replicated on that peer.
-    ///                      Initialized to 0 (no entries confirmed yet).
+    /// `next_index[peer]`:       index of the *next* entry to send to that peer.
+    ///                           Initialized to leader's last log index + 1.
+    /// `match_index[peer]`:      highest index known to be replicated on that peer.
+    ///                           Initialized to 0 (no entries confirmed yet).
+    /// `snapshot_pending[peer]`: `last_included_index` of an in-flight
+    ///                           InstallSnapshot sent to that peer. Present only
+    ///                           while we are waiting for the reply; removed on
+    ///                           receipt of InstallSnapshotResponse.
     Leader {
         next_index: HashMap<NodeId, LogIndex>,
         match_index: HashMap<NodeId, LogIndex>,
+        snapshot_pending: HashMap<NodeId, LogIndex>,
     },
 }
 

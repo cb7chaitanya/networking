@@ -472,9 +472,10 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             }
             // PreVote variants already handled above.
             Rpc::PreVote(_) | Rpc::PreVoteResponse(_) => unreachable!(),
-            // InstallSnapshot RPC is storage infrastructure only for now;
-            // node-level handling will be added when log compaction is wired in.
-            Rpc::InstallSnapshot(_) | Rpc::InstallSnapshotResponse(_) => {}
+            Rpc::InstallSnapshot(args) => self.handle_install_snapshot(envelope.from, args),
+            Rpc::InstallSnapshotResponse(reply) => {
+                self.handle_install_snapshot_response(envelope.from, reply)
+            }
         }
     }
 
@@ -624,6 +625,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.role = Role::Leader {
             next_index,
             match_index,
+            snapshot_pending: HashMap::new(),
         };
 
         // We are the leader now.
@@ -907,6 +909,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         let Role::Leader {
             ref mut next_index,
             ref mut match_index,
+            ..
         } = self.role
         else {
             return;
@@ -947,6 +950,125 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             // Retry immediately with the updated next_index.
             self.replicate_to(from);
         }
+    }
+
+    /// Handle an incoming InstallSnapshot RPC from the current leader (§7).
+    ///
+    /// Only single-chunk snapshots (offset=0, done=true) are handled; chunked
+    /// transfers are silently ignored and the leader will retry.
+    fn handle_install_snapshot(&mut self, from: NodeId, args: InstallSnapshotArgs) {
+        // Receiving a snapshot proves the leader is alive — suppress elections.
+        self.current_leader = Some(from);
+        self.reset_election_timer();
+
+        // Candidates step down on contact from the legitimate leader, same as
+        // for AppendEntries.
+        if matches!(self.role, Role::Candidate { .. }) {
+            self.become_follower();
+        }
+
+        let last_included_index = args.last_included_index;
+        let last_included_term = args.last_included_term;
+
+        // Stale snapshot: we have already installed this index (or a later one).
+        // Acknowledge so the leader stops retrying.
+        if last_included_index <= self.snapshot_index {
+            self.send(
+                from,
+                Rpc::InstallSnapshotResponse(InstallSnapshotReply {
+                    term: self.persistent.current_term,
+                }),
+            );
+            return;
+        }
+
+        // We only support single-chunk transfers. Ignore mid-stream chunks;
+        // the leader will re-send the full snapshot after its retry timer fires.
+        if args.offset != 0 || !args.done {
+            return;
+        }
+
+        // Persist the snapshot before touching any volatile state (crash safety).
+        let snap = Snapshot {
+            last_included_index,
+            last_included_term,
+            data: args.data,
+        };
+        if self.storage.save_snapshot(&snap).is_err() {
+            return; // storage failure — don't reply; leader retries on timeout
+        }
+
+        // Discard log entries now covered by the snapshot.
+        self.log.compact(last_included_index, last_included_term);
+
+        // Advance snapshot tracking fields.
+        self.snapshot_index = last_included_index;
+        self.snapshot_term = last_included_term;
+
+        // Advance commit_index and last_applied to the snapshot boundary.
+        // Entries up to last_included_index are already "applied" by definition
+        // — the snapshot encodes that state.
+        if last_included_index > self.volatile.commit_index {
+            self.volatile.commit_index = last_included_index;
+        }
+        if last_included_index > self.volatile.last_applied {
+            self.volatile.last_applied = last_included_index;
+        }
+
+        self.send(
+            from,
+            Rpc::InstallSnapshotResponse(InstallSnapshotReply {
+                term: self.persistent.current_term,
+            }),
+        );
+    }
+
+    /// Handle an InstallSnapshot response from a follower.
+    ///
+    /// Advance the follower's replication cursors and send any log entries that
+    /// come after the installed snapshot.
+    fn handle_install_snapshot_response(
+        &mut self,
+        from: NodeId,
+        _reply: InstallSnapshotReply,
+    ) {
+        // Retrieve the snapshot index we sent this peer; ignore stale responses.
+        let pending_index = match &self.role {
+            Role::Leader { snapshot_pending, .. } => {
+                match snapshot_pending.get(&from).copied() {
+                    Some(idx) => idx,
+                    None => return,
+                }
+            }
+            _ => return,
+        };
+
+        // Advance match_index and next_index using the confirmed index.
+        if let Role::Leader {
+            ref mut next_index,
+            ref mut match_index,
+            ref mut snapshot_pending,
+        } = self.role
+        {
+            snapshot_pending.remove(&from);
+            if let Some(mi) = match_index.get_mut(&from) {
+                if pending_index > *mi {
+                    *mi = pending_index;
+                }
+            }
+            if let Some(ni) = next_index.get_mut(&from) {
+                let new_ni = pending_index + 1;
+                if new_ni > *ni {
+                    *ni = new_ni;
+                }
+            }
+        }
+
+        // Check if the newly confirmed index lets us commit anything.
+        self.maybe_advance_commit_index();
+
+        // Send any log entries that follow the snapshot.
+        self.replicate_to(from);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1051,17 +1173,53 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         }
     }
 
-    /// Send AppendEntries to a specific follower.
+    /// Send AppendEntries (or InstallSnapshot when the follower lags behind the
+    /// snapshot boundary) to a specific follower.
     fn replicate_to(&mut self, peer: NodeId) {
-        let Role::Leader {
-            ref next_index, ..
-        } = self.role
-        else {
-            return;
+        // Extract the replication cursor and check whether a snapshot is
+        // already in flight for this peer — all as a copy, releasing the borrow.
+        let (ni, snapshot_in_flight) = match &self.role {
+            Role::Leader { next_index, snapshot_pending, .. } => {
+                let ni = *next_index.get(&peer).unwrap_or(&1);
+                let in_flight = snapshot_pending.contains_key(&peer);
+                (ni, in_flight)
+            }
+            _ => return,
         };
 
-        let ni = *next_index.get(&peer).unwrap_or(&1);
+        // While a snapshot transfer is in flight we must not send AppendEntries;
+        // the follower's log is inconsistent until it finishes installing.
+        if snapshot_in_flight {
+            return;
+        }
 
+        // ── InstallSnapshot path ──
+        // The follower's next_index falls before our snapshot boundary, which
+        // means we have already discarded the log entries it needs.  Send the
+        // full snapshot instead.
+        if ni <= self.snapshot_index {
+            if let Ok(Some(snap)) = self.storage.load_snapshot() {
+                let last_included_index = snap.last_included_index;
+                let args = InstallSnapshotArgs {
+                    term: self.persistent.current_term,
+                    leader_id: self.id,
+                    last_included_index,
+                    last_included_term: snap.last_included_term,
+                    offset: 0,
+                    data: snap.data,
+                    done: true,
+                };
+                // Record the in-flight snapshot so we skip this peer until the
+                // response arrives.
+                if let Role::Leader { ref mut snapshot_pending, .. } = self.role {
+                    snapshot_pending.insert(peer, last_included_index);
+                }
+                self.send(peer, Rpc::InstallSnapshot(args));
+            }
+            return;
+        }
+
+        // ── AppendEntries path ──
         // prev_log_index/term: the entry just before what we're sending.
         let prev_log_index = ni.saturating_sub(1);
         let prev_log_term = if prev_log_index == 0 {

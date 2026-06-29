@@ -424,6 +424,18 @@ impl Simulator {
         }
     }
 
+    /// Compact a live node's log up to (and including) `last_included_index`.
+    ///
+    /// Panics if the node is crashed or missing, or if compaction fails.
+    pub fn compact_node(&mut self, node_id: NodeId, last_included_index: u64) {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .unwrap_or_else(|| panic!("node {node_id} is not alive"));
+        node.compact(last_included_index)
+            .expect("compact should not fail with MemoryStorage");
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     //  Election helpers
     // ════════════════════════════════════════════════════════════════════════
@@ -530,7 +542,9 @@ impl Simulator {
     ///
     /// For each pair of live nodes, every log index up to
     /// `min(commit_index_a, commit_index_b)` must contain the same
-    /// term and data.
+    /// term and data. Entries that have been compacted (covered by a node's
+    /// snapshot) are considered consistent with any other representation of
+    /// that index — only indices present in both logs are compared directly.
     pub fn assert_logs_consistent(&self) {
         let nodes: Vec<(&NodeId, &RaftNode<MemoryStorage, InMemoryLog>)> =
             self.nodes.iter().collect();
@@ -558,11 +572,18 @@ impl Simulator {
                                 "log inconsistency at index {idx}: node {id_a} and node {id_b} have different data",
                             );
                         }
+                        // One node has compacted this index — covered by its snapshot,
+                        // so the data is implicitly consistent.
+                        (None, Some(_)) if idx <= node_a.snapshot_index => {}
+                        (Some(_), None) if idx <= node_b.snapshot_index => {}
+                        // Both compacted — fine.
+                        (None, None)
+                            if idx <= node_a.snapshot_index || idx <= node_b.snapshot_index => {}
                         (None, Some(_)) => {
-                            panic!("node {id_a} missing committed entry at index {idx}");
+                            panic!("node {id_a} missing committed entry at index {idx} (snapshot_index={})", node_a.snapshot_index);
                         }
                         (Some(_), None) => {
-                            panic!("node {id_b} missing committed entry at index {idx}");
+                            panic!("node {id_b} missing committed entry at index {idx} (snapshot_index={})", node_b.snapshot_index);
                         }
                         (None, None) => {
                             panic!("both nodes {id_a} and {id_b} missing entry at index {idx}");
@@ -953,6 +974,122 @@ mod tests {
             sim.node(3).log.last_index(),
             sim.node(1).log.last_index()
         );
+        sim.assert_logs_consistent();
+    }
+
+    // ── InstallSnapshot / log compaction ──
+
+    /// A follower that is partitioned while the leader compacts its log must
+    /// catch up via InstallSnapshot rather than AppendEntries once the partition
+    /// heals, because the leader no longer has the missing entries.
+    #[test]
+    fn lagging_follower_catches_up_via_snapshot() {
+        let mut sim = Simulator::new(3, test_config(), 1);
+        sim.elect(1);
+        sim.stabilize();
+
+        let leader_id = sim.assert_one_leader();
+
+        // Cut node 3 off so it can't receive new entries.
+        sim.isolate(3);
+
+        // Replicate several entries to nodes 1 and 2 only.
+        for i in 1u8..=5 {
+            sim.propose_to(leader_id, vec![i]);
+        }
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        let commit = sim.node(leader_id).commit_index();
+        assert!(commit >= 5, "expected at least 5 committed entries, got {commit}");
+
+        // Leader compacts everything it has committed.
+        sim.compact_node(leader_id, commit);
+
+        // The compacted entries are gone from the leader's log.
+        assert_eq!(sim.node(leader_id).snapshot_index(), commit);
+        assert!(sim.node(leader_id).log.len() == 0 || sim.node(leader_id).log.last_index() >= commit);
+
+        // Heal the partition.
+        sim.heal();
+
+        // Give time for the leader to send InstallSnapshot and node 3 to reply.
+        sim.tick(5);
+        sim.stabilize();
+
+        // Node 3 must have advanced via snapshot.
+        let n3_commit = sim.node(3).commit_index();
+        assert!(
+            n3_commit >= commit,
+            "node 3 commit_index={n3_commit}, expected >= {commit}"
+        );
+        assert!(
+            sim.node(3).snapshot_index() >= commit,
+            "node 3 snapshot_index={}, expected >= {commit}",
+            sim.node(3).snapshot_index()
+        );
+
+        sim.assert_logs_consistent();
+    }
+
+    /// When the leader compacts its log *before* a crashed follower restarts,
+    /// the restarted follower must receive a snapshot on its first heartbeat
+    /// interval rather than getting the (now-missing) entries via AppendEntries.
+    #[test]
+    fn leader_compacts_before_follower_recovers() {
+        let mut sim = Simulator::new(3, test_config(), 2);
+        sim.elect(1);
+        sim.stabilize();
+
+        let leader_id = sim.assert_one_leader();
+
+        // Replicate a few entries to all nodes, then crash node 3.
+        for i in 1u8..=3 {
+            sim.propose_to(leader_id, vec![i]);
+        }
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+        sim.crash(3);
+
+        // While node 3 is down, replicate more entries and commit.
+        for i in 4u8..=6 {
+            sim.propose_to(leader_id, vec![i]);
+        }
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        let commit = sim.node(leader_id).commit_index();
+        assert!(commit >= 7); // noop + 6 entries
+
+        // Leader compacts the entire committed log before node 3 comes back.
+        sim.compact_node(leader_id, commit);
+        assert_eq!(sim.node(leader_id).snapshot_index(), commit);
+
+        // Restart node 3. Its log has only the first 3 entries (from before crash).
+        sim.restart(3);
+
+        // Allow several heartbeat cycles so the leader can send and node 3 can
+        // install the snapshot.
+        sim.tick(5);
+        sim.stabilize();
+        sim.tick(5);
+        sim.stabilize();
+
+        // Node 3 must have installed the snapshot and caught up.
+        let n3_commit = sim.node(3).commit_index();
+        assert!(
+            n3_commit >= commit,
+            "node 3 commit_index={n3_commit}, expected >= {commit}"
+        );
+        assert!(
+            sim.node(3).snapshot_index() >= commit,
+            "node 3 snapshot_index={}, expected >= {commit}",
+            sim.node(3).snapshot_index()
+        );
+
         sim.assert_logs_consistent();
     }
 }
