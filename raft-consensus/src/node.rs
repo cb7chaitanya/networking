@@ -63,6 +63,100 @@ impl Default for ClusterConfig {
     }
 }
 
+// ── Cluster membership ──
+
+/// Tracks the voter set and manages joint-consensus transitions (Raft §6).
+///
+/// A cluster change is proposed as a `Command::AddNode` / `Command::RemoveNode`
+/// log entry.  The moment any node appends that entry — even before it is
+/// committed — it enters **joint consensus**: commits require a majority of both
+/// the *old* (`voters`) and the *new* (`transitional`) voter set simultaneously.
+/// Once the entry commits the new config becomes the sole stable config.
+///
+/// Only one pending change is tracked at a time.  Callers must wait for the
+/// current change to commit before proposing another.
+#[derive(Debug, Clone)]
+pub struct ClusterMembership {
+    /// Current stable voter set.  Always includes `self.id`.
+    /// When not in joint consensus this is the full effective membership.
+    pub voters: HashSet<NodeId>,
+    /// Target voter set during a joint-consensus transition.
+    /// `None` = stable (single-config) mode.
+    pub transitional: Option<HashSet<NodeId>>,
+}
+
+impl ClusterMembership {
+    fn new(all_voters: impl IntoIterator<Item = NodeId>) -> Self {
+        Self {
+            voters: all_voters.into_iter().collect(),
+            transitional: None,
+        }
+    }
+
+    pub fn is_joint(&self) -> bool {
+        self.transitional.is_some()
+    }
+
+    /// All peers (excluding `self_id`) that a leader must replicate to.
+    /// During joint consensus: the union of old and new voter sets.
+    pub fn all_peers(&self, self_id: NodeId) -> Vec<NodeId> {
+        let mut all: HashSet<NodeId> = self.voters.clone();
+        if let Some(new) = &self.transitional {
+            all.extend(new.iter().copied());
+        }
+        all.retain(|&id| id != self_id);
+        all.into_iter().collect()
+    }
+
+    /// Returns `true` if `confirmed` (the set of nodes known to have an entry,
+    /// **including self**) constitutes a quorum.
+    ///
+    /// Single-config: strict majority of `voters`.
+    /// Joint config: strict majority of `voters` **and** strict majority of
+    /// `transitional` — both must be satisfied simultaneously.
+    pub fn has_quorum(&self, confirmed: &HashSet<NodeId>) -> bool {
+        let old_count = self.voters.iter().filter(|id| confirmed.contains(*id)).count();
+        if old_count < (self.voters.len() / 2) + 1 {
+            return false;
+        }
+        if let Some(new) = &self.transitional {
+            let new_count = new.iter().filter(|id| confirmed.contains(*id)).count();
+            if new_count < (new.len() / 2) + 1 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Activate joint consensus for `AddNode(id)`.  No-op if already joint.
+    pub fn begin_add_node(&mut self, id: NodeId) {
+        if self.transitional.is_some() {
+            return;
+        }
+        let mut new_voters = self.voters.clone();
+        new_voters.insert(id);
+        self.transitional = Some(new_voters);
+    }
+
+    /// Activate joint consensus for `RemoveNode(id)`.  No-op if already joint.
+    pub fn begin_remove_node(&mut self, id: NodeId) {
+        if self.transitional.is_some() {
+            return;
+        }
+        let mut new_voters = self.voters.clone();
+        new_voters.remove(&id);
+        self.transitional = Some(new_voters);
+    }
+
+    /// Finalise the joint transition: adopt the new config as the stable config.
+    /// Returns the new voter set.
+    pub fn commit_transition(&mut self) -> HashSet<NodeId> {
+        let new_voters = self.transitional.take().expect("commit_transition called outside joint");
+        self.voters = new_voters.clone();
+        new_voters
+    }
+}
+
 // ── Timer state ──
 
 /// Minimal deterministic timer. The simulator increments ticks manually;
@@ -120,7 +214,11 @@ pub struct RaftNode<S: Storage = MemoryStorage, L: RaftLog = InMemoryLog> {
     /// This node's unique ID.
     pub id: NodeId,
     /// IDs of all other nodes in the cluster. Does not include `self.id`.
+    /// Tracks the *stable* config; updated when a config-change entry commits.
     pub peers: Vec<NodeId>,
+    /// Joint-consensus membership state.  Authoritative source for quorum
+    /// checks and the set of peers to replicate to.
+    pub membership: ClusterMembership,
 
     // ── Role ──
     /// Current role in the Raft protocol. See `Role` for invariants.
@@ -190,9 +288,13 @@ impl RaftNode<MemoryStorage, InMemoryLog> {
             config.election_timeout_max,
         );
 
+        let membership = ClusterMembership::new(
+            std::iter::once(id).chain(peers.iter().copied()),
+        );
         Self {
             id,
             peers,
+            membership,
             role: Role::Follower,
             persistent: PersistentState::new(),
             volatile: VolatileState::new(),
@@ -227,9 +329,13 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             config.election_timeout_max,
         );
 
+        let membership = ClusterMembership::new(
+            std::iter::once(id).chain(peers.iter().copied()),
+        );
         Self {
             id,
             peers,
+            membership,
             role: Role::Follower,
             persistent: PersistentState::new(),
             volatile: VolatileState::new(),
@@ -293,9 +399,13 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             config.election_timeout_max,
         );
 
+        let membership = ClusterMembership::new(
+            std::iter::once(id).chain(peers.iter().copied()),
+        );
         Ok(Self {
             id,
             peers,
+            membership,
             role: Role::Follower,
             persistent: PersistentState {
                 current_term: hard_state.current_term,
@@ -501,9 +611,12 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             data,
         };
         self.log.append(entry.clone());
-        self.persist_log_append(&[entry]);
+        self.persist_log_append(&[entry.clone()]);
+        // Activate joint consensus immediately if this is a config-change entry.
+        self.activate_joint_if_config_entry(&[entry]);
 
-        // Immediately try to replicate to all followers.
+        // Immediately try to replicate to all followers (now including any
+        // newly added node from a just-activated joint config).
         self.replicate_to_all();
 
         // In a single-node cluster (or when the leader alone is a majority),
@@ -572,11 +685,11 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // Step 3: reset election timer
         self.reset_election_timer();
 
-        // Step 4: send RequestVote to all peers
+        // Step 4: send RequestVote to all current peers (old+new during joint).
         let last_log_index = self.log.last_index();
         let last_log_term = self.log.last_term();
 
-        let peers: Vec<NodeId> = self.peers.clone();
+        let peers: Vec<NodeId> = self.membership.all_peers(self.id);
         for &peer in &peers {
             self.send(
                 peer,
@@ -614,7 +727,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         let mut next_index = HashMap::new();
         let mut match_index = HashMap::new();
 
-        for &peer in &self.peers {
+        for &peer in &self.membership.all_peers(self.id) {
             // Optimistic: assume peer has all entries. If wrong, AppendEntries
             // replies will cause us to decrement until we find the match point.
             next_index.insert(peer, last_index + 1);
@@ -757,12 +870,10 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             return;
         };
 
-        // Total cluster size = self + peers.
-        let cluster_size = self.peers.len() + 1;
-        // Strict majority: more than half.
-        let majority = (cluster_size / 2) + 1;
-
-        if votes_received.len() >= majority {
+        // In joint consensus, a candidate needs majority in BOTH old and new
+        // configs — the same quorum rule used for commit.
+        let confirmed: HashSet<NodeId> = votes_received.clone();
+        if self.membership.has_quorum(&confirmed) {
             self.become_leader();
         }
     }
@@ -875,6 +986,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         }
         if !new_entries.is_empty() {
             self.persist_log_append(&new_entries);
+            // Activate joint consensus for any config-change entries we just appended.
+            self.activate_joint_if_config_entry(&new_entries);
         }
 
         // ── Advance commit index ──
@@ -1130,8 +1243,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             return;
         };
 
-        let cluster_size = self.peers.len() + 1;
-        let majority = (cluster_size / 2) + 1;
+        // Build a snapshot of match_index so we can pass it to the membership
+        // quorum check without holding a reference to self.role.
+        let match_index_snap: HashMap<NodeId, LogIndex> = match_index.clone();
 
         // Check each index from our last log entry down to commit_index + 1.
         // We scan downward because we want the *highest* committable index.
@@ -1142,15 +1256,18 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                 continue;
             }
 
-            // Count how many nodes have this entry (including ourselves).
-            let mut replication_count = 1; // count self
-            for (_, &mi) in match_index.iter() {
+            // Build the set of voters that have this entry (always includes self).
+            let mut confirmed: HashSet<NodeId> = HashSet::new();
+            confirmed.insert(self.id);
+            for (&peer, &mi) in &match_index_snap {
                 if mi >= n {
-                    replication_count += 1;
+                    confirmed.insert(peer);
                 }
             }
 
-            if replication_count >= majority {
+            // Joint-consensus-aware quorum check: during a config transition
+            // this requires majority of BOTH old and new voter sets.
+            if self.membership.has_quorum(&confirmed) {
                 self.volatile.commit_index = n;
                 self.apply_committed_entries();
                 break; // found the highest committable index
@@ -1173,12 +1290,86 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             let index = self.volatile.last_applied;
 
             if let Some(entry) = self.log.get(index) {
-                self.applied.push(ApplyResult {
-                    index,
-                    term: entry.term,
-                    data: entry.data.clone(),
-                });
+                let data = entry.data.clone();
+                let term = entry.term;
+
+                // Config-change entries finalise the joint transition on commit.
+                match Command::decode(&data) {
+                    Some(Command::AddNode(_)) | Some(Command::RemoveNode(_)) => {
+                        self.finalize_config_change();
+                    }
+                    _ => {}
+                }
+
+                self.applied.push(ApplyResult { index, term, data });
             }
+        }
+    }
+
+    /// Called the instant a config-change `LogEntry` is written to the log
+    /// (even before it is committed).  Activates joint consensus so that from
+    /// this point forward every quorum check requires majority in BOTH configs.
+    fn activate_joint_if_config_entry(&mut self, entries: &[LogEntry]) {
+        for entry in entries {
+            match Command::decode(&entry.data) {
+                Some(Command::AddNode(id)) => {
+                    self.membership.begin_add_node(id);
+                    // Initialise leader replication tracking for the new node
+                    // so we begin sending it entries immediately.
+                    if let Role::Leader {
+                        ref mut next_index,
+                        ref mut match_index,
+                        ..
+                    } = self.role
+                    {
+                        next_index.entry(id).or_insert(1);
+                        match_index.entry(id).or_insert(0);
+                    }
+                }
+                Some(Command::RemoveNode(id)) => {
+                    self.membership.begin_remove_node(id);
+                    // Keep replicating to the removed node until the entry
+                    // commits — it still counts in the old-config quorum.
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Called when a config-change entry reaches `commit_index`.  Adopts the
+    /// transitional voter set as the new stable config and updates `peers`.
+    fn finalize_config_change(&mut self) {
+        if !self.membership.is_joint() {
+            return;
+        }
+        let new_voters = self.membership.commit_transition();
+
+        // Update the stable peer list (excludes self).
+        self.peers = new_voters
+            .iter()
+            .copied()
+            .filter(|&id| id != self.id)
+            .collect();
+
+        // Update leader replication tracking.
+        if let Role::Leader {
+            ref mut next_index,
+            ref mut match_index,
+            ..
+        } = self.role
+        {
+            // Ensure any newly confirmed peers have tracking entries.
+            for &voter in &new_voters {
+                if voter == self.id {
+                    continue;
+                }
+                let last = self.log.last_index();
+                next_index.entry(voter).or_insert(last + 1);
+                match_index.entry(voter).or_insert(0);
+            }
+            // Drop tracking for nodes no longer in the cluster.
+            next_index.retain(|id, _| new_voters.contains(id));
+            match_index.retain(|id, _| new_voters.contains(id));
         }
     }
 
@@ -1186,9 +1377,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     //  Replication helpers (leader only)
     // ════════════════════════════════════════════════════════════════════════
 
-    /// Send AppendEntries to all followers.
+    /// Send AppendEntries to all followers (old+new during joint consensus).
     fn replicate_to_all(&mut self) {
-        let peers: Vec<NodeId> = self.peers.clone();
+        let peers: Vec<NodeId> = self.membership.all_peers(self.id);
         for peer in peers {
             self.replicate_to(peer);
         }
@@ -1356,7 +1547,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         self.pre_vote_responses.insert(self.id); // we'd vote for ourselves
         self.reset_election_timer();
 
-        let peers: Vec<NodeId> = self.peers.clone();
+        let peers: Vec<NodeId> = self.membership.all_peers(self.id);
         for &peer in &peers {
             self.send(
                 peer,
@@ -1422,11 +1613,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         }
     }
 
-    /// Check if we have a pre-vote majority.
+    /// Check if we have a pre-vote majority (joint-consensus-aware).
     fn has_pre_vote_majority(&self) -> bool {
-        let cluster_size = self.peers.len() + 1;
-        let majority = (cluster_size / 2) + 1;
-        self.pre_vote_responses.len() >= majority
+        self.membership.has_quorum(&self.pre_vote_responses)
     }
 
     /// Check if a candidate's log is at least as up-to-date as ours (§5.4.1).
@@ -1579,9 +1768,19 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         matches!(self.role, Role::Candidate { .. })
     }
 
-    /// Returns the cluster size (self + peers).
+    /// Returns the stable cluster size (old voter set).
     pub fn cluster_size(&self) -> usize {
-        self.peers.len() + 1
+        self.membership.voters.len()
+    }
+
+    /// Current stable voter set (includes self).
+    pub fn voters(&self) -> &HashSet<NodeId> {
+        &self.membership.voters
+    }
+
+    /// New voter set during a joint-consensus transition; `None` when stable.
+    pub fn transitional_voters(&self) -> Option<&HashSet<NodeId>> {
+        self.membership.transitional.as_ref()
     }
 
     /// Returns who we believe the current leader is, or `None` if unknown.
@@ -5815,5 +6014,307 @@ mod tests {
         } else {
             panic!("expected InstallSnapshotResponse");
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Cluster membership / joint-consensus tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    // ── Helpers ──
+
+    /// A leader in a two-node cluster {1, 2}: node 1 is leader in term 1,
+    /// node 2 has acknowledged the noop (match_index[2] = 1).
+    fn two_node_leader() -> RaftNode {
+        let mut leader = RaftNode::new(1, vec![2], default_config());
+        // Force election win.
+        leader.tick(25);
+        leader.drain_messages();
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: true }),
+        ));
+        assert!(leader.is_leader());
+
+        // Acknowledge the noop so match_index[2] = 1.
+        leader.drain_messages();
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }),
+        ));
+        leader.drain_messages();
+        leader
+    }
+
+    /// A leader in a three-node cluster {1, 2, 3}: node 1 is leader in term 1.
+    fn three_node_leader() -> RaftNode {
+        let mut leader = three_node_cluster(1);
+        leader.tick(25);
+        leader.drain_messages();
+        leader.step(envelope(
+            2,
+            1,
+            Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: true }),
+        ));
+        assert!(leader.is_leader());
+
+        // Acknowledge noop on both peers.
+        leader.drain_messages();
+        for peer in [2u64, 3] {
+            leader.step(envelope(
+                peer,
+                1,
+                Rpc::AppendEntriesResponse(AppendEntriesReply {
+                    term: 1,
+                    success: true,
+                    match_index: 1,
+                }),
+            ));
+        }
+        leader.drain_messages();
+        leader
+    }
+
+    /// Ack `match_index` from `peer` to `leader`.
+    fn ack(leader: &mut RaftNode, peer: NodeId, match_index: u64) {
+        leader.step(envelope(
+            peer,
+            1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: leader.current_term(),
+                success: true,
+                match_index,
+            }),
+        ));
+        leader.drain_messages();
+    }
+
+    // ── AddNode ──
+
+    #[test]
+    fn add_node_activates_joint_consensus_on_append() {
+        let mut leader = two_node_leader();
+        // Before the change: stable config {1, 2}.
+        assert!(!leader.membership.is_joint());
+        assert_eq!(leader.voters().len(), 2);
+
+        // Propose AddNode(3).
+        let idx = leader.append_entry(Command::AddNode(3)).unwrap();
+        assert!(idx > 0);
+
+        // Joint consensus must be active immediately on append.
+        assert!(leader.membership.is_joint());
+        let old = leader.voters();
+        let new = leader.transitional_voters().unwrap();
+        assert!(old.contains(&1) && old.contains(&2));
+        assert!(new.contains(&1) && new.contains(&2) && new.contains(&3));
+    }
+
+    #[test]
+    fn add_node_requires_new_majority_to_commit() {
+        // Two-node cluster: AddNode(3) → joint {1,2} + {1,2,3}.
+        // Old majority = 2 (both), new majority = 2 (any two of three).
+        // Node 2 acks but node 3 has not acked yet → should not commit.
+        let mut leader = two_node_leader();
+        let idx = leader.append_entry(Command::AddNode(3)).unwrap();
+
+        // Only node 2 acks.
+        ack(&mut leader, 2, idx);
+        // Old config: 2/2 = ✓. New config: {1,2} acked out of {1,2,3} = 2/3 ✓.
+        // So it SHOULD commit — both old and new majority are satisfied.
+        // (Node 1 counts in both; node 2 acks in both; node 3 hasn't, so new = 2/3 which IS a majority.)
+        assert_eq!(leader.commit_index(), idx, "should commit: majority of new config (2/3) satisfied");
+    }
+
+    #[test]
+    fn add_node_commit_finalizes_config() {
+        let mut leader = two_node_leader();
+        let idx = leader.append_entry(Command::AddNode(3)).unwrap();
+
+        // Ack from node 2 satisfies both majorities (old={1,2}, new has 2/3).
+        ack(&mut leader, 2, idx);
+
+        // Joint phase must end once the entry commits.
+        assert!(!leader.membership.is_joint(), "joint phase should end after commit");
+        assert_eq!(leader.voters().len(), 3);
+        assert!(leader.voters().contains(&3));
+        // peers list updated.
+        assert!(leader.peers.contains(&3));
+    }
+
+    #[test]
+    fn add_node_followers_activate_joint_on_append_entries() {
+        // A follower must activate joint consensus the moment it appends
+        // an AddNode entry, even before the leader commits it.
+        let mut follower = RaftNode::new(2, vec![1, 3], default_config());
+
+        let add_entry = LogEntry {
+            term: 1,
+            data: Command::AddNode(4).encode(),
+        };
+        follower.step(envelope(
+            1,
+            2,
+            Rpc::AppendEntries(AppendEntriesArgs {
+                term: 1,
+                leader_id: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![add_entry],
+                leader_commit: 0, // NOT yet committed by leader
+            }),
+        ));
+        follower.drain_messages();
+
+        // Joint consensus is active even though the entry is not committed.
+        assert!(follower.membership.is_joint());
+        let new = follower.transitional_voters().unwrap();
+        assert!(new.contains(&4));
+    }
+
+    // ── RemoveNode ──
+
+    #[test]
+    fn remove_node_activates_joint_consensus_on_append() {
+        let mut leader = three_node_leader();
+        assert!(!leader.membership.is_joint());
+
+        leader.append_entry(Command::RemoveNode(3)).unwrap();
+
+        assert!(leader.membership.is_joint());
+        let new = leader.transitional_voters().unwrap();
+        // New config must not contain node 3.
+        assert!(!new.contains(&3));
+        assert!(new.contains(&1) && new.contains(&2));
+    }
+
+    #[test]
+    fn remove_node_commit_finalizes_config() {
+        // Three-node cluster {1,2,3}: remove node 3.
+        // Old majority = 2; new config = {1,2}, majority = 2.
+        let mut leader = three_node_leader();
+        let idx = leader.append_entry(Command::RemoveNode(3)).unwrap();
+
+        // Ack from nodes 2 and 3 satisfies both majorities.
+        ack(&mut leader, 2, idx);
+        ack(&mut leader, 3, idx);
+
+        assert!(!leader.membership.is_joint());
+        assert_eq!(leader.voters().len(), 2);
+        assert!(!leader.voters().contains(&3));
+        assert!(!leader.peers.contains(&3));
+    }
+
+    // ── Overlapping majorities (joint-consensus quorum check) ──
+
+    #[test]
+    fn overlapping_majorities_needed_when_new_node_cannot_ack() {
+        // Three-node cluster {1,2,3}: AddNode(4) → joint {1,2,3} + {1,2,3,4}.
+        // Old majority = 2 (of 3). New majority = 3 (of 4).
+        // If only nodes 1 and 2 ack, new_count = 2 which is NOT a majority of 4.
+        let mut leader = three_node_leader();
+        let idx = leader.append_entry(Command::AddNode(4)).unwrap();
+
+        // Ack from node 2 only (node 3 and 4 have not acked).
+        // confirmed = {1, 2}: old = 2/3 ✓, new = 2/4 ✗ → must NOT commit.
+        ack(&mut leader, 2, idx);
+        assert!(
+            leader.commit_index() < idx,
+            "should not commit: new config needs 3/4 but only 2/4 confirmed"
+        );
+
+        // Node 3 acks: confirmed = {1, 2, 3}: old = 3/3 ✓, new = 3/4 ✓ → commits.
+        ack(&mut leader, 3, idx);
+        assert_eq!(leader.commit_index(), idx);
+        assert!(!leader.membership.is_joint());
+    }
+
+    #[test]
+    fn old_majority_alone_insufficient_during_joint() {
+        // Five-node cluster {1,2,3,4,5}: RemoveNode(5) → joint {1,2,3,4,5} + {1,2,3,4}.
+        // Old majority = 3 (of 5). New majority = 3 (of 4).
+        // If old majority is reached (3 of 5) but new majority isn't (say only 2 of 4),
+        // the entry must NOT commit.
+
+        // Set up a five-node leader.
+        let mut leader = five_node_cluster(1);
+        leader.tick(25);
+        leader.drain_messages();
+        // Give it votes from nodes 2, 3, 4, 5.
+        for peer in [2u64, 3, 4, 5] {
+            leader.step(envelope(
+                peer, 1,
+                Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: true }),
+            ));
+        }
+        assert!(leader.is_leader());
+        leader.drain_messages();
+        // Ack the noop from all followers.
+        for peer in [2u64, 3, 4, 5] {
+            ack(&mut leader, peer, 1);
+        }
+
+        let idx = leader.append_entry(Command::RemoveNode(5)).unwrap();
+        // confirmed = {1, 2, 3}: old = 3/5 ✓, new = 3/4 ✓ → commits.
+        // But if only {1, 2}: old = 2/5 ✗ → must not commit.
+
+        // Only node 2 acks — old count = 2/5, does not meet old majority.
+        ack(&mut leader, 2, idx);
+        assert!(leader.commit_index() < idx, "2/5 does not meet old majority of 3");
+
+        // Node 3 acks — old = 3/5 ✓, new (nodes 1,2,3 in {1,2,3,4}) = 3/4 ✓ → commits.
+        ack(&mut leader, 3, idx);
+        assert_eq!(leader.commit_index(), idx);
+        assert!(!leader.membership.is_joint());
+        assert_eq!(leader.voters().len(), 4);
+    }
+
+    #[test]
+    fn new_majority_alone_insufficient_during_joint() {
+        // Four-node cluster {1,2,3,4}: AddNode(5) → joint {1,2,3,4} + {1,2,3,4,5}.
+        // New majority = 3 (of 5). Old majority = 3 (of 4).
+        // If the new config has 3/5 but old config has only 2/4, must NOT commit.
+
+        let mut leader = RaftNode::new(1, vec![2, 3, 4], default_config());
+        leader.tick(25);
+        leader.drain_messages();
+        for peer in [2u64, 3, 4] {
+            leader.step(envelope(
+                peer, 1,
+                Rpc::RequestVoteResponse(RequestVoteReply { term: 1, vote_granted: true }),
+            ));
+        }
+        assert!(leader.is_leader());
+        leader.drain_messages();
+        for peer in [2u64, 3, 4] {
+            ack(&mut leader, peer, 1);
+        }
+
+        let idx = leader.append_entry(Command::AddNode(5)).unwrap();
+        // Joint: old = {1,2,3,4} (need 3), new = {1,2,3,4,5} (need 3).
+
+        // Node 2 acks: confirmed = {1,2}. old = 2/4 ✗ → no commit.
+        ack(&mut leader, 2, idx);
+        assert!(leader.commit_index() < idx);
+
+        // Node 5 also acks (it just joined but can send a response):
+        // confirmed = {1,2,5}. old = 2/4 ✗ → still no commit even though new = 3/5.
+        leader.step(envelope(5, 1,
+            Rpc::AppendEntriesResponse(AppendEntriesReply {
+                term: 1, success: true, match_index: idx,
+            }),
+        ));
+        leader.drain_messages();
+        assert!(leader.commit_index() < idx, "new majority without old majority must not commit");
+
+        // Node 3 acks: confirmed = {1,2,3,5}. old = 3/4 ✓, new = 4/5 ✓ → commits.
+        ack(&mut leader, 3, idx);
+        assert_eq!(leader.commit_index(), idx);
+        assert!(!leader.membership.is_joint());
     }
 }
