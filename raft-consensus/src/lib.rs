@@ -6,4 +6,5 @@ pub mod server;
 pub mod simulator;
 pub mod state;
 pub mod storage;
+pub mod transport;
 pub mod wire;

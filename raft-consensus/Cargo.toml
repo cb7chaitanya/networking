@@ -6,6 +6,7 @@ description = "Raft consensus algorithm implemented from scratch in Rust"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 serde_json = "1"
