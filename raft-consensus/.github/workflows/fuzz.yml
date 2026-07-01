@@ -1,0 +1,76 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Extended nightly run at 02:00 UTC every day.
+    - cron: "0 2 * * *"
+
+jobs:
+  fuzz:
+    name: fuzz / ${{ matrix.target }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false   # run all targets even if one finds a crash
+      matrix:
+        target:
+          - wire_decode        # arbitrary bytes → decode, roundtrip
+          - message_roundtrip  # structured input → encode/decode idempotency
+          - snapshot_decode    # InstallSnapshot-specific paths
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # cargo-fuzz requires a nightly toolchain.
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src  # needed by -Z build-std inside cargo-fuzz
+
+      # Cache the fuzz build artefacts separately from the main build cache
+      # so a change in the library doesn't bust the fuzzer binary cache and
+      # vice versa.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: fuzz-cargo-${{ runner.os }}-${{ hashFiles('raft-consensus/fuzz/Cargo.toml') }}
+          restore-keys: fuzz-cargo-${{ runner.os }}-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # On a scheduled run the job has more budget; give it 5 minutes per
+      # target.  On push/PR we only verify the harness compiles and runs
+      # without immediate crashes (30 seconds is enough to catch trivial bugs
+      # and keeps CI fast).
+      - name: Set fuzz duration
+        id: duration
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "seconds=300" >> "$GITHUB_OUTPUT"
+          else
+            echo "seconds=30"  >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: raft-consensus
+        run: |
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            -- -max_total_time=${{ steps.duration.outputs.seconds }}
+
+      # Upload any crash artifacts so they can be reproduced locally.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: |
+            raft-consensus/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

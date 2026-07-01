@@ -1,0 +1,36 @@
+[package]
+name = "raft-consensus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.raft-consensus]
+path = ".."
+
+# Prevent this from being picked up as a member of the root workspace.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "message_roundtrip"
+path = "fuzz_targets/message_roundtrip.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "snapshot_decode"
+path = "fuzz_targets/snapshot_decode.rs"
+doc = false
+test = false

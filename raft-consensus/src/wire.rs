@@ -270,7 +270,12 @@ pub fn decode(data: &[u8]) -> Result<Rpc, WireError> {
             let leader_commit = cursor.read_u64()?;
             let entry_count = cursor.read_u32()? as usize;
 
-            let mut entries = Vec::with_capacity(entry_count);
+            // Cap the pre-allocation to what the remaining buffer can hold.
+            // Each entry requires at least 12 bytes (8 term + 4 data_len).
+            // Without this cap a malformed entry_count of u32::MAX would
+            // cause Vec::with_capacity to try to allocate ~100 GB.
+            let remaining = cursor.data.len().saturating_sub(cursor.pos);
+            let mut entries = Vec::with_capacity(entry_count.min(remaining / 12));
             for _ in 0..entry_count {
                 let entry_term = cursor.read_u64()?;
                 let data_len = cursor.read_u32()? as usize;
