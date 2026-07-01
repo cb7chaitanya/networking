@@ -7,4 +7,5 @@ pub mod simulator;
 pub mod state;
 pub mod storage;
 pub mod transport;
+pub mod wal;
 pub mod wire;

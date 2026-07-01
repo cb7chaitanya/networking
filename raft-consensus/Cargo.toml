@@ -5,6 +5,7 @@ edition = "2021"
 description = "Raft consensus algorithm implemented from scratch in Rust"
 
 [dependencies]
+crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 
