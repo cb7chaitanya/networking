@@ -22,6 +22,12 @@ A SWIM-style gossip membership protocol where nodes discover peers, detect failu
 
 **~6,600 lines | 250+ tests | property tests | fuzz targets | benchmarks**
 
+### [raft-consensus](raft-consensus/)
+
+A full implementation of the Raft consensus algorithm covering the complete paper and dissertation: leader election, PreVote, log replication, joint consensus membership changes, leadership transfer, ReadIndex, snapshotting, and crash recovery via a segmented CRC32-framed WAL. The consensus core is a pure deterministic state machine driven by a seeded in-process simulator for testing and an async TCP transport for production. Includes a Prometheus/Grafana observability stack with 22+ metrics and a 27-panel dashboard.
+
+**~15,000 lines | 319+ tests | 3 fuzz targets | benchmarks | Prometheus metrics**
+
 ## Building
 
 Each project is a standalone Cargo package — no workspace. Build and test independently:
@@ -30,6 +36,7 @@ Each project is a standalone Cargo package — no workspace. Build and test inde
 cd tcp-over-udp && cargo test
 cd dns-resolver && cargo test
 cd gossip-membership && cargo test
+cd raft-consensus && cargo test
 ```
 
 ## Structure
@@ -37,6 +44,7 @@ cd gossip-membership && cargo test
 ```
 networking/
 ├── tcp-over-udp/          # TCP over UDP (transport layer)
-├── dns-resolver/           # Iterative DNS resolver (application layer)
-└── gossip-membership/      # SWIM gossip protocol (distributed systems)
+├── dns-resolver/          # Iterative DNS resolver (application layer)
+├── gossip-membership/     # SWIM gossip protocol (distributed systems)
+└── raft-consensus/        # Raft consensus algorithm (distributed consensus)
 ```
