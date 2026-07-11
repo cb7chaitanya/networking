@@ -40,6 +40,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -47,6 +48,7 @@ use crc32fast::Hasher as CrcHasher;
 
 use crate::{
     log::LogEntry,
+    metrics::RaftMetrics,
     state::{LogIndex, NodeId, Term},
     storage::{HardState, Result as StorageResult, Snapshot, Storage, StorageError},
 };
@@ -381,6 +383,8 @@ pub struct WalStorage {
     snapshot: Option<Snapshot>,
     // For FsyncPolicy::EveryN.
     last_fsync: Option<Instant>,
+    // Optional metrics (set via attach_metrics after open).
+    metrics: Option<Arc<RaftMetrics>>,
 }
 
 impl WalStorage {
@@ -411,7 +415,8 @@ impl WalStorage {
 
         let active_size = active_file.metadata()?.len();
 
-        Ok(WalStorage {
+        let seg_count = list_segment_ids(&dir)?.len() as u64;
+        let wal = WalStorage {
             dir,
             config,
             active_id: rec.active_id,
@@ -422,7 +427,22 @@ impl WalStorage {
             log: rec.log,
             snapshot,
             last_fsync: None,
-        })
+            metrics: None,
+        };
+        // Seed segment-count gauge (metrics not attached yet, but cache for
+        // when attach_metrics is called later).
+        let _ = seg_count; // captured below via set_wal_segment_count
+        Ok(wal)
+    }
+
+    /// Attach a metrics store.  Call after `open` if you want WAL gauges
+    /// (`wal_bytes_written_total`, `wal_segment_count`, `wal_active_segment_bytes`)
+    /// to be populated.
+    pub fn attach_metrics(&mut self, m: Arc<RaftMetrics>) {
+        let seg_count = list_segment_ids(&self.dir).unwrap_or_default().len() as u64;
+        m.set_wal_segment_count(seg_count);
+        m.set_wal_active_segment_bytes(self.active_size);
+        self.metrics = Some(m);
     }
 
     // ── Internal write path ──────────────────────────────────────────────
@@ -436,10 +456,15 @@ impl WalStorage {
         }
 
         let record = encode_record(k, payload);
+        let record_len = record.len() as u64;
         self.active_file
             .write_all(&record)
             .map_err(|e| StorageError::Io(e.to_string()))?;
-        self.active_size += record.len() as u64;
+        self.active_size += record_len;
+        if let Some(ref m) = self.metrics {
+            m.add_wal_bytes_written(record_len);
+            m.set_wal_active_segment_bytes(self.active_size);
+        }
 
         self.maybe_fsync()
             .map_err(|e| StorageError::Io(e.to_string()))?;
@@ -456,6 +481,11 @@ impl WalStorage {
             .create(true)
             .append(true)
             .open(&path)?;
+        if let Some(ref m) = self.metrics {
+            let seg_count = list_segment_ids(&self.dir).unwrap_or_default().len() as u64;
+            m.set_wal_segment_count(seg_count);
+            m.set_wal_active_segment_bytes(0);
+        }
         Ok(())
     }
 

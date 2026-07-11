@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: "raft_cluster"
+    static_configs:
+      - targets:
+          - "host.docker.internal:9001"
+          - "host.docker.internal:9002"
+          - "host.docker.internal:9003"
+        labels:
+          cluster: "raft-demo"
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: "host.docker.internal:(\\d+)"
+        target_label: node_id
+        replacement: "${1}"
+    metrics_path: /metrics

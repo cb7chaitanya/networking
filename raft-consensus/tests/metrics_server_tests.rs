@@ -109,10 +109,10 @@ fn metrics_body_contains_all_counter_names() {
     let raw = http_get(&addr, "/metrics");
     let b = body(&raw);
     for name in &[
-        "elections_total",
-        "vote_requests_total",
-        "append_entries_total",
-        "snapshots_sent_total",
+        "raft_elections_total",
+        "raft_vote_requests_total",
+        "raft_append_entries_total",
+        "raft_snapshots_sent_total",
     ] {
         assert!(b.contains(name), "missing counter '{name}' in /metrics body: {b}");
     }
@@ -123,7 +123,7 @@ fn metrics_body_contains_all_gauge_names() {
     let addr = spawn(Arc::new(RaftMetrics::new()));
     let raw = http_get(&addr, "/metrics");
     let b = body(&raw);
-    for name in &["current_term", "commit_index", "last_applied", "leader_id"] {
+    for name in &["raft_current_term", "raft_commit_index", "raft_last_applied", "raft_leader_id"] {
         assert!(b.contains(name), "missing gauge '{name}' in /metrics body: {b}");
     }
 }
@@ -133,8 +133,8 @@ fn metrics_body_contains_type_hints() {
     let addr = spawn(Arc::new(RaftMetrics::new()));
     let raw = http_get(&addr, "/metrics");
     let b = body(&raw);
-    assert!(b.contains("# TYPE elections_total counter"), "missing TYPE hint: {b}");
-    assert!(b.contains("# TYPE current_term gauge"), "missing TYPE hint: {b}");
+    assert!(b.contains("# TYPE raft_elections_total counter"), "missing TYPE hint: {b}");
+    assert!(b.contains("# TYPE raft_current_term gauge"), "missing TYPE hint: {b}");
 }
 
 #[test]
@@ -151,10 +151,10 @@ fn metrics_values_reflect_current_state() {
     let raw = http_get(&addr, "/metrics");
     let b = body(&raw);
 
-    assert!(b.contains("elections_total 3"), "wrong elections count: {b}");
-    assert!(b.contains("current_term 7"), "wrong term: {b}");
-    assert!(b.contains("leader_id 2"), "wrong leader_id: {b}");
-    assert!(b.contains("commit_index 99"), "wrong commit_index: {b}");
+    assert!(b.contains("raft_elections_total 3"), "wrong elections count: {b}");
+    assert!(b.contains("raft_current_term 7"), "wrong term: {b}");
+    assert!(b.contains("raft_leader_id 2"), "wrong leader_id: {b}");
+    assert!(b.contains("raft_commit_index 99"), "wrong commit_index: {b}");
 }
 
 #[test]
@@ -171,8 +171,8 @@ fn metrics_counters_accumulate_across_updates() {
 
     let raw = http_get(&addr, "/metrics");
     let b = body(&raw);
-    assert!(b.contains("vote_requests_total 10"), "expected 10 vote requests: {b}");
-    assert!(b.contains("append_entries_total 5"), "expected 5 append entries: {b}");
+    assert!(b.contains("raft_vote_requests_total 10"), "expected 10 vote requests: {b}");
+    assert!(b.contains("raft_append_entries_total 5"), "expected 5 append entries: {b}");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -276,7 +276,7 @@ fn server_handles_multiple_sequential_requests() {
         m.set_current_term(i);
         let b = body(&http_get(&addr, "/metrics")).to_owned();
         assert!(
-            b.contains(&format!("current_term {i}")),
+            b.contains(&format!("raft_current_term {i}")),
             "tick {i}: wrong term in response: {b}"
         );
     }
@@ -420,15 +420,15 @@ fn metrics_visible_through_http_after_node_operations() {
     // Now verify the HTTP endpoint reflects what the node updated.
     let b = body(&http_get(&addr, "/metrics")).to_owned();
     assert!(
-        b.contains("elections_total 1"),
+        b.contains("raft_elections_total 1"),
         "HTTP /metrics should show 1 election: {b}"
     );
     assert!(
-        b.contains("current_term 1"),
+        b.contains("raft_current_term 1"),
         "HTTP /metrics should show term=1: {b}"
     );
     assert!(
-        b.contains("leader_id 1"),
+        b.contains("raft_leader_id 1"),
         "HTTP /metrics should show leader_id=1: {b}"
     );
 }

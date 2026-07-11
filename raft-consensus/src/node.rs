@@ -821,6 +821,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         };
         self.log.append(entry.clone());
         self.persist_log_append(&[entry.clone()]);
+        if let Some(ref m) = self.metrics {
+            m.inc_proposals();
+        }
         // Activate joint consensus immediately if this is a config-change entry.
         self.activate_joint_if_config_entry(&[entry]);
 
@@ -861,6 +864,9 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
     /// calling this (via `update_term()`), unless we're already in the correct term.
     fn become_follower(&mut self) {
         self.role = Role::Follower;
+        if let Some(ref m) = self.metrics {
+            m.set_is_leader(0);
+        }
         self.reset_election_timer();
         self.abort_pending_reads();
         self.transfer = None;
@@ -886,6 +892,8 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         if let Some(ref m) = self.metrics {
             m.set_current_term(self.persistent.current_term);
             m.set_leader_id(0); // no leader during an election
+            m.set_is_leader(0);
+            m.inc_term_changes();
         }
 
         // Step 2: vote for self
@@ -963,6 +971,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
 
         if let Some(ref m) = self.metrics {
             m.set_leader_id(self.id);
+            m.set_is_leader(1);
         }
 
         // Reset heartbeat timer so we send heartbeats immediately.
@@ -1012,6 +1021,7 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         if let Some(ref m) = self.metrics {
             m.set_current_term(new_term);
             m.set_leader_id(0); // leader unknown after a term change
+            m.inc_term_changes();
         }
 
         self.become_follower();
@@ -1277,6 +1287,11 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
                     *ni = new_ni;
                 }
             }
+            if let Some(ref m) = self.metrics {
+                m.update_peer_match_index(from, confirmed);
+                let ni = next_index.get(&from).copied().unwrap_or(0);
+                m.update_peer_next_index(from, ni);
+            }
 
             // Check if we can advance the commit index.
             self.maybe_advance_commit_index();
@@ -1376,6 +1391,10 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
         // Advance snapshot tracking fields.
         self.snapshot_index = last_included_index;
         self.snapshot_term = last_included_term;
+        if let Some(ref m) = self.metrics {
+            m.inc_snapshots_received();
+            m.set_snapshot_last_index(last_included_index);
+        }
 
         // Advance commit_index and last_applied to the snapshot boundary.
         // Entries up to last_included_index are already "applied" by definition
@@ -1510,9 +1529,13 @@ impl<S: Storage, L: RaftLog> RaftNode<S, L> {
             // Joint-consensus-aware quorum check: during a config transition
             // this requires majority of BOTH old and new voter sets.
             if self.membership.has_quorum(&confirmed) {
+                let prev = self.volatile.commit_index;
                 self.volatile.commit_index = n;
                 if let Some(ref m) = self.metrics {
                     m.set_commit_index(n);
+                    if n > prev {
+                        m.add_proposals_committed(n - prev);
+                    }
                 }
                 self.apply_committed_entries();
                 break; // found the highest committable index

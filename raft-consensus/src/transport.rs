@@ -84,8 +84,8 @@ pub fn encode_frame(envelope: &Envelope) -> Vec<u8> {
     frame
 }
 
-/// Read one frame from `stream` and decode it into an [`Envelope`].
-async fn read_frame(stream: &mut TcpStream) -> tokio::io::Result<Envelope> {
+/// Read one frame from `stream` and decode it into an `(Envelope, bytes_read)` pair.
+async fn read_frame(stream: &mut TcpStream) -> tokio::io::Result<(Envelope, u64)> {
     let body_len = stream.read_u32().await? as usize;
     if body_len < ENVELOPE_HEADER {
         return Err(tokio::io::Error::new(
@@ -104,7 +104,9 @@ async fn read_frame(stream: &mut TcpStream) -> tokio::io::Result<Envelope> {
         tokio::io::Error::new(tokio::io::ErrorKind::InvalidData, e.to_string())
     })?;
 
-    Ok(Envelope { from, to, payload })
+    // 4-byte length prefix + body.
+    let bytes_read = (4 + body_len) as u64;
+    Ok((Envelope { from, to, payload }, bytes_read))
 }
 
 // ── TcpTransport ─────────────────────────────────────────────────────────────
@@ -122,6 +124,8 @@ pub struct TcpTransport {
     peer_txs: HashMap<NodeId, mpsc::UnboundedSender<Vec<u8>>>,
     /// Clone this to hand to newly accepted reader tasks.
     incoming_tx: mpsc::UnboundedSender<Envelope>,
+    /// Optional metrics store — shared with writer/reader tasks.
+    metrics: Option<Arc<RaftMetrics>>,
 }
 
 impl TcpTransport {
@@ -133,16 +137,23 @@ impl TcpTransport {
                 node_id,
                 peer_txs: HashMap::new(),
                 incoming_tx,
+                metrics: None,
             },
             incoming_rx,
         )
+    }
+
+    /// Attach a metrics store. Must be called before `add_peer` / `listen`
+    /// for the store to be visible to background tasks.
+    pub fn set_metrics(&mut self, m: Arc<RaftMetrics>) {
+        self.metrics = Some(m);
     }
 
     /// Register a peer and spawn a background writer task that maintains the
     /// outgoing TCP connection with automatic reconnect.
     pub fn add_peer(&mut self, peer_id: NodeId, addr: SocketAddr) {
         let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(peer_writer_task(peer_id, addr, rx));
+        tokio::spawn(peer_writer_task(peer_id, addr, rx, self.metrics.clone()));
         self.peer_txs.insert(peer_id, tx);
     }
 
@@ -154,7 +165,7 @@ impl TcpTransport {
         let listener = TcpListener::bind(addr).await?;
         let bound = listener.local_addr()?;
         let incoming_tx = self.incoming_tx.clone();
-        tokio::spawn(accept_loop(listener, incoming_tx));
+        tokio::spawn(accept_loop(listener, incoming_tx, self.metrics.clone()));
         Ok(bound)
     }
 
@@ -171,12 +182,16 @@ impl TcpTransport {
 // ── Background tasks ─────────────────────────────────────────────────────────
 
 /// Accept incoming TCP connections and spawn a reader task per connection.
-async fn accept_loop(listener: TcpListener, incoming_tx: mpsc::UnboundedSender<Envelope>) {
+async fn accept_loop(
+    listener: TcpListener,
+    incoming_tx: mpsc::UnboundedSender<Envelope>,
+    metrics: Option<Arc<RaftMetrics>>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _peer_addr)) => {
                 let tx = incoming_tx.clone();
-                tokio::spawn(reader_task(stream, tx));
+                tokio::spawn(reader_task(stream, tx, metrics.clone()));
             }
             Err(_) => break, // listener was closed
         }
@@ -184,10 +199,17 @@ async fn accept_loop(listener: TcpListener, incoming_tx: mpsc::UnboundedSender<E
 }
 
 /// Read frames from an accepted connection and forward them as envelopes.
-async fn reader_task(mut stream: TcpStream, tx: mpsc::UnboundedSender<Envelope>) {
+async fn reader_task(
+    mut stream: TcpStream,
+    tx: mpsc::UnboundedSender<Envelope>,
+    metrics: Option<Arc<RaftMetrics>>,
+) {
     loop {
         match read_frame(&mut stream).await {
-            Ok(envelope) => {
+            Ok((envelope, bytes)) => {
+                if let Some(ref m) = metrics {
+                    m.add_transport_bytes_received(bytes);
+                }
                 if tx.send(envelope).is_err() {
                     break; // receiver dropped
                 }
@@ -206,6 +228,7 @@ async fn peer_writer_task(
     _peer_id: NodeId,
     addr: SocketAddr,
     mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    metrics: Option<Arc<RaftMetrics>>,
 ) {
     let mut pending: std::collections::VecDeque<Vec<u8>> = Default::default();
     let mut backoff = Duration::from_millis(RECONNECT_BASE_MS);
@@ -218,10 +241,14 @@ async fn peer_writer_task(
                 // Flush messages that arrived while we were disconnected.
                 let mut flush_ok = true;
                 while let Some(frame) = pending.pop_front() {
+                    let n = frame.len() as u64;
                     if stream.write_all(&frame).await.is_err() {
                         pending.push_front(frame);
                         flush_ok = false;
                         break;
+                    }
+                    if let Some(ref m) = metrics {
+                        m.add_transport_bytes_sent(n);
                     }
                 }
                 if !flush_ok {
@@ -233,9 +260,13 @@ async fn peer_writer_task(
                 loop {
                     match rx.recv().await {
                         Some(frame) => {
+                            let n = frame.len() as u64;
                             if stream.write_all(&frame).await.is_err() {
                                 pending.push_back(frame);
                                 break; // reconnect
+                            }
+                            if let Some(ref m) = metrics {
+                                m.add_transport_bytes_sent(n);
                             }
                         }
                         None => return, // sender dropped; node shut down
@@ -243,6 +274,9 @@ async fn peer_writer_task(
                 }
             }
             Err(_) => {
+                if let Some(ref m) = metrics {
+                    m.inc_transport_reconnects();
+                }
                 time::sleep(backoff).await;
                 backoff = (backoff * 2).min(Duration::from_millis(RECONNECT_MAX_MS));
             }
@@ -306,6 +340,7 @@ impl NodeRunner {
             .with_metrics(Arc::clone(&metrics));
 
         let (mut transport, incoming_rx) = TcpTransport::new(id);
+        transport.set_metrics(Arc::clone(&metrics));
         for (peer_id, peer_addr) in &peers {
             transport.add_peer(*peer_id, *peer_addr);
         }
