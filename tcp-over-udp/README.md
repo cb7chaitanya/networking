@@ -219,20 +219,25 @@ let sim = SimulatedSocket::bind(addr, SimulationConfig {
 ## Test Coverage
 
 ```
-cargo test --lib                                      # 107 unit tests
-cargo test --test gbn_tests -- --skip test_gbn_concurrent_session  # 40 integration tests
-cargo test --test simulator_tests                     # 14 simulator tests
+cargo test --lib                          # 112 unit tests
+cargo test --test gbn_tests               # 48 integration tests
+cargo test --test simulator_tests         # 14 simulator tests
+cargo test --test timestamp_test          # 10 tests
+cargo test --test rst_tests               # 7 tests
+# ... (200 tests total)
 ```
 
 | Module | Tests | Focus |
 |---|---|---|
-| `packet.rs` | 28 | Encode/decode, MSS, SACK, checksum, flags |
-| `rtt.rs` | 11 | EWMA convergence, back-off, min/max RTO |
-| `persist_timer.rs` | 10 | Zero-window activation, probe back-off |
+| `packet.rs` | 33 | Encode/decode, MSS, SACK, checksum, flags |
 | `gbn_sender.rs` | 38 | Window, ACK, CC transitions, SACK marking |
 | `gbn_receiver.rs` | 20 | OOO buffer, delivery chain, SACK blocks |
-| `gbn_tests.rs` | 40 | Full connection lifecycle, CC, flow control, SR, Nagle, TIME_WAIT |
+| `rtt.rs` | 11 | EWMA convergence, back-off, min/max RTO |
+| `persist_timer.rs` | 10 | Zero-window activation, probe back-off |
+| `gbn_tests.rs` | 48 | Full connection lifecycle, CC, flow control, SR, Nagle, TIME_WAIT |
 | `simulator_tests.rs` | 14 | Loss, reorder, corrupt, duplicate, BW throttle, PRNG seed |
+| `rst_tests.rs` | 7 | RST handling |
+| `timestamp_test.rs` | 10 | RTT timestamp accuracy |
 
 ## Dependencies
 

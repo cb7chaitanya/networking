@@ -8,7 +8,7 @@ Networking and distributed systems protocols implemented from scratch in Rust. E
 
 A complete TCP-like reliable transport stack running over UDP sockets. Implements the 3-way handshake, sliding window (Go-Back-N + Selective Repeat), SACK, TCP Reno congestion control, RTT estimation (RFC 6298), flow control with persist timer, Nagle's algorithm, and full connection teardown — all verified against a pluggable fault-injection simulator.
 
-**~8,000 lines | 160+ tests | 16 modules**
+**~8,000 lines | 200+ tests | 16 modules**
 
 ### [dns-resolver](dns-resolver/)
 
@@ -20,7 +20,7 @@ An iterative DNS resolver that starts from the 13 IANA root servers and walks th
 
 A SWIM-style gossip membership protocol where nodes discover peers, detect failures via direct + indirect probes, and maintain a consistent cluster view through epidemic dissemination. Features ChaCha20-Poly1305 encryption, anti-entropy full-table sync, adaptive fanout, rate limiting, and a Prometheus/Grafana observability stack.
 
-**~6,600 lines | 250+ tests | property tests | fuzz targets | benchmarks**
+**~6,600 lines | 266+ tests | property tests | fuzz targets | benchmarks**
 
 ### [raft-consensus](raft-consensus/)
 

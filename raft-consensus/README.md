@@ -558,6 +558,12 @@ Every `raft_node` process exposes an HTTP server (enabled with `--metrics host:p
 
 The Grafana dashboard (`observability/grafana/dashboards/raft.json`) has 27 panels across 9 sections covering leader timeline, term history, proposal throughput, commit latency, replication lag, follower status, snapshot activity, WAL growth, and transport bandwidth. See [`docs/observability.md`](docs/observability.md) for setup instructions.
 
+### Grafana Dashboard
+
+![Leader Timeline, Term History, Proposal Throughput, Commit Latency](docs/grafana-dashboard-top.png)
+
+![Replication Lag, Follower Status, WAL Growth, Transport Bandwidth, Cluster Overview](docs/grafana-dashboard-bottom.png)
+
 ---
 
 ## References
