@@ -113,6 +113,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Optional self-driven workload: if --propose-rate N is set, the leader
+    // proposes N synthetic entries per second so metrics show live activity.
+    if args.propose_rate > 0 {
+        let metrics = Arc::clone(&handle.metrics);
+        let propose_tx = handle.propose_tx.clone();
+        let id = args.id;
+        let rate = args.propose_rate;
+        tokio::spawn(async move {
+            let interval_us = 1_000_000u64 / rate as u64;
+            let mut ticker = tokio::time::interval(Duration::from_micros(interval_us));
+            let mut seq: u64 = 0;
+            loop {
+                ticker.tick().await;
+                if metrics.leader_id() == id {
+                    seq += 1;
+                    let _ = propose_tx.send(format!("workload:{seq}").into_bytes());
+                }
+            }
+        });
+    }
+
     // Run the Raft event loop forever.
     runner.run().await;
 
@@ -127,6 +148,7 @@ struct Args {
     peers: Vec<(u64, SocketAddr)>,
     metrics_addr: Option<String>,
     tick_ms: u64,
+    propose_rate: u32,
 }
 
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
@@ -135,6 +157,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut peers: Vec<(u64, SocketAddr)> = Vec::new();
     let mut metrics_addr: Option<String> = None;
     let mut tick_ms = DEFAULT_TICK_MS;
+    let mut propose_rate: u32 = 0;
 
     let mut raw = std::env::args().skip(1).peekable();
     while let Some(flag) = raw.next() {
@@ -153,6 +176,7 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
             }
             "--metrics" => metrics_addr = Some(val),
             "--tick-ms" => tick_ms = val.parse()?,
+            "--propose-rate" => propose_rate = val.parse()?,
             other => return Err(format!("unknown flag: {other}").into()),
         }
     }
@@ -163,5 +187,6 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         peers,
         metrics_addr,
         tick_ms,
+        propose_rate,
     })
 }
