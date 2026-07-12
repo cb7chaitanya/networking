@@ -40,6 +40,10 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "")]
     peers: Vec<String>,
 
+    /// Enable LZ4 compression for gossip payloads (default: true)
+    #[arg(long, default_value = "true")]
+    compression: bool,
+
     /// Shared cluster key (64 hex chars = 256-bit ChaCha20-Poly1305 key).
     /// All nodes in the cluster must use the same key.
     #[arg(long)]
@@ -116,7 +120,9 @@ async fn main() {
         })
         .collect();
 
-    let mut transport = Transport::bind(args.bind)
+    config.compression_enabled = args.compression;
+
+    let mut transport = Transport::bind_with_compression(args.bind, config.compression_enabled)
         .await
         .expect("failed to bind UDP socket");
 
@@ -125,7 +131,11 @@ async fn main() {
         log::info!("encryption enabled (ChaCha20-Poly1305)");
     }
 
-    log::info!("bound to {}", transport.local_addr);
+    log::info!(
+        "bound to {} (compression={})",
+        transport.local_addr,
+        config.compression_enabled
+    );
 
     let node = Node::new(transport, config, &peers);
 

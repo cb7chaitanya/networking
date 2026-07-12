@@ -10,7 +10,7 @@
 ///  Bytes 4-11    : sender_id    (u64)  — originating node identity
 ///  Bytes 12-15   : heartbeat    (u32)  — sender's current heartbeat counter
 ///  Bytes 16-19   : incarnation  (u32)  — sender's current incarnation number
-///  Byte  20      : flags        (u8)   — bit-0 = REQUEST_ACK
+///  Byte  20      : flags        (u8)   — bit-0 = REQUEST_ACK, bit-1 = COMPRESSED
 ///  Byte  21      : reserved     (u8)   — must be 0 (keeps header 16-bit aligned)
 ///  Bytes 22-23   : checksum     (u16)  — RFC 1071 over entire buffer (zeroed for calc)
 /// ```
@@ -22,6 +22,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 /// Current wire format version. Incremented when the header layout or
 /// payload encoding changes in a backwards-incompatible way.
 pub const VERSION: u8 = 1;
+
+use crate::compression;
 
 // ── Header byte offsets ──────────────────────────────────────────────────────
 pub const OFF_VERSION: usize = 0;
@@ -48,6 +50,7 @@ pub mod kind {
 // ── Flags ────────────────────────────────────────────────────────────────────
 pub mod flags {
     pub const REQUEST_ACK: u8 = 0b0000_0001;
+    pub const COMPRESSED: u8 = 0b0000_0010;
 }
 
 // ── Status byte values (also used in NodeStatus::to_wire / from_wire) ────────
@@ -385,7 +388,16 @@ pub fn internet_checksum(buf: &[u8]) -> u16 {
 // ── Encode / Decode ───────────────────────────────────────────────────────────
 impl Message {
     /// Encode into a wire buffer.
+    ///
+    /// When `compress` is true and the payload is a GOSSIP message above the
+    /// compression threshold, the payload is LZ4-compressed and the
+    /// `COMPRESSED` flag bit is set.
     pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
+        self.encode_opts(false)
+    }
+
+    /// Encode with optional compression.
+    pub fn encode_opts(&self, compress: bool) -> Result<Vec<u8>, MessageError> {
         // Build payload bytes first so we know the length.
         let mut payload_bytes: Vec<u8> = Vec::new();
         match &self.payload {
@@ -400,6 +412,20 @@ impl Message {
             }
             MessagePayload::AntiEntropyChunk(c) => {
                 c.encode_into(&mut payload_bytes);
+            }
+        }
+
+        // Optionally compress GOSSIP payloads above the threshold.
+        let mut effective_flags = self.flags;
+        if compress
+            && self.kind == kind::GOSSIP
+            && payload_bytes.len() >= compression::COMPRESS_THRESHOLD
+        {
+            let compressed = compression::compress(&payload_bytes);
+            // Only use compression if it actually reduces size.
+            if compressed.len() < payload_bytes.len() {
+                payload_bytes = compressed;
+                effective_flags |= flags::COMPRESSED;
             }
         }
 
@@ -420,7 +446,7 @@ impl Message {
             .copy_from_slice(&self.sender_heartbeat.to_be_bytes());
         buf[OFF_INCARNATION..OFF_INCARNATION + 4]
             .copy_from_slice(&self.sender_incarnation.to_be_bytes());
-        buf[OFF_FLAGS] = self.flags;
+        buf[OFF_FLAGS] = effective_flags;
         // Checksum field stays zero for computation.
         buf[HEADER_LEN..].copy_from_slice(&payload_bytes);
 
@@ -477,8 +503,18 @@ impl Message {
             u32::from_be_bytes(buf[OFF_INCARNATION..OFF_INCARNATION + 4].try_into().unwrap());
         let flags = buf[OFF_FLAGS];
 
-        let payload_buf = &buf[HEADER_LEN..];
+        let raw_payload = &buf[HEADER_LEN..];
 
+        // Decompress if the COMPRESSED flag is set.
+        let is_compressed = (flags & flags::COMPRESSED) != 0;
+        let decompressed;
+        let payload_buf: &[u8] = if is_compressed {
+            decompressed = compression::decompress(raw_payload)
+                .map_err(|_| MessageError::MalformedPayload)?;
+            &decompressed
+        } else {
+            raw_payload
+        };
         let payload = match msg_kind {
             kind::GOSSIP => {
                 MessagePayload::Gossip(parse_node_entries(payload_buf)?)
@@ -908,6 +944,70 @@ mod tests {
             u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
         assert_ne!(stored, 0, "checksum of a non-zero buffer must not be 0");
         assert!(Message::decode(&buf).is_ok());
+    }
+
+    // ── Compression tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn compressed_gossip_roundtrip() {
+        let entries: Vec<WireNodeEntry> = (0..20)
+            .map(|i| WireNodeEntry {
+                node_id: i,
+                heartbeat: i as u32 * 3,
+                incarnation: i as u32,
+                status: (i % 3) as u8,
+                addr: v4([192, 168, 1, i as u8], 9000 + i as u16),
+            })
+            .collect();
+        let msg = build_gossip(7, 42, 0, entries.clone());
+        let buf = msg.encode_opts(true).unwrap();
+
+        // Verify COMPRESSED flag is set.
+        assert_ne!(buf[OFF_FLAGS] & flags::COMPRESSED, 0);
+
+        // Compressed buffer should be smaller than uncompressed.
+        let uncompressed_buf = msg.encode().unwrap();
+        assert!(buf.len() < uncompressed_buf.len());
+
+        // Decode must recover original entries.
+        let decoded = Message::decode(&buf).unwrap();
+        match decoded.payload {
+            MessagePayload::Gossip(got) => assert_eq!(got, entries),
+            _ => panic!("wrong payload"),
+        }
+    }
+
+    #[test]
+    fn small_gossip_not_compressed() {
+        // 1 entry = 24 bytes, below COMPRESS_THRESHOLD of 60.
+        let entry = WireNodeEntry {
+            node_id: 1,
+            heartbeat: 1,
+            incarnation: 0,
+            status: status::ALIVE,
+            addr: v4([127, 0, 0, 1], 8080),
+        };
+        let msg = build_gossip(1, 1, 0, vec![entry]);
+        let buf = msg.encode_opts(true).unwrap();
+
+        // COMPRESSED flag should NOT be set for small payloads.
+        assert_eq!(buf[OFF_FLAGS] & flags::COMPRESSED, 0);
+    }
+
+    #[test]
+    fn compressed_flag_not_set_when_disabled() {
+        let entries: Vec<WireNodeEntry> = (0..20)
+            .map(|i| WireNodeEntry {
+                node_id: i,
+                heartbeat: i as u32,
+                incarnation: 0,
+                status: status::ALIVE,
+                addr: v4([10, 0, 0, i as u8], 5000 + i as u16),
+            })
+            .collect();
+        let msg = build_gossip(1, 1, 0, entries);
+        let buf = msg.encode_opts(false).unwrap();
+        assert_eq!(buf[OFF_FLAGS] & flags::COMPRESSED, 0);
     }
 
     #[test]

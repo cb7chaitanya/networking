@@ -21,6 +21,7 @@ chacha20poly1305 = "0.10"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+lz4_flex  = "0.11"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -29,3 +30,8 @@ proptest = "1"
 [[bench]]
 name = "protocol_bench"
 harness = false
+
+[[bench]]
+name = "compression_bench"
+harness = false
+
