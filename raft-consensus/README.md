@@ -22,6 +22,8 @@ The implementation covers the full Raft protocol as described in the [extended p
 | cargo-fuzz | 3 fuzz targets covering wire decode, message roundtrip, snapshot decode |
 | Criterion benchmarks | 7 benchmark groups covering encode, decode, log append, commit, snapshot |
 
+**Article:** [Building a Raft Consensus Engine from Scratch in Rust](https://medium.com/@cb7chaitanya/building-a-raft-consensus-engine-from-scratch-in-rust-61f3f90fa33d)
+
 ---
 
 ## Why Raft?
