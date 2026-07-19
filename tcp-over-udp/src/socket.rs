@@ -11,6 +11,7 @@ use tokio::net::UdpSocket;
 use std::sync::Arc;  
 
 use crate::packet::{Packet, PacketError};
+use crate::trace;
 
 /// Maximum UDP payload size (theoretical limit; in practice kept much smaller).
 const MAX_DATAGRAM: usize = 65_535;
@@ -77,6 +78,7 @@ impl Socket {
 
     /// Encode `packet` and send it as a single UDP datagram to `dest`.
     pub async fn send_to(&self, packet: &Packet, dest: SocketAddr) -> Result<(), SocketError> {
+        trace::log_tx(self.local_addr, dest, packet);
         let bytes = packet.encode().map_err(SocketError::Packet)?;
         self.inner.send_to(&bytes, dest).await?;
         Ok(())
@@ -90,6 +92,7 @@ impl Socket {
         let mut buf = vec![0u8; MAX_DATAGRAM];
         let (n, addr) = self.inner.recv_from(&mut buf).await?;
         let packet = Packet::decode(&buf[..n])?;
+        trace::log_rx(self.local_addr, addr, &packet);
         Ok((packet, addr))
     }
 }
