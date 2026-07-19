@@ -46,4 +46,5 @@ pub mod sender;
 pub mod simulator;
 pub mod socket;
 pub mod state;
+pub mod metrics;
 pub mod listener;

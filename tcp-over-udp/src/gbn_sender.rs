@@ -43,6 +43,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::congestion_control::{CongestionControl, LossKind, RenoCC};
+use crate::metrics;
 use crate::packet::{flags, Header, Packet, SackBlock};
 use crate::persist_timer::{PersistTimer, PersistTransition};
 
@@ -385,6 +386,7 @@ impl<CC: CongestionControl> GbnSender<CC> {
             if self.has_unacked() {
                 result.dup_ack = true;
                 self.dup_ack_count += 1;
+                metrics::DUPLICATE_ACKS.inc();
             }
             return result;
         }
@@ -493,6 +495,7 @@ impl<CC: CongestionControl> GbnSender<CC> {
             entry.tx_count += 1;
             entry.sent_at = Instant::now();
             self.sr_retransmit_count += 1;
+            metrics::RETRANSMISSIONS.inc();
             Some(entry.packet.clone())
         } else {
             None
