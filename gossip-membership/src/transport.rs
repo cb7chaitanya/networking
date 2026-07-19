@@ -12,11 +12,13 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 
 use crate::crypto::{ClusterKey, CryptoError};
 use crate::message::{Message, MessageError};
 use crate::rate_limit::{InboundRateLimiter, RateLimitConfig};
 use crate::simulator::NetSim;
+use crate::viz::GossipEvent;
 
 /// Practical UDP MTU ceiling — avoids fragmentation on most Ethernet paths.
 const MAX_DATAGRAM: usize = 1_472;
@@ -60,6 +62,8 @@ pub struct Transport {
     rate_limiter: Option<Mutex<InboundRateLimiter>>,
     /// Count of packets dropped by rate limiting (caller reads this).
     pub rate_limited_count: std::sync::atomic::AtomicU64,
+    /// Optional event sink for gossip visualization.
+    event_tx: Option<mpsc::UnboundedSender<GossipEvent>>,
 }
 
 impl Transport {
@@ -74,6 +78,7 @@ impl Transport {
             sim: None,
             rate_limiter: None,
             rate_limited_count: std::sync::atomic::AtomicU64::new(0),
+            event_tx: None,
         })
     }
 
@@ -92,6 +97,12 @@ impl Transport {
     /// Attach an inbound rate limiter.
     pub fn with_rate_limit(mut self, config: RateLimitConfig) -> Self {
         self.rate_limiter = Some(Mutex::new(InboundRateLimiter::new(&config)));
+        self
+    }
+
+    /// Attach an event sink for tracing gossip message flow (visualization).
+    pub fn with_event_sink(mut self, tx: mpsc::UnboundedSender<GossipEvent>) -> Self {
+        self.event_tx = Some(tx);
         self
     }
 
@@ -163,6 +174,17 @@ impl Transport {
 
         // No simulator — send directly.
         self.socket.send_to(&wire_bytes, dest).await?;
+
+        // Emit event if tracing is enabled.
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(GossipEvent::message_sent(
+                self.local_addr,
+                dest,
+                msg,
+                wire_bytes.len(),
+            ));
+        }
+
         Ok(())
     }
 
@@ -187,7 +209,18 @@ impl Transport {
             }
 
             match self.decode_datagram(&buf[..n]) {
-                Ok(msg) => return Ok((msg, from)),
+                Ok(msg) => {
+                    // Emit event if tracing is enabled.
+                    if let Some(tx) = &self.event_tx {
+                        let _ = tx.send(GossipEvent::message_received(
+                            from,
+                            self.local_addr,
+                            &msg,
+                            n,
+                        ));
+                    }
+                    return Ok((msg, from));
+                }
                 Err(e) => {
                     log::debug!("[transport] dropped datagram from {from}: {e}");
                 }

@@ -7,6 +7,10 @@ edition = "2021"
 name = "gossip-membership"
 path = "src/main.rs"
 
+[[bin]]
+name = "gossip-viz"
+path = "src/bin/gossip-viz.rs"
+
 [lib]
 name = "gossip_membership"
 path = "src/lib.rs"
