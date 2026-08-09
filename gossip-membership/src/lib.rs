@@ -11,4 +11,5 @@ pub mod rate_limit;
 pub mod reliable;
 pub mod runner;
 pub mod simulator;
+pub mod tracing;
 pub mod transport;

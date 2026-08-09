@@ -11,6 +11,9 @@ path = "src/main.rs"
 name = "gossip_membership"
 path = "src/lib.rs"
 
+[features]
+otel = ["opentelemetry-otlp"]
+
 [dependencies]
 tokio      = { version = "1", features = ["full"] }
 log        = "0.4"
@@ -21,6 +24,12 @@ chacha20poly1305 = "0.10"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+tracing = "0.1"
+tracing-opentelemetry = "0.22"
+opentelemetry = "0.21"
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry-otlp = { version = "0.14", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

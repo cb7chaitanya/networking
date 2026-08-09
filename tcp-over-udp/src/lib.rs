@@ -32,6 +32,7 @@
 //! - [`receiver`]        — stop-and-wait inbound segment reassembly
 //! - [`simulator`]       — optional lossy/reorder network layer for testing
 //! - [`socket`]          — async UDP socket abstraction
+//! - [`tracing`]         — OpenTelemetry-compatible tracing instrumentation
 
 pub mod congestion_control;
 pub mod connection;
@@ -47,3 +48,4 @@ pub mod simulator;
 pub mod socket;
 pub mod state;
 pub mod listener;
+pub mod tracing;
