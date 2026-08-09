@@ -48,6 +48,9 @@ pub struct NetworkSection {
 #[serde(default)]
 pub struct ProbeSection {
     pub interval_ms: Option<u64>,
+    pub adaptive: Option<bool>,
+    pub interval_min_ms: Option<u64>,
+    pub interval_max_ms: Option<u64>,
     pub timeout_ms: Option<u64>,
     pub indirect_k: Option<usize>,
     pub suspect_timeout_ms: Option<u64>,
@@ -98,6 +101,9 @@ impl FileConfig {
 
         // ── probes ──
         if let Some(v) = self.probes.interval_ms { cfg.probe_interval_ms = v; }
+        if let Some(v) = self.probes.adaptive { cfg.adaptive_probe = v; }
+        if let Some(v) = self.probes.interval_min_ms { cfg.probe_interval_min_ms = v; }
+        if let Some(v) = self.probes.interval_max_ms { cfg.probe_interval_max_ms = v; }
         if let Some(v) = self.probes.timeout_ms { cfg.probe_timeout_ms = v; }
         if let Some(v) = self.probes.indirect_k { cfg.indirect_probe_k = v; }
         if let Some(v) = self.probes.suspect_timeout_ms { cfg.suspect_timeout_ms = v; }
