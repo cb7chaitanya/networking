@@ -53,6 +53,10 @@ pub struct NodeState {
     pub last_update: Instant,
     /// Set when status transitions to Suspect; used to time-out to Dead.
     pub suspect_since: Option<Instant>,
+    /// Number of times this node has been suspected. Used for suspicion
+    /// acceleration heuristics - higher counts get gossiped more frequently.
+    /// NOT transmitted on the wire (local tracking only).
+    pub suspect_count: u32,
 }
 
 impl NodeState {
@@ -66,6 +70,7 @@ impl NodeState {
             status: NodeStatus::Alive,
             last_update: Instant::now(),
             suspect_since: None,
+            suspect_count: 0,
         }
     }
 }
@@ -105,6 +110,14 @@ pub struct NodeConfig {
     /// `hash(local_id, suspect_id)`, desynchronising Dead declarations across
     /// the cluster and preventing a thundering herd of concurrent state changes.
     pub suspect_timeout_jitter_ms: u64,
+    /// Enable suspicion acceleration: suspected nodes get gossiped more frequently.
+    pub suspicion_acceleration: bool,
+    /// Weight factor for suspicion score in gossip prioritization.
+    /// Higher values give suspected nodes more priority in gossip digest.
+    pub suspicion_weight: f64,
+    /// Number of additional gossip targets to use for suspected nodes.
+    /// These extra targets help propagate suspicion faster via multi-path.
+    pub suspicion_multi_path: usize,
     /// Number of indirect probers to use (k in SWIM).
     pub indirect_probe_k: usize,
     /// Base max entries to include in one GOSSIP message.
@@ -162,6 +175,9 @@ impl Default for NodeConfig {
             suspect_timeout_ms: 3_000,
             suspect_timeout_multiplier: 0.5,
             suspect_timeout_jitter_ms: 1_000,
+            suspicion_acceleration: false,
+            suspicion_weight: 2.0,
+            suspicion_multi_path: 1,
             indirect_probe_k: 2,
             gossip_fanout: 50,
             adaptive_fanout: true,
@@ -193,6 +209,9 @@ impl NodeConfig {
             suspect_timeout_ms: 300,
             suspect_timeout_multiplier: 0.5,
             suspect_timeout_jitter_ms: 50,
+            suspicion_acceleration: false,
+            suspicion_weight: 2.0,
+            suspicion_multi_path: 1,
             indirect_probe_k: 2,
             gossip_fanout: 50,
             adaptive_fanout: true,
@@ -200,10 +219,10 @@ impl NodeConfig {
             adaptive_gossip_targets: true,
             dead_retention_ms: 1_000,
             piggyback_max: 6,
-            metrics_log_interval_ms: 0, // disabled in tests
-            metrics_server_port: 0, // disabled in tests
+            metrics_log_interval_ms: 0,  // disabled in tests
+            metrics_server_port: 0,      // disabled in tests
             anti_entropy_interval_ms: 0, // disabled by default in tests
-            inbound_global_capacity: 0, // disabled in tests
+            inbound_global_capacity: 0,  // disabled in tests
             inbound_global_refill_rate: 0,
             inbound_peer_capacity: 0,
             inbound_peer_refill_rate: 0,

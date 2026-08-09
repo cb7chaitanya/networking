@@ -37,7 +37,7 @@ impl MembershipTable {
         };
         // Seed our own entry as Alive with heartbeat 0, incarnation 0.
         t.entries.insert(
-            local_id,
+            local_id, 
             NodeState::new_alive(local_id, local_addr, 0),
         );
         t
@@ -225,8 +225,22 @@ impl MembershipTable {
                 e.status = NodeStatus::Suspect;
                 e.suspect_since = Some(Instant::now());
                 e.last_update = Instant::now();
+                e.suspect_count += 1;
             }
         }
+    }
+
+    /// Increment suspect count for a node (used when receiving gossip about
+    /// a node being suspected by another node).
+    pub fn increment_suspect_count(&mut self, id: NodeId) {
+        if let Some(e) = self.entries.get_mut(&id) {
+            e.suspect_count += 1;
+        }
+    }
+
+    /// Get suspect count for a node.
+    pub fn get_suspect_count(&self, id: NodeId) -> u32 {
+        self.entries.get(&id).map(|e| e.suspect_count).unwrap_or(0)
     }
 
     pub fn declare_dead(&mut self, id: NodeId) {
@@ -340,18 +354,67 @@ impl MembershipTable {
     /// Return up to `max_entries` entries for gossiping, prioritising recently
     /// updated entries so fresh information spreads faster (infection-style).
     ///
+    /// When `suspicion_weight > 0`, suspected nodes get priority boost based on
+    /// their suspect_count. This accelerates suspicion propagation through the
+    /// cluster (multi-path dissemination).
+    ///
     /// Placeholder entries (bootstrap peers whose real IDs we haven't learned
     /// yet) are excluded — they are local bookkeeping and must not propagate.
     pub fn gossip_digest(&self, max_entries: usize) -> Vec<NodeState> {
+        self.gossip_digest_with_suspicion(max_entries, 0.0)
+    }
+
+    /// Return gossip digest with suspicion acceleration.
+    ///
+    /// `suspicion_weight` controls how much priority suspected nodes get:
+    /// - 0.0 = disabled (standard gossip)
+    /// - Higher values = suspected nodes appear more frequently in digest
+    pub fn gossip_digest_with_suspicion(
+        &self,
+        max_entries: usize,
+        suspicion_weight: f64,
+    ) -> Vec<NodeState> {
         let mut all: Vec<&NodeState> = self
             .entries
             .values()
             .filter(|e| !self.placeholder_ids.contains(&e.node_id))
             .collect();
-        // Most recently updated first.
-        all.sort_by(|a, b| b.last_update.cmp(&a.last_update));
+
+        if suspicion_weight > 0.0 {
+            // Sort by: suspicion priority boost first, then by last_update
+            // Suspect nodes get boosted by (suspect_count * suspicion_weight)
+            all.sort_by(|a, b| {
+                let a_score = a.last_update
+                    + if a.status == NodeStatus::Suspect {
+                        Duration::from_secs_f64(a.suspect_count as f64 * suspicion_weight)
+                    } else {
+                        Duration::ZERO
+                    };
+                let b_score = b.last_update
+                    + if b.status == NodeStatus::Suspect {
+                        Duration::from_secs_f64(b.suspect_count as f64 * suspicion_weight)
+                    } else {
+                        Duration::ZERO
+                    };
+                b_score.cmp(&a_score)
+            });
+        } else {
+            // Standard: most recently updated first
+            all.sort_by(|a, b| b.last_update.cmp(&a.last_update));
+        }
+
         all.truncate(max_entries);
         all.into_iter().cloned().collect()
+    }
+
+    /// Return suspected nodes for multi-path propagation.
+    /// These nodes should be gossiped to extra targets.
+    pub fn suspected_nodes(&self) -> Vec<NodeId> {
+        self.entries
+            .values()
+            .filter(|e| e.status == NodeStatus::Suspect)
+            .map(|e| e.node_id)
+            .collect()
     }
 
     /// Returns `true` if `id` is a bootstrap placeholder (synthetic node ID).
@@ -362,6 +425,18 @@ impl MembershipTable {
     /// Convert a gossip digest into wire entries.
     pub fn gossip_wire_entries(&self, max_entries: usize) -> Vec<WireNodeEntry> {
         self.gossip_digest(max_entries)
+            .iter()
+            .filter_map(|s| node_state_to_wire(s))
+            .collect()
+    }
+
+    /// Convert a gossip digest into wire entries with suspicion acceleration.
+    pub fn gossip_wire_entries_with_suspicion(
+        &self,
+        max_entries: usize,
+        suspicion_weight: f64,
+    ) -> Vec<WireNodeEntry> {
+        self.gossip_digest_with_suspicion(max_entries, suspicion_weight)
             .iter()
             .filter_map(|s| node_state_to_wire(s))
             .collect()
@@ -453,6 +528,7 @@ pub fn wire_to_node_state(e: &WireNodeEntry) -> Option<NodeState> {
         } else {
             None
         },
+        suspect_count: 0,
     })
 }
 
@@ -689,8 +765,8 @@ mod tests {
     #[test]
     fn is_newer_near_boundary() {
         let half = 1u32 << 31; // 2^31
-        // Exactly half the range apart: a.wrapping_sub(b) == 2^31 → NOT newer
-        // (ambiguous region; we treat it as not newer for safety).
+                               // Exactly half the range apart: a.wrapping_sub(b) == 2^31 → NOT newer
+                               // (ambiguous region; we treat it as not newer for safety).
         assert!(!is_newer(half, 0));
         // One less than half: clearly newer.
         assert!(is_newer(half - 1, 0));
@@ -726,7 +802,7 @@ mod tests {
     fn gossip_digest_most_recent_first() {
         let mut t = MembershipTable::new(1, make_addr(1000));
         // Age the self entry so it sorts below the peers we are about to insert.
-        t.entries.get_mut(&1).unwrap().last_update =
+        t.entries.get_mut(&1).unwrap().last_update = 
             Instant::now() - Duration::from_secs(10);
         for i in 2..=6u64 {
             let mut s = NodeState::new_alive(i, make_addr(i as u16 * 1000), i as u32);
@@ -1049,5 +1125,50 @@ mod tests {
         // With base=10000 ms: effective ≈ 10 s.  5 s < 10 s → not expired.
         let not_expired = t.expired_suspects_jittered(10_000, 0.0, 0);
         assert!(!not_expired.contains(&2));
+    }
+
+    // ── Suspicion acceleration tests ─────────────────────────────────────────
+
+    #[test]
+    fn suspect_increments_count() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 1));
+
+        // Initial count should be 0
+        assert_eq!(t.get_suspect_count(2), 0);
+
+        // Suspect the node
+        t.suspect(2);
+        assert_eq!(t.get_suspect_count(2), 1);
+
+        // Suspect again (shouldn't double-count since already Suspect)
+        t.suspect(2);
+        assert_eq!(t.get_suspect_count(2), 1);
+    }
+
+    #[test]
+    fn increment_suspect_count_from_gossip() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 1));
+
+        // Simulate receiving gossip that node 2 is suspected by another node
+        t.increment_suspect_count(2);
+        assert_eq!(t.get_suspect_count(2), 1);
+
+        t.increment_suspect_count(2);
+        assert_eq!(t.get_suspect_count(2), 2);
+    }
+
+    #[test]
+    fn declare_dead_clears_suspect_data() {
+        let mut t = MembershipTable::new(1, make_addr(1000));
+        t.merge_entry(&NodeState::new_alive(2, make_addr(2000), 1));
+
+        t.suspect(2);
+        assert_eq!(t.get_suspect_count(2), 1);
+
+        t.declare_dead(2);
+        // After declaring dead, suspect_since should be None
+        assert!(t.entries[&2].suspect_since.is_none());
     }
 }
