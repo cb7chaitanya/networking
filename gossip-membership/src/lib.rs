@@ -7,6 +7,7 @@ pub mod membership;
 pub mod message;
 pub mod metrics;
 pub mod node;
+pub mod pcap;
 pub mod rate_limit;
 pub mod reliable;
 pub mod runner;
