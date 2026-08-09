@@ -10,9 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use gossip_membership::anti_entropy;
 use gossip_membership::gossip;
 use gossip_membership::membership::MembershipTable;
-use gossip_membership::message::{
-    build_gossip, build_ping, status, Message, WireNodeEntry,
-};
+use gossip_membership::message::{build_gossip, build_ping, status, Message, WireNodeEntry};
 use gossip_membership::node::{NodeState, NodeStatus};
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -143,55 +141,39 @@ fn bench_encode_decode(c: &mut Criterion) {
 fn bench_gossip_round(c: &mut Criterion) {
     let mut group = c.benchmark_group("gossip_round");
     for &n in SIZES {
-        group.bench_with_input(
-            BenchmarkId::new("build_gossip_message", n),
-            &n,
-            |b, &n| {
-                let table = table_with_peers(n);
-                let fanout = gossip::effective_fanout(50, table.entries.len(), true);
-                b.iter(|| {
-                    black_box(gossip::build_gossip_message(
-                        black_box(&table),
-                        1,
-                        42,
-                        0,
-                        fanout,
-                    ));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("build_gossip_message", n), &n, |b, &n| {
+            let table = table_with_peers(n);
+            let fanout = gossip::effective_fanout(50, table.entries.len(), true);
+            b.iter(|| {
+                black_box(gossip::build_gossip_message(
+                    black_box(&table),
+                    1,
+                    42,
+                    0,
+                    fanout,
+                ));
+            });
+        });
     }
     group.finish();
 
     let mut group = c.benchmark_group("gossip_peer_selection");
     for &n in SIZES {
-        group.bench_with_input(
-            BenchmarkId::new("pick_gossip_targets", n),
-            &n,
-            |b, &n| {
-                let table = table_with_peers(n);
-                let max = gossip::effective_gossip_targets(1, table.entries.len(), true);
-                b.iter(|| {
-                    black_box(gossip::pick_gossip_targets(
-                        black_box(&table),
-                        1,
-                        max,
-                    ));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("pick_gossip_targets", n), &n, |b, &n| {
+            let table = table_with_peers(n);
+            let max = gossip::effective_gossip_targets(1, table.entries.len(), true);
+            b.iter(|| {
+                black_box(gossip::pick_gossip_targets(black_box(&table), 1, max));
+            });
+        });
     }
     group.finish();
 
     let mut group = c.benchmark_group("gossip_fanout_calc");
     for &n in SIZES {
-        group.bench_with_input(
-            BenchmarkId::new("effective_fanout", n),
-            &n,
-            |b, &n| {
-                b.iter(|| black_box(gossip::effective_fanout(50, black_box(n), true)));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("effective_fanout", n), &n, |b, &n| {
+            b.iter(|| black_box(gossip::effective_fanout(50, black_box(n), true)));
+        });
     }
     group.finish();
 }
@@ -220,13 +202,7 @@ fn bench_anti_entropy(c: &mut Criterion) {
             &entries,
             |b, entries| {
                 b.iter(|| {
-                    black_box(anti_entropy::build_chunks(
-                        black_box(entries),
-                        1,
-                        42,
-                        0,
-                        1,
-                    ));
+                    black_box(anti_entropy::build_chunks(black_box(entries), 1, 42, 0, 1));
                 });
             },
         );

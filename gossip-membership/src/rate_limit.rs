@@ -69,8 +69,8 @@ impl TokenBucket {
     fn refill(&mut self, now: Instant) {
         let elapsed = now.duration_since(self.last_refill).as_secs_f64();
         if elapsed > 0.0 {
-            self.tokens = (self.tokens + elapsed * self.refill_rate as f64)
-                .min(self.capacity as f64);
+            self.tokens =
+                (self.tokens + elapsed * self.refill_rate as f64).min(self.capacity as f64);
             self.last_refill = now;
         }
     }
@@ -103,9 +103,10 @@ impl InboundRateLimiter {
         if !self.global.try_consume(now) {
             return false;
         }
-        let peer = self.peers.entry(from).or_insert_with(|| {
-            TokenBucket::new(self.peer_capacity, self.peer_refill_rate)
-        });
+        let peer = self
+            .peers
+            .entry(from)
+            .or_insert_with(|| TokenBucket::new(self.peer_capacity, self.peer_refill_rate));
         if !peer.try_consume(now) {
             // Undo the global consume — this peer is throttled but the
             // global bucket shouldn't be penalised.
@@ -139,7 +140,10 @@ mod tests {
         for _ in 0..5 {
             assert!(b.try_consume(now));
         }
-        assert!(!b.try_consume(now), "should be empty after capacity consumed");
+        assert!(
+            !b.try_consume(now),
+            "should be empty after capacity consumed"
+        );
     }
 
     #[test]

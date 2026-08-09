@@ -184,7 +184,10 @@ impl PingReqPayload {
         let target_id = u64::from_be_bytes(buf[0..8].try_into().ok()?);
         let (addr, addr_len) = decode_addr(&buf[8..])?;
         Some((
-            Self { target_id, target_addr: addr },
+            Self {
+                target_id,
+                target_addr: addr,
+            },
             8 + addr_len,
         ))
     }
@@ -285,7 +288,12 @@ impl AntiEntropyChunkPayload {
         let total_chunks = u16::from_be_bytes(buf[10..12].try_into().ok()?);
         let entries = parse_node_entries(&buf[AE_CHUNK_HEADER..]).ok()?;
         Some((
-            Self { table_version, chunk_index, total_chunks, entries },
+            Self {
+                table_version,
+                chunk_index,
+                total_chunks,
+                entries,
+            },
             buf.len(),
         ))
     }
@@ -389,7 +397,9 @@ impl Message {
         // Build payload bytes first so we know the length.
         let mut payload_bytes: Vec<u8> = Vec::new();
         match &self.payload {
-            MessagePayload::Gossip(entries) | MessagePayload::Ping(entries) | MessagePayload::Ack(entries) => {
+            MessagePayload::Gossip(entries)
+            | MessagePayload::Ping(entries)
+            | MessagePayload::Ack(entries) => {
                 encode_node_entries(entries, &mut payload_bytes);
             }
             MessagePayload::PingReq(p) => {
@@ -416,8 +426,7 @@ impl Message {
         buf[OFF_KIND] = self.kind;
         buf[OFF_PLEN..OFF_PLEN + 2].copy_from_slice(&(payload_len as u16).to_be_bytes());
         buf[OFF_SENDER_ID..OFF_SENDER_ID + 8].copy_from_slice(&self.sender_id.to_be_bytes());
-        buf[OFF_HEARTBEAT..OFF_HEARTBEAT + 4]
-            .copy_from_slice(&self.sender_heartbeat.to_be_bytes());
+        buf[OFF_HEARTBEAT..OFF_HEARTBEAT + 4].copy_from_slice(&self.sender_heartbeat.to_be_bytes());
         buf[OFF_INCARNATION..OFF_INCARNATION + 4]
             .copy_from_slice(&self.sender_incarnation.to_be_bytes());
         buf[OFF_FLAGS] = self.flags;
@@ -473,19 +482,18 @@ impl Message {
             u64::from_be_bytes(buf[OFF_SENDER_ID..OFF_SENDER_ID + 8].try_into().unwrap());
         let sender_heartbeat =
             u32::from_be_bytes(buf[OFF_HEARTBEAT..OFF_HEARTBEAT + 4].try_into().unwrap());
-        let sender_incarnation =
-            u32::from_be_bytes(buf[OFF_INCARNATION..OFF_INCARNATION + 4].try_into().unwrap());
+        let sender_incarnation = u32::from_be_bytes(
+            buf[OFF_INCARNATION..OFF_INCARNATION + 4]
+                .try_into()
+                .unwrap(),
+        );
         let flags = buf[OFF_FLAGS];
 
         let payload_buf = &buf[HEADER_LEN..];
 
         let payload = match msg_kind {
-            kind::GOSSIP => {
-                MessagePayload::Gossip(parse_node_entries(payload_buf)?)
-            }
-            kind::PING => {
-                MessagePayload::Ping(parse_node_entries(payload_buf)?)
-            }
+            kind::GOSSIP => MessagePayload::Gossip(parse_node_entries(payload_buf)?),
+            kind::PING => MessagePayload::Ping(parse_node_entries(payload_buf)?),
             kind::PING_REQ => {
                 let (p, consumed) =
                     PingReqPayload::decode(payload_buf).ok_or(MessageError::MalformedPayload)?;
@@ -494,12 +502,8 @@ impl Message {
                 }
                 MessagePayload::PingReq(p)
             }
-            kind::ACK => {
-                MessagePayload::Ack(parse_node_entries(payload_buf)?)
-            }
-            kind::LEAVE => {
-                MessagePayload::Leave
-            }
+            kind::ACK => MessagePayload::Ack(parse_node_entries(payload_buf)?),
+            kind::LEAVE => MessagePayload::Leave,
             kind::ANTI_ENTROPY => {
                 let (c, consumed) = AntiEntropyChunkPayload::decode(payload_buf)
                     .ok_or(MessageError::MalformedPayload)?;
@@ -621,11 +625,7 @@ pub fn build_anti_entropy_chunk(
     }
 }
 
-pub fn build_leave(
-    sender_id: u64,
-    sender_heartbeat: u32,
-    sender_incarnation: u32,
-) -> Message {
+pub fn build_leave(sender_id: u64, sender_heartbeat: u32, sender_incarnation: u32) -> Message {
     Message {
         version: VERSION,
         kind: kind::LEAVE,
@@ -722,7 +722,10 @@ mod tests {
         let entries = vec![v4_entry.clone(), v6_entry.clone()];
         let msg = build_gossip(7, 42, 0, entries.clone());
         let buf = msg.encode().unwrap();
-        assert_eq!(buf.len(), HEADER_LEN + NODE_ENTRY_V4_LEN + NODE_ENTRY_V6_LEN);
+        assert_eq!(
+            buf.len(),
+            HEADER_LEN + NODE_ENTRY_V4_LEN + NODE_ENTRY_V6_LEN
+        );
         let decoded = Message::decode(&buf).unwrap();
         match decoded.payload {
             MessagePayload::Gossip(got) => assert_eq!(got, entries),
@@ -857,13 +860,18 @@ mod tests {
             build_ping(1, 0, 0, vec![]),
             build_ping(u64::MAX, u32::MAX, 0, vec![]),
             build_ack(42, 100, 0, vec![]),
-            build_gossip(7, 3, 0, vec![WireNodeEntry {
-                node_id: 1,
-                heartbeat: 0,
-                incarnation: 0,
-                status: status::ALIVE,
-                addr: v4([127, 0, 0, 1], 9000),
-            }]),
+            build_gossip(
+                7,
+                3,
+                0,
+                vec![WireNodeEntry {
+                    node_id: 1,
+                    heartbeat: 0,
+                    incarnation: 0,
+                    status: status::ALIVE,
+                    addr: v4([127, 0, 0, 1], 9000),
+                }],
+            ),
         ] {
             let buf = msg.encode().unwrap();
             assert!(
@@ -904,8 +912,7 @@ mod tests {
     fn checksum_all_zero_fields_roundtrip() {
         let msg = build_ping(0, 0, 0, vec![]);
         let buf = msg.encode().unwrap();
-        let stored =
-            u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
+        let stored = u16::from_be_bytes(buf[OFF_CHECKSUM..OFF_CHECKSUM + 2].try_into().unwrap());
         assert_ne!(stored, 0, "checksum of a non-zero buffer must not be 0");
         assert!(Message::decode(&buf).is_ok());
     }
@@ -980,7 +987,11 @@ mod tests {
             build_leave(1, 0, 0),
         ] {
             let buf = msg.encode().unwrap();
-            assert_eq!(buf[OFF_VERSION], VERSION, "kind={} must encode version", msg.kind);
+            assert_eq!(
+                buf[OFF_VERSION], VERSION,
+                "kind={} must encode version",
+                msg.kind
+            );
             let decoded = Message::decode(&buf).unwrap();
             assert_eq!(decoded.version, VERSION);
         }

@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod dns;
+pub mod distributed;
 pub mod network;
 pub mod resolver;
 

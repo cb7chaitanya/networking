@@ -200,10 +200,10 @@ impl NodeConfig {
             adaptive_gossip_targets: true,
             dead_retention_ms: 1_000,
             piggyback_max: 6,
-            metrics_log_interval_ms: 0, // disabled in tests
-            metrics_server_port: 0, // disabled in tests
+            metrics_log_interval_ms: 0,  // disabled in tests
+            metrics_server_port: 0,      // disabled in tests
             anti_entropy_interval_ms: 0, // disabled by default in tests
-            inbound_global_capacity: 0, // disabled in tests
+            inbound_global_capacity: 0,  // disabled in tests
             inbound_global_refill_rate: 0,
             inbound_peer_capacity: 0,
             inbound_peer_refill_rate: 0,

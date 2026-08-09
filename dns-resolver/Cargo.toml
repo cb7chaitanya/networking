@@ -7,4 +7,7 @@ edition = "2021"
 anyhow = "1.0"
 rand = "0.9.2"
 thiserror = "1.0"
+gossip-membership = { path = "../gossip-membership" }
 
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

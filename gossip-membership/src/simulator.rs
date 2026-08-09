@@ -268,11 +268,15 @@ mod tests {
     fn loss_deterministic_same_seed() {
         let results_a: Vec<bool> = {
             let mut sim = NetSim::new(99).with_loss(0.3);
-            (0..100).map(|_| sim.should_deliver(addr(1), addr(2))).collect()
+            (0..100)
+                .map(|_| sim.should_deliver(addr(1), addr(2)))
+                .collect()
         };
         let results_b: Vec<bool> = {
             let mut sim = NetSim::new(99).with_loss(0.3);
-            (0..100).map(|_| sim.should_deliver(addr(1), addr(2))).collect()
+            (0..100)
+                .map(|_| sim.should_deliver(addr(1), addr(2)))
+                .collect()
         };
         assert_eq!(results_a, results_b);
     }
@@ -429,8 +433,10 @@ mod tests {
             }
         }
         // ~50% should be reordered.
-        assert!(reordered > 50 && reordered < 150,
-            "expected ~100 reordered, got {reordered}");
+        assert!(
+            reordered > 50 && reordered < 150,
+            "expected ~100 reordered, got {reordered}"
+        );
     }
 
     #[test]

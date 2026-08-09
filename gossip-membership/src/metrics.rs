@@ -103,27 +103,99 @@ impl Metrics {
             };
         }
 
-        counter!("swim_gossip_rounds_total", "Gossip rounds initiated.", self.gossip_rounds);
-        counter!("swim_gossip_sent_total", "Gossip messages sent.", self.gossip_sent);
-        counter!("swim_gossip_recv_total", "Gossip messages received.", self.gossip_recv);
-        counter!("swim_pings_sent_total", "PING messages sent.", self.pings_sent);
-        counter!("swim_pings_recv_total", "PING messages received.", self.pings_recv);
+        counter!(
+            "swim_gossip_rounds_total",
+            "Gossip rounds initiated.",
+            self.gossip_rounds
+        );
+        counter!(
+            "swim_gossip_sent_total",
+            "Gossip messages sent.",
+            self.gossip_sent
+        );
+        counter!(
+            "swim_gossip_recv_total",
+            "Gossip messages received.",
+            self.gossip_recv
+        );
+        counter!(
+            "swim_pings_sent_total",
+            "PING messages sent.",
+            self.pings_sent
+        );
+        counter!(
+            "swim_pings_recv_total",
+            "PING messages received.",
+            self.pings_recv
+        );
         counter!("swim_acks_sent_total", "ACK messages sent.", self.acks_sent);
-        counter!("swim_acks_recv_total", "ACK messages received.", self.acks_recv);
-        counter!("swim_ping_reqs_sent_total", "PING_REQ messages sent.", self.ping_reqs_sent);
-        counter!("swim_ping_reqs_recv_total", "PING_REQ messages received.", self.ping_reqs_recv);
-        counter!("swim_probe_direct_timeouts_total", "Direct probes that timed out.", self.probe_direct_timeouts);
-        counter!("swim_probe_failures_total", "Probes that resulted in Suspect.", self.probe_failures);
-        counter!("swim_merges_new_total", "New nodes discovered via merge.", self.merges_new);
-        counter!("swim_merges_updated_total", "Existing entries updated.", self.merges_updated);
-        counter!("swim_merges_stale_total", "Stale entries rejected.", self.merges_stale);
-        counter!("swim_anti_entropy_sent_total", "Anti-entropy full syncs sent.", self.anti_entropy_sent);
-        counter!("swim_rate_limited_total", "Inbound packets dropped by rate limiter.", self.rate_limited);
-        counter!("swim_reliable_retries_total", "REQUEST_ACK retransmissions.", self.reliable_retries);
-        counter!("swim_reliable_exhausted_total", "REQUEST_ACK retries exhausted.", self.reliable_exhausted);
+        counter!(
+            "swim_acks_recv_total",
+            "ACK messages received.",
+            self.acks_recv
+        );
+        counter!(
+            "swim_ping_reqs_sent_total",
+            "PING_REQ messages sent.",
+            self.ping_reqs_sent
+        );
+        counter!(
+            "swim_ping_reqs_recv_total",
+            "PING_REQ messages received.",
+            self.ping_reqs_recv
+        );
+        counter!(
+            "swim_probe_direct_timeouts_total",
+            "Direct probes that timed out.",
+            self.probe_direct_timeouts
+        );
+        counter!(
+            "swim_probe_failures_total",
+            "Probes that resulted in Suspect.",
+            self.probe_failures
+        );
+        counter!(
+            "swim_merges_new_total",
+            "New nodes discovered via merge.",
+            self.merges_new
+        );
+        counter!(
+            "swim_merges_updated_total",
+            "Existing entries updated.",
+            self.merges_updated
+        );
+        counter!(
+            "swim_merges_stale_total",
+            "Stale entries rejected.",
+            self.merges_stale
+        );
+        counter!(
+            "swim_anti_entropy_sent_total",
+            "Anti-entropy full syncs sent.",
+            self.anti_entropy_sent
+        );
+        counter!(
+            "swim_rate_limited_total",
+            "Inbound packets dropped by rate limiter.",
+            self.rate_limited
+        );
+        counter!(
+            "swim_reliable_retries_total",
+            "REQUEST_ACK retransmissions.",
+            self.reliable_retries
+        );
+        counter!(
+            "swim_reliable_exhausted_total",
+            "REQUEST_ACK retries exhausted.",
+            self.reliable_exhausted
+        );
 
         gauge!("swim_members_alive", "Number of Alive members.", alive);
-        gauge!("swim_members_suspect", "Number of Suspect members.", suspect);
+        gauge!(
+            "swim_members_suspect",
+            "Number of Suspect members.",
+            suspect
+        );
         gauge!("swim_members_dead", "Number of Dead members.", dead);
 
         out
@@ -133,16 +205,27 @@ impl Metrics {
     pub fn json(&self, alive: usize, suspect: usize, dead: usize) -> String {
         format!(
             r#"{{"gossip_rounds":{},"gossip_sent":{},"gossip_recv":{},"pings_sent":{},"pings_recv":{},"acks_sent":{},"acks_recv":{},"ping_reqs_sent":{},"ping_reqs_recv":{},"probe_direct_timeouts":{},"probe_failures":{},"merges_new":{},"merges_updated":{},"merges_stale":{},"anti_entropy_sent":{},"rate_limited":{},"reliable_retries":{},"reliable_exhausted":{},"alive":{},"suspect":{},"dead":{}}}"#,
-            self.gossip_rounds, self.gossip_sent, self.gossip_recv,
-            self.pings_sent, self.pings_recv,
-            self.acks_sent, self.acks_recv,
-            self.ping_reqs_sent, self.ping_reqs_recv,
-            self.probe_direct_timeouts, self.probe_failures,
-            self.merges_new, self.merges_updated, self.merges_stale,
+            self.gossip_rounds,
+            self.gossip_sent,
+            self.gossip_recv,
+            self.pings_sent,
+            self.pings_recv,
+            self.acks_sent,
+            self.acks_recv,
+            self.ping_reqs_sent,
+            self.ping_reqs_recv,
+            self.probe_direct_timeouts,
+            self.probe_failures,
+            self.merges_new,
+            self.merges_updated,
+            self.merges_stale,
             self.anti_entropy_sent,
             self.rate_limited,
-            self.reliable_retries, self.reliable_exhausted,
-            alive, suspect, dead,
+            self.reliable_retries,
+            self.reliable_exhausted,
+            alive,
+            suspect,
+            dead,
         )
     }
 
@@ -274,8 +357,14 @@ mod tests {
             }
             let parts: Vec<&str> = line.split_whitespace().collect();
             assert_eq!(parts.len(), 2, "invalid exposition line: {line}");
-            assert!(parts[0].starts_with("swim_"), "metric should have swim_ prefix: {line}");
-            assert!(parts[1].parse::<u64>().is_ok(), "value should be numeric: {line}");
+            assert!(
+                parts[0].starts_with("swim_"),
+                "metric should have swim_ prefix: {line}"
+            );
+            assert!(
+                parts[1].parse::<u64>().is_ok(),
+                "value should be numeric: {line}"
+            );
         }
     }
 

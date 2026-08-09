@@ -35,6 +35,7 @@
 
 pub mod congestion_control;
 pub mod connection;
+pub mod discovery;
 pub mod gbn_connection;
 pub mod gbn_receiver;
 pub mod gbn_sender;
